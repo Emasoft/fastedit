@@ -120,12 +120,13 @@ def _check_hallucinations(
 ) -> float:
     """Score merge quality: 1.0 = clean, 0.0 = hallucinated.
 
-    The validator treats ``deterministic_edit``'s marker semantics as the
-    reference and checks the model's ``merged_chunk`` against a set of
-    *invariants* rather than reconstructing one mandatory expected output.
-    Marker syntax legitimately permits both preservation and a locally
-    justified replacement, so the validator accepts any merge that is a
-    faithful outcome under those rules and rejects everything else.
+    The validator follows ``deterministic_edit``'s content-level marker
+    semantics, but intentionally does not reproduce that editor's anchor
+    selection heuristics. ``deterministic_edit`` uses ambiguous-line and raw
+    indentation checks to synthesize one output; this validator operates on
+    normalized line content and accepts any model output satisfying the
+    invariants below. Marker syntax legitimately permits both preservation
+    and a locally justified replacement.
 
     The snippet is forward-scanned into context anchors (lines matching an
     as-yet-unconsumed original line) and new lines, delimited by
@@ -182,11 +183,16 @@ def _classify_snippet(
 
     Each token is ``("context", orig_idx, line)``, ``("new", None, line)``
     or ``("marker", None, None)``. A non-marker snippet line is a *context*
-    anchor when it matches an as-yet-unconsumed original line (scanning
-    forward, so anchors are strictly increasing in ``orig_idx``); otherwise
-    it is a *new* line. This mirrors the classification in
-    ``deterministic_edit`` so the validator stays aligned with the engine
-    that produces real faithful merges.
+    anchor when its normalized content matches an as-yet-unconsumed original
+    line (scanning forward, so anchors are strictly increasing in
+    ``orig_idx``); otherwise it is a *new* line.
+
+    This is deliberately simpler than ``deterministic_edit``'s classifier.
+    The editor has synthesis-specific rules for ambiguous structural lines
+    and indentation deltas; the validator receives stripped content after
+    output realignment and must not copy those rules blindly. Its job is to
+    enforce content, multiplicity, and ordering invariants, not reconstruct
+    the editor's single chosen output.
     """
     tokens: list[tuple[str, int | None, str | None]] = []
     cursor = 0
@@ -488,7 +494,7 @@ def _new_side_order_ok(
     first_survivor, last_survivor = survivors[0], survivors[-1]
 
     unmatched = [j for j in range(len(merged_seg)) if j not in kept_merged]
-    for side, j in zip(new_sides, unmatched):
+    for side, j in zip(new_sides, unmatched, strict=True):
         if side == "before" and j > first_survivor:
             return False
         if side == "after" and j < last_survivor:

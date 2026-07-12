@@ -34,7 +34,11 @@ from __future__ import annotations
 
 import pytest
 
-from fastedit.inference.chunked_merge import _check_hallucinations
+from fastedit.inference.chunked_merge import (
+    _check_hallucinations,
+    _classify_snippet,
+    _real_lines,
+)
 
 
 PASS_THRESHOLD = 0.85
@@ -665,17 +669,18 @@ def test_new_after_marker_insertion_accepted():
 
 
 # ---------------------------------------------------------------------------
-# Parity matrix: every non-None deterministic_edit result is accepted.
+# Compatibility matrix: selected deterministic_edit outputs are accepted.
 # ---------------------------------------------------------------------------
 #
-# ``deterministic_edit`` is the established marker-semantics reference. The
-# validator runs after model fallback but must never reject an output the
-# deterministic engine itself produced. Each row below exercises one marker
-# shape; the test asserts (a) deterministic_edit returns a concrete merge
-# and (b) the validator accepts that exact merge.
+# The validator shares content-level marker semantics with
+# ``deterministic_edit`` but intentionally uses a simpler anchor classifier.
+# This finite matrix covers representative shapes on which both components
+# agree; it is a compatibility guard, not a claim of universal classifier or
+# output equivalence. Each row asserts (a) deterministic_edit returns a
+# concrete merge and (b) the validator accepts that merge.
 
 
-_PARITY_MATRIX = [
+_COMPATIBILITY_MATRIX = [
     # (label, original, snippet)
     (
         "new-before-marker",
@@ -717,17 +722,14 @@ _PARITY_MATRIX = [
 
 
 @pytest.mark.parametrize(
-    "label,original,snippet",
-    _PARITY_MATRIX,
-    ids=[row[0] for row in _PARITY_MATRIX],
+    ("label", "original", "snippet"),
+    _COMPATIBILITY_MATRIX,
+    ids=[row[0] for row in _COMPATIBILITY_MATRIX],
 )
-def test_deterministic_edit_parity_accepted(
+def test_deterministic_edit_compatibility_matrix_accepted(
     label: str, original: str, snippet: str
 ):
-    """Every concrete ``deterministic_edit`` output is accepted by the
-    validator. This is the anti-drift guard: the validator's marker
-    semantics must not diverge from the engine that produces real
-    faithful merges."""
+    """Each representative matrix output is accepted by the validator."""
     from fastedit.inference.text_match import deterministic_edit
 
     produced = deterministic_edit(original, snippet)
@@ -741,6 +743,81 @@ def test_deterministic_edit_parity_accepted(
         f"[{label}] validator rejected a faithful deterministic_edit "
         f"output (score {score:.3f}); produced:\n{produced}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Intentional classifier divergence from deterministic_edit.
+# ---------------------------------------------------------------------------
+
+
+def test_content_scan_keeps_ambiguous_closer_as_context():
+    """A repeated structural closer remains a content anchor.
+
+    ``deterministic_edit`` may classify a middle ``}`` as new because its
+    output-synthesis path treats short structural lines as ambiguous. The
+    validator must not inherit that heuristic: doing so can demand a duplicate
+    closer in a marker-protected gap and reject the faithful model merge.
+    """
+    original = (
+        "function f() {\n"
+        "  if (ready) {\n"
+        "    work();\n"
+        "  }\n"
+        "  preserved();\n"
+        "  tail();\n"
+        "}\n"
+    )
+    snippet = (
+        "function f() {\n"
+        "  if (ready) {\n"
+        "    work();\n"
+        "  }\n"
+        "  inserted();\n"
+        "  // ... existing code ...\n"
+        "  tail();\n"
+        "}\n"
+    )
+    merged = (
+        "function f() {\n"
+        "  if (ready) {\n"
+        "    work();\n"
+        "  }\n"
+        "  inserted();\n"
+        "  preserved();\n"
+        "  tail();\n"
+        "}\n"
+    )
+
+    tokens = _classify_snippet(snippet, _real_lines(original))
+
+    assert ("context", 3, "}") in tokens
+    assert ("new", None, "}") not in tokens
+    assert _score(original, merged, snippet) >= PASS_THRESHOLD
+
+
+def test_content_scan_ignores_synthesis_only_indent_delta():
+    """Indent movement does not turn matching content into an invention.
+
+    Parse validation and output realignment own indentation correctness. The
+    hallucination validator compares normalized content, so a shared line
+    moved into a newly declared block remains a context anchor.
+    """
+    original = (
+        "def f():\n"
+        "    shared()\n"
+        "    tail()\n"
+    )
+    snippet = (
+        "def f():\n"
+        "    if ready:\n"
+        "        shared()\n"
+        "    tail()\n"
+    )
+
+    tokens = _classify_snippet(snippet, _real_lines(original))
+
+    assert ("context", 1, "shared()") in tokens
+    assert _score(original, snippet, snippet) >= PASS_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
