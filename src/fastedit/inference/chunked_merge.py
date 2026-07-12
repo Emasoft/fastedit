@@ -60,7 +60,7 @@ from .symbols import (  # noqa: F401
     delete_symbol,
     move_symbol,
 )
-from .text_match import deterministic_edit  # noqa: F401
+from .text_match import _replacement_key, deterministic_edit  # noqa: F401
 
 # Phrases that mark "keep everything here" in snippets
 _MARKER_PHRASES = ("... existing code ...", "// ...", "# ...")
@@ -118,60 +118,429 @@ def _check_hallucinations(
     merged_chunk: str,
     snippet: str,
 ) -> float:
-    """Score merge quality: 1.0 = clean, lower = hallucinated.
+    """Score merge quality: 1.0 = clean, 0.0 = hallucinated.
 
-    Combines two signals:
-    - Anchor preservation: did the model keep lines it wasn't asked to change?
-    - Invention rate: did the model add lines that exist in neither original nor snippet?
+    The validator treats ``deterministic_edit``'s marker semantics as the
+    reference and checks the model's ``merged_chunk`` against a set of
+    *invariants* rather than reconstructing one mandatory expected output.
+    Marker syntax legitimately permits both preservation and a locally
+    justified replacement, so the validator accepts any merge that is a
+    faithful outcome under those rules and rejects everything else.
 
-    Returns a score where <0.85 typically indicates hallucination.
+    The snippet is forward-scanned into context anchors (lines matching an
+    as-yet-unconsumed original line) and new lines, delimited by
+    preservation markers. The anchors partition the original — and the
+    anchors located in the merge partition the merge — into aligned
+    segments; each segment is validated independently.
+
+    A merge is rejected on any of:
+
+      * **marker leakage** — a snippet placeholder echoed into the merge.
+      * **anchor loss / reorder** — a declared context anchor missing from
+        the merge or appearing out of order.
+      * **invention / omission / duplication / new-line reorder** — the
+        merge's new lines in a segment must equal the snippet's declared
+        new lines for that segment exactly (order and multiplicity).
+      * **unjustified deletion** — a marker-protected original removed
+        without a local one-to-one justification: a unique shared
+        ``_replacement_key`` identity, or positional adjacency for an
+        identity-free line on the marker-adjacent side. A keyed original
+        may only be replaced by a same-key new line, never by positional
+        proximity; ambiguous keys fail closed.
+      * **preserved-line reorder / loss** — surviving originals must keep
+        their relative order and multiplicity.
+      * **marker side-order violation** — a snippet-new line declared
+        before the first marker must precede every surviving original in
+        its segment, and one declared after the last marker must follow
+        every survivor. A new line teleported to the wrong side of the
+        preserved gap is rejected even when nothing is deleted. New lines
+        declared between two markers are position-ambiguous and impose no
+        side constraint.
+
+    ``_replacement_key`` (imported from :mod:`text_match`) is the single
+    shared identity heuristic — the validator maintains no second
+    language model. Returns ``1.0`` for a clean merge, ``0.0`` otherwise.
     """
-    orig_lines = original_chunk.splitlines()
-    merged_lines = merged_chunk.splitlines()
-    snippet_lines = snippet.splitlines()
+    # Marker leak guard. Scan the raw merged chunk first so a leaked
+    # marker cannot be hidden by the stripped-line comparison below.
+    for raw_line in merged_chunk.splitlines():
+        if raw_line.strip() and _is_marker_line(raw_line):
+            return 0.0
 
-    # Non-marker snippet lines = the intended changes
-    snippet_code: set[str] = set()
-    for sl in snippet_lines:
-        s = sl.strip()
-        if s and not _is_marker_line(sl):
-            snippet_code.add(s)
+    orig = _real_lines(original_chunk)
+    merged = _real_lines(merged_chunk)
+    tokens = _classify_snippet(snippet, orig)
 
-    orig_set = {line.strip() for line in orig_lines if line.strip()}
+    return 1.0 if _merge_is_faithful(orig, merged, tokens) else 0.0
 
-    # Anchor lines: original lines NOT in the snippet's change set
-    anchors: list[str] = []
-    for ol in orig_lines:
-        s = ol.strip()
+
+def _classify_snippet(
+    snippet: str,
+    orig: list[str],
+) -> list[tuple[str, int | None, str | None]]:
+    """Forward-scan the snippet into ordered tokens.
+
+    Each token is ``("context", orig_idx, line)``, ``("new", None, line)``
+    or ``("marker", None, None)``. A non-marker snippet line is a *context*
+    anchor when it matches an as-yet-unconsumed original line (scanning
+    forward, so anchors are strictly increasing in ``orig_idx``); otherwise
+    it is a *new* line. This mirrors the classification in
+    ``deterministic_edit`` so the validator stays aligned with the engine
+    that produces real faithful merges.
+    """
+    tokens: list[tuple[str, int | None, str | None]] = []
+    cursor = 0
+    for raw in snippet.splitlines():
+        s = raw.strip()
         if not s:
             continue
-        if s in snippet_code:
+        if _is_marker_line(raw):
+            tokens.append(("marker", None, None))
             continue
-        anchors.append(s)
+        match_idx = None
+        for i in range(cursor, len(orig)):
+            if orig[i] == s:
+                match_idx = i
+                break
+        if match_idx is not None:
+            tokens.append(("context", match_idx, s))
+            cursor = match_idx + 1
+        else:
+            tokens.append(("new", None, s))
+    return tokens
+
+
+def _merge_is_faithful(
+    orig: list[str],
+    merged: list[str],
+    tokens: list[tuple[str, int | None, str | None]],
+) -> bool:
+    """Check the merge against the per-segment invariants.
+
+    Context anchors must appear in the merge in order (else declared
+    context was dropped or shuffled). The anchors partition the original
+    and the merge into aligned leading ("pre"), internal ("mid") and
+    trailing ("post") segments, each validated by
+    :func:`_segment_is_faithful`.
+    """
+    anchors = [t[1] for t in tokens if t[0] == "context"]
+
+    # Locate each anchor in the merge, in order. A missing or out-of-order
+    # anchor means declared context was lost or reordered.
+    merged_pos: list[int] = []
+    mcursor = 0
+    for a in anchors:
+        val = orig[a]
+        found = None
+        for j in range(mcursor, len(merged)):
+            if merged[j] == val:
+                found = j
+                break
+        if found is None:
+            return False
+        merged_pos.append(found)
+        mcursor = found + 1
+
+    for orig_seg, merged_seg, seg_tokens, kind in _build_segments(
+        orig, merged, tokens, anchors, merged_pos
+    ):
+        if not _segment_is_faithful(orig_seg, merged_seg, seg_tokens, kind):
+            return False
+    return True
+
+
+def _build_segments(
+    orig: list[str],
+    merged: list[str],
+    tokens: list[tuple[str, int | None, str | None]],
+    anchors: list[int],
+    merged_pos: list[int],
+) -> list[tuple[list[str], list[str], list[tuple[str, int | None, str | None]], str]]:
+    """Slice orig, merged and the snippet tokens into aligned segments.
+
+    Returns ``(orig_seg, merged_seg, seg_tokens, kind)`` per segment, where
+    ``seg_tokens`` are the non-context tokens (new lines and markers)
+    declared in that segment and ``kind`` is ``"pre"``, ``"mid"``,
+    ``"post"`` or ``"full"`` (the whole span when there are no anchors).
+    """
+    # Group non-context tokens by the anchor they follow: rank -1 means
+    # "before the first anchor", rank k means "after anchor k".
+    groups: dict[int, list[tuple[str, int | None, str | None]]] = {}
+    anchor_rank = -1
+    for t in tokens:
+        if t[0] == "context":
+            anchor_rank += 1
+        else:
+            groups.setdefault(anchor_rank, []).append(t)
 
     if not anchors:
-        return 1.0
+        return [(orig, merged, groups.get(-1, []), "full")]
 
-    merged_set = {line.strip() for line in merged_lines}
-    survived = sum(1 for a in anchors if a in merged_set)
-    anchor_score = survived / len(anchors)
+    segments: list[
+        tuple[list[str], list[str], list[tuple[str, int | None, str | None]], str]
+    ] = []
+    segments.append((
+        orig[:anchors[0]],
+        merged[:merged_pos[0]],
+        groups.get(-1, []),
+        "pre",
+    ))
+    for k in range(len(anchors) - 1):
+        segments.append((
+            orig[anchors[k] + 1:anchors[k + 1]],
+            merged[merged_pos[k] + 1:merged_pos[k + 1]],
+            groups.get(k, []),
+            "mid",
+        ))
+    segments.append((
+        orig[anchors[-1] + 1:],
+        merged[merged_pos[-1] + 1:],
+        groups.get(len(anchors) - 1, []),
+        "post",
+    ))
+    return segments
 
-    # Invention penalty: lines in output that don't come from original or snippet
-    merged_real = [line.strip() for line in merged_lines if line.strip()]
-    if merged_real:
-        invented = sum(1 for m in merged_real if m not in orig_set and m not in snippet_code)
-        invention_rate = invented / len(merged_real)
-    else:
-        invention_rate = 0.0
 
-    # Marker leak: if the model left "... existing code ..." in output,
-    # it didn't actually merge — it echoed the snippet placeholders
-    marker_leak = sum(1 for m in merged_real if _is_marker_line(m))
-    if marker_leak > 0:
-        return max(0.0, anchor_score - invention_rate - 0.3)
+def _segment_is_faithful(
+    orig_seg: list[str],
+    merged_seg: list[str],
+    seg_tokens: list[tuple[str, int | None, str | None]],
+    kind: str,
+) -> bool:
+    """Validate one segment against the marker invariants.
 
-    # Combined: anchor preservation minus invention penalty
-    return max(0.0, anchor_score - invention_rate)
+    Boundary segments (pre/post/full) preserve their originals by default
+    and become replacement zones only when they carry new lines with no
+    marker. Internal (mid) segments without a marker are replacement zones
+    (the gap is overwritten). Marker segments preserve originals unless a
+    deletion is locally justified, and their new lines must satisfy the
+    marker side-order invariant (see :func:`_new_side_order_ok`).
+    """
+    new_all = [t[2] for t in seg_tokens if t[0] == "new"]
+    has_marker = any(t[0] == "marker" for t in seg_tokens)
+
+    if has_marker:
+        protected = True
+    elif kind == "mid":
+        protected = False
+    else:  # boundary segment
+        protected = not new_all
+
+    if not protected:
+        # Replacement zone: the originals are overwritten wholesale, so the
+        # merged segment must be exactly the declared new lines.
+        return merged_seg == new_all
+
+    # Protected: survivors are the originals kept (longest common
+    # subsequence); the remaining merged lines are new and must equal the
+    # declared new lines exactly. Every deleted original must be justified.
+    kept_orig, kept_merged = _lcs_matched(orig_seg, merged_seg)
+    new_in_merged = [
+        merged_seg[j] for j in range(len(merged_seg)) if j not in kept_merged
+    ]
+    if new_in_merged != new_all:
+        return False
+
+    # Marker side-order invariant: a snippet-new line declared before the
+    # first marker must precede every surviving original in the merge, and a
+    # new line declared after the last marker must follow every survivor.
+    # Checked before the deletion shortcut below because a wrong-side new
+    # line can violate the invariant with no deletion at all (the survivor
+    # multiset is intact — only the relative placement is corrupt).
+    if has_marker and not _new_side_order_ok(seg_tokens, merged_seg, kept_merged):
+        return False
+
+    deleted = [i for i in range(len(orig_seg)) if i not in kept_orig]
+    if not deleted:
+        return True
+    if not has_marker:
+        # Protected boundary segment with no marker: every original must
+        # survive — a deletion here has no local justification.
+        return False
+
+    marker_positions = [i for i, t in enumerate(seg_tokens) if t[0] == "marker"]
+    first_marker, last_marker = marker_positions[0], marker_positions[-1]
+    new_before = [
+        t[2] for i, t in enumerate(seg_tokens)
+        if t[0] == "new" and i < first_marker
+    ]
+    new_after = [
+        t[2] for i, t in enumerate(seg_tokens)
+        if t[0] == "new" and i > last_marker
+    ]
+    return _deletions_justified(
+        orig_seg, deleted, new_all, new_before, new_after
+    )
+
+
+def _deletions_justified(
+    orig_seg: list[str],
+    deleted: list[int],
+    new_all: list[str],
+    new_before: list[str],
+    new_after: list[str],
+) -> bool:
+    """Decide whether every deleted marker-protected original is justified.
+
+    A *keyed* original (``_replacement_key`` is not ``None``) may be deleted
+    only when exactly one original and exactly one declared new line share
+    its key — a unique shared identity. Any other keyed deletion fails
+    closed. An *identity-free* original may be deleted by positional
+    fallback only, when it sits contiguously against a marker boundary that
+    carries an identity-free new line (front for lines declared before the
+    marker, back for lines declared after) — never an arbitrary bystander.
+    """
+    n = len(orig_seg)
+    deleted_set = set(deleted)
+
+    orig_keys = [_replacement_key(line) for line in orig_seg]
+    orig_key_count: dict[str, int] = {}
+    for k in orig_keys:
+        if k is not None:
+            orig_key_count[k] = orig_key_count.get(k, 0) + 1
+    new_key_count: dict[str, int] = {}
+    for line in new_all:
+        k = _replacement_key(line)
+        if k is not None:
+            new_key_count[k] = new_key_count.get(k, 0) + 1
+
+    positional: list[int] = []
+    for i in deleted:
+        k = orig_keys[i]
+        if k is not None:
+            # Keyed deletion: require a unique shared identity on both sides.
+            if orig_key_count.get(k, 0) == 1 and new_key_count.get(k, 0) == 1:
+                continue
+            return False
+        positional.append(i)
+
+    if not positional:
+        return True
+
+    # Positional fallback capacity comes from identity-free new lines on
+    # each side; deletions must form a contiguous run against that boundary.
+    front_cap = sum(1 for line in new_before if _replacement_key(line) is None)
+    back_cap = sum(1 for line in new_after if _replacement_key(line) is None)
+
+    front_run = 0
+    while front_run < n and front_run in deleted_set:
+        front_run += 1
+    back_run = 0
+    while back_run < n and (n - 1 - back_run) in deleted_set:
+        back_run += 1
+    front_cover = min(front_run, front_cap)
+    back_cover = min(back_run, back_cap)
+
+    for i in positional:
+        if i < front_cover or i >= n - back_cover:
+            continue
+        return False
+    return True
+
+
+def _new_side_order_ok(
+    seg_tokens: list[tuple[str, int | None, str | None]],
+    merged_seg: list[str],
+    kept_merged: set[int],
+) -> bool:
+    """Check the marker side-order invariant for one protected segment.
+
+    A snippet-new line declared *before the first marker* is a top-of-gap
+    insertion — it must occur before every surviving original in the merge.
+    A new line declared *after the last marker* is a bottom-of-gap
+    insertion — it must occur after every survivor. A new line declared
+    *between* two markers is position-ambiguous and imposes no constraint;
+    the caller's invention/omission/deletion checks still apply to it.
+
+    The k-th unmatched merged occurrence (in merge order) corresponds to the
+    k-th declared new line, because the caller has already verified the
+    merged new lines equal the declared new lines in order and multiplicity.
+    Enforcing the constraint on the concrete merged indices from the LCS
+    alignment — not on line values or global counts — keeps repeated
+    survivors and repeated new lines correctly positioned, so an LCS tie
+    cannot hide a wrong-side new occurrence.
+
+    Returns ``True`` when the segment carries no marker or no surviving
+    original (the constraint is then vacuous — deletion justification still
+    governs acceptance upstream).
+    """
+    marker_positions = [i for i, t in enumerate(seg_tokens) if t[0] == "marker"]
+    if not marker_positions:
+        return True
+    first_marker, last_marker = marker_positions[0], marker_positions[-1]
+
+    # Side of each declared new line, in declared order. This list is
+    # parallel to the unmatched merged occurrences (same length, same order).
+    new_sides: list[str] = []
+    for i, t in enumerate(seg_tokens):
+        if t[0] != "new":
+            continue
+        if i < first_marker:
+            new_sides.append("before")
+        elif i > last_marker:
+            new_sides.append("after")
+        else:
+            new_sides.append("between")
+
+    survivors = sorted(kept_merged)
+    if not survivors:
+        return True
+    first_survivor, last_survivor = survivors[0], survivors[-1]
+
+    unmatched = [j for j in range(len(merged_seg)) if j not in kept_merged]
+    for side, j in zip(new_sides, unmatched):
+        if side == "before" and j > first_survivor:
+            return False
+        if side == "after" and j < last_survivor:
+            return False
+    return True
+
+
+def _lcs_matched(
+    a: list[str],
+    b: list[str],
+) -> tuple[set[int], set[int]]:
+    """Longest-common-subsequence alignment of two line lists.
+
+    Returns ``(matched_a, matched_b)`` — the index sets paired by an LCS.
+    ``matched_a`` identifies the originals that survived; the unmatched
+    ``b`` indices are the merge's new lines. Order and multiplicity of
+    repeated lines are respected (this is a subsequence match, not a set).
+    """
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return set(), set()
+    dp = [[0] * (lb + 1) for _ in range(la + 1)]
+    for i in range(la - 1, -1, -1):
+        for j in range(lb - 1, -1, -1):
+            if a[i] == b[j]:
+                dp[i][j] = dp[i + 1][j + 1] + 1
+            else:
+                dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
+    matched_a: set[int] = set()
+    matched_b: set[int] = set()
+    i = j = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            matched_a.add(i)
+            matched_b.add(j)
+            i += 1
+            j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return matched_a, matched_b
+
+
+def _real_lines(s: str) -> list[str]:
+    """Stripped, non-blank, non-marker lines — the lines that carry
+    real content for the diff."""
+    return [
+        ln.strip()
+        for ln in s.splitlines()
+        if ln.strip() and not _is_marker_line(ln)
+    ]
 
 
 # ---------------------------------------------------------------------------
