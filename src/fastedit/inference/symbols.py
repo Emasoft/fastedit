@@ -81,11 +81,15 @@ def delete_symbol(
     start_idx = target.line_start - 1  # 0-indexed
     end_idx = target.line_end           # exclusive
 
-    # Strip trailing blank lines that belong to the deleted symbol
+    # Strip ALL trailing blank lines that separated the deleted symbol from
+    # whatever follows it. Consuming only a single blank line (the previous
+    # behavior) left a stray extra blank line behind whenever the file used
+    # a 2-blank-line separator style (e.g. PEP 8 top-level defs): the
+    # leading blank lines already preserved before start_idx become the new
+    # separator, so any trailing blanks left uncollapsed are pure surplus.
+    # This was a silent, deterministic (exit 0) formatting corruption.
     while end_idx < total_lines and original_lines[end_idx].strip() == "":
         end_idx += 1
-        # Only consume one trailing blank line as separator
-        break
 
     result_lines = original_lines[:start_idx] + original_lines[end_idx:]
     merged_code = "".join(result_lines)
