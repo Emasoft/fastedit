@@ -89,7 +89,7 @@ class BackupStore:
             logger.info("Pruned %d stale backup(s) older than 24h", pruned)
 
 
-def _atomic_write(path: Path, content: str, backups=None) -> None:
+def _atomic_write(path: Path, content: str | bytes, backups=None) -> None:
     """Write content to a file atomically via temp file + rename.
 
     Prevents corrupt files if the process is interrupted mid-write.
@@ -97,6 +97,12 @@ def _atomic_write(path: Path, content: str, backups=None) -> None:
     If *backups* is provided and the file already exists, the current content
     is saved into backups before overwriting. This enables 1-deep undo via
     ``fast_undo``. Backups persist to disk (~/.fastedit/backups/).
+
+    *content* may be str (every caller except duplicate) or bytes (used
+    only by `fastedit duplicate` for a byte-for-byte copy that never
+    decodes the source). Backups themselves are still always read/stored
+    as text -- overwriting an existing *binary* destination is an
+    unrelated, pre-existing edge case this does not change.
     """
     if backups is not None and path.exists():
         backups[str(path)] = path.read_text(encoding="utf-8")
@@ -105,7 +111,8 @@ def _atomic_write(path: Path, content: str, backups=None) -> None:
     )
     closed = False
     try:
-        os.write(fd, content.encode("utf-8"))
+        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        os.write(fd, data)
         os.close(fd)
         closed = True
         os.replace(tmp, path)  # atomic on POSIX

@@ -724,10 +724,10 @@ def cmd_create(args):
     stdin), or stdin directly when neither flag is given. Refuses to
     overwrite an existing file unless --force is set, refuses a missing
     parent directory unless --parents is set, and refuses content the
-    fastedit.data_gen.ast_analyzer text/binary detector sniffs as binary
+    fastedit.filetype text/binary detector sniffs as binary
     (never by extension).
     """
-    from .data_gen.ast_analyzer import is_text_file
+    from .filetype import is_text_file
     from .mcp.backup import BackupStore, _atomic_write
 
     path = Path(args.file)
@@ -770,15 +770,15 @@ def cmd_create(args):
 
 
 def cmd_duplicate(args):
-    """Duplicate a text file byte-for-byte to a new path.
+    """Duplicate a file byte-for-byte to a new path.
 
-    Refuses when the source doesn't exist, when the source's content is
-    sniffed as binary by the fastedit.data_gen.ast_analyzer text/binary
-    detector (never by extension), when the destination already exists
-    unless --force is set, or when the destination's parent directory is
-    missing unless --parents is set.
+    Refuses when the source doesn't exist, when the destination already
+    exists unless --force is set, or when the destination's parent
+    directory is missing unless --parents is set. The content is copied
+    as raw bytes with no decode step -- a byte-for-byte copy has nothing
+    for a text/binary detector to protect against, so a binary source
+    (images, archives, etc.) duplicates cleanly.
     """
-    from .data_gen.ast_analyzer import is_text_file
     from .mcp.backup import BackupStore, _atomic_write
 
     src = Path(args.src)
@@ -787,10 +787,6 @@ def cmd_duplicate(args):
         sys.exit(1)
 
     raw = src.read_bytes()
-    detection = is_text_file(raw)
-    if not detection.is_text:
-        print(f"Error: refusing to duplicate a binary file: {args.src} ({detection.reason})", file=sys.stderr)
-        sys.exit(1)
 
     dst = Path(args.dst)
     if dst.exists() and not args.force:
@@ -802,18 +798,169 @@ def cmd_duplicate(args):
             sys.exit(1)
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        print(f"Error: {args.src} is not valid UTF-8 text ({e})", file=sys.stderr)
-        sys.exit(1)
-
     backups = BackupStore()
-    _atomic_write(dst, content, backups=backups)
-    total_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+    _atomic_write(dst, raw, backups=backups)
+    total_lines = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
     print(f"Duplicated {args.src} to {args.dst} ({total_lines} lines).")
 
-    _report_symbols_after_write(args.dst, content, total_lines)
+    _report_symbols_after_write(args.dst, raw.decode("utf-8", errors="replace"), total_lines)
+
+def cmd_split(args):
+    """Split a file into per-chunk parts under --out, format-aware where possible."""
+    import json as json_mod
+
+    from .filetype import is_text_file
+    from .split_join import (
+        MANIFEST_NAME,
+        SplitJoinError,
+        detect_format,
+        split_by_lines,
+        split_csv_rows,
+        split_json_array,
+        split_markdown_headings,
+        split_markup_top_level_children,
+    )
+
+    src = Path(args.file)
+    if not src.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+
+    raw = src.read_bytes()
+    detection = is_text_file(raw)
+    if not detection.is_text:
+        print(f"Error: refusing to split a binary file: {args.file} ({detection.reason})", file=sys.stderr)
+        sys.exit(1)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(f"Error: {args.file} is not valid UTF-8 text ({e})", file=sys.stderr)
+        sys.exit(1)
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fmt = detect_format(src)
+    ext = src.suffix
+    manifest: dict = {"source_name": src.name, "format": fmt}
+
+    def _write_parts(chunks: list[str]) -> list[str]:
+        names = []
+        for i, chunk in enumerate(chunks):
+            name = f"part-{i:04d}{ext}"
+            (out_dir / name).write_text(chunk, encoding="utf-8")
+            names.append(name)
+        return names
+
+    try:
+        if args.by == "element":
+            if fmt == "json":
+                prefix, elements, separators, suffix = split_json_array(text)
+                manifest.update({
+                    "mode": "element",
+                    "joinable": True,
+                    "parts": _write_parts(elements),
+                    "json_prefix": prefix,
+                    "json_separators": separators,
+                    "json_suffix": suffix,
+                })
+            elif fmt in ("xml", "html"):
+                children = split_markup_top_level_children(text)
+                if not children:
+                    print(f"Error: no top-level child elements found in {args.file}", file=sys.stderr)
+                    sys.exit(1)
+                manifest.update({"mode": "element", "joinable": False, "parts": _write_parts(children)})
+                print(
+                    "Warning: XML/HTML element splits are lossy (fragments lose ancestor "
+                    "namespaces/xml:base/context) and read-only -- there is no `join` for this split.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Error: --by element does not apply to a {fmt} file (only json/xml/html)", file=sys.stderr)
+                sys.exit(1)
+        elif args.by == "heading":
+            if fmt != "markdown":
+                print(f"Error: --by heading does not apply to a {fmt} file (only markdown/mdx)", file=sys.stderr)
+                sys.exit(1)
+            chunks = split_markdown_headings(text, args.level)
+            manifest.update({"mode": "heading", "joinable": True, "level": args.level, "parts": _write_parts(chunks)})
+        elif args.lines is not None:
+            manifest.update({
+                "mode": "lines", "joinable": True, "parts": _write_parts(split_by_lines(text, args.lines)),
+            })
+        elif args.rows is not None:
+            if fmt not in ("csv", "tsv"):
+                print(f"Error: --rows does not apply to a {fmt} file (only csv/tsv)", file=sys.stderr)
+                sys.exit(1)
+            manifest.update({
+                "mode": "rows", "joinable": True, "parts": _write_parts(split_csv_rows(text, args.rows)),
+            })
+    except SplitJoinError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    (out_dir / MANIFEST_NAME).write_text(json_mod.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    n_parts = len(manifest["parts"])
+    print(f"Split {args.file} into {n_parts} part(s) in {args.out}.")
+
+
+def cmd_join(args):
+    """Join split parts back into one file, inverting `split`'s mode."""
+    import json as json_mod
+
+    from .split_join import (
+        MANIFEST_NAME,
+        detect_format,
+        join_csv_chunks,
+        join_json_array,
+    )
+
+    inputs = [Path(p) for p in args.inputs]
+    manifest = None
+    if len(inputs) == 1 and inputs[0].is_dir():
+        directory = inputs[0]
+        manifest_path = directory / MANIFEST_NAME
+        if not manifest_path.exists():
+            print(f"Error: no {MANIFEST_NAME} found in {directory}", file=sys.stderr)
+            sys.exit(1)
+        manifest = json_mod.loads(manifest_path.read_text(encoding="utf-8"))
+        part_paths = [directory / name for name in manifest["parts"]]
+    else:
+        part_paths = inputs
+        if part_paths:
+            manifest_path = part_paths[0].parent / MANIFEST_NAME
+            if manifest_path.exists():
+                manifest = json_mod.loads(manifest_path.read_text(encoding="utf-8"))
+
+    for p in part_paths:
+        if not p.exists():
+            print(f"Error: part not found: {p}", file=sys.stderr)
+            sys.exit(1)
+
+    if manifest is not None and manifest.get("joinable") is False:
+        mode = manifest.get("mode")
+        fmt = manifest.get("format")
+        print(
+            f"Error: this split is not joinable (mode={mode!r}, format={fmt!r}) -- "
+            "XML/HTML element splits are read-only.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    chunks = [p.read_text(encoding="utf-8") for p in part_paths]
+    mode = manifest.get("mode") if manifest else None
+    fmt = manifest.get("format") if manifest else detect_format(Path(args.out))
+
+    if mode == "element" and fmt == "json":
+        result = join_json_array(
+            manifest["json_prefix"], chunks, manifest["json_separators"], manifest["json_suffix"],
+        )
+    elif fmt in ("csv", "tsv"):
+        result = join_csv_chunks(chunks)
+    else:
+        result = "".join(chunks)
+
+    Path(args.out).write_text(result, encoding="utf-8")
+    print(f"Joined {len(part_paths)} part(s) into {args.out}.")
 
 
 def _format_search_results(stdout: str, mode: str) -> str:
@@ -1105,7 +1252,7 @@ def main():
     # --- duplicate (no model) ---
     duplicate_p = sub.add_parser(
         "duplicate",
-        help="Duplicate a text file to a new path",
+        help="Duplicate a file to a new path, byte-for-byte",
     )
     duplicate_p.add_argument("src", help="Path of the file to duplicate")
     duplicate_p.add_argument("dst", help="Destination path")
@@ -1119,6 +1266,42 @@ def main():
         action="store_true",
         help="Create missing destination parent directories",
     )
+
+    # --- split (no model) ---
+    split_p = sub.add_parser(
+        "split",
+        help="Split a file into per-chunk parts, format-aware where possible",
+    )
+    split_p.add_argument("file", help="Path to the file to split")
+    split_p.add_argument("--out", required=True, help="Output directory for the parts")
+    split_mode = split_p.add_mutually_exclusive_group(required=True)
+    split_mode.add_argument(
+        "--by", choices=["element", "heading"], default=None,
+        help="Split by structural element (json array / xml / html) or by heading (markdown)",
+    )
+    split_mode.add_argument(
+        "--lines", type=int, default=None,
+        help="Split into chunks of N lines (any text file)",
+    )
+    split_mode.add_argument(
+        "--rows", type=int, default=None,
+        help="Split into chunks of N data rows, repeating the header (csv/tsv)",
+    )
+    split_p.add_argument(
+        "--level", type=int, default=2,
+        help="Heading level for --by heading, e.g. 2 for '## ' (default: 2)",
+    )
+
+    # --- join (no model) ---
+    join_p = sub.add_parser(
+        "join",
+        help="Join split parts back into one file (inverts 'split')",
+    )
+    join_p.add_argument(
+        "inputs", nargs="+",
+        help="A split output directory, or explicit part files in order",
+    )
+    join_p.add_argument("-o", "--out", required=True, help="Destination file to write")
 
     # --- undo (no model) ---
     undo_p = sub.add_parser("undo", help="Revert the last edit to a file")
@@ -1170,6 +1353,10 @@ def main():
         cmd_create(args)
     elif args.command == "duplicate":
         cmd_duplicate(args)
+    elif args.command == "split":
+        cmd_split(args)
+    elif args.command == "join":
+        cmd_join(args)
     elif args.command == "undo":
         cmd_undo(args)
     elif args.command == "pull":

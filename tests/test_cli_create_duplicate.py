@@ -32,6 +32,24 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         env=env,
     )
 
+def _make_png_bytes() -> bytes:
+    """Build a real, minimal, valid PNG file in memory (8x8 IHDR + empty IDAT)."""
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            len(data).to_bytes(4, "big")
+            + tag
+            + data
+            + zlib.crc32(tag + data).to_bytes(4, "big")
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(b"IHDR", (8).to_bytes(4, "big") + (8).to_bytes(4, "big") + bytes([8, 2, 0, 0, 0]))
+    idat = chunk(b"IDAT", zlib.compress(b"\x00" + b"\x00" * 24))
+    iend = chunk(b"IEND", b"")
+    return signature + ihdr + idat + iend
+
 
 class TestCLICreate:
     def test_create_writes_content_from_flag(self, tmp_path: Path) -> None:
@@ -156,15 +174,16 @@ class TestCLIDuplicate:
         assert "source file not found" in result.stderr
         assert not dest.exists()
 
-    def test_duplicate_refuses_binary_source(self, tmp_path: Path) -> None:
-        """A binary source (NUL-bearing) is refused before any write happens."""
-        source = tmp_path / "payload.dat"
-        source.write_bytes(b"abc\x00def")
-        dest = tmp_path / "b.dat"
+    def test_duplicate_copies_binary_source_bytes_exactly(self, tmp_path: Path) -> None:
+        """A binary source (a real PNG) duplicates byte-for-byte -- no refusal, no decode."""
+        png_bytes = _make_png_bytes()
+        source = tmp_path / "logo.png"
+        source.write_bytes(png_bytes)
+        dest = tmp_path / "logo-old.png"
         result = run_cli("duplicate", str(source), str(dest))
-        assert result.returncode == 1
-        assert "binary" in result.stderr
-        assert not dest.exists()
+        assert result.returncode == 0
+        assert dest.read_bytes() == png_bytes
+        assert "Duplicated" in result.stdout
 
     def test_duplicate_refuses_existing_destination_without_force(self, tmp_path: Path) -> None:
         """An existing destination is refused with exit code 2, no --force."""

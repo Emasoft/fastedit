@@ -1,4 +1,4 @@
-"""Tests for fastedit.data_gen.ast_analyzer.is_text_file / detect_file_type.
+"""Tests for fastedit.filetype.is_text_file / detect_file_type.
 
 Covers both required lists from the phase-1 spec: real content for every
 text format that must be detected as text regardless of extension, and
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from fastedit.data_gen.ast_analyzer import detect_file_type, is_text_file
+from fastedit.filetype import detect_file_type, is_text_file
 
 # Real content for every format the spec requires to be classified as text.
 # The detector never looks at a name, so one representative snippet per
