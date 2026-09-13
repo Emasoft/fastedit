@@ -4,6 +4,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import shlex
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "install-fork.sh"
 
 
@@ -14,6 +16,21 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
+
+
+def spec_argv(stdout: str, prefix: str) -> str:
+    """Find the "+ <prefix><spec>" dry-run line and return the shell-unquoted spec.
+
+    Asserts the spec is copy-pasteable as ONE argv token (shlex.split
+    backslash-unescapes it back to the original string) rather than
+    checking for a literal quoting style, since printf %q's escaping
+    convention can vary.
+    """
+    for line in stdout.splitlines():
+        if line.startswith(f"+ {prefix}"):
+            tokens = shlex.split(line)
+            return tokens[-1]
+    raise AssertionError(f"no dry-run line starting with +{prefix!r} in:\n{stdout}")
 
 
 class TestInstallForkScriptExists:
@@ -30,10 +47,9 @@ class TestInstallForkDryRun:
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
         assert "uv tool uninstall fastedits" in result.stdout
-        assert (
-            "uv tool install fastedits @ "
-            "git+https://github.com/Emasoft/fastedit@feat/create-file"
-        ) in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == (
+            "fastedits @ git+https://github.com/Emasoft/fastedit@feat/create-file"
+        )
 
     def test_dry_run_sweeps_every_install_method(self) -> None:
         """Uninstall-first sweeps uv tool, pipx and pip so no leftover install collides."""
@@ -59,15 +75,17 @@ class TestInstallForkDryRun:
         """--ref pins the install to an explicit branch/tag/sha instead of the default."""
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert "git+https://github.com/Emasoft/fastedit@v1.2.3" in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == (
+            "fastedits @ git+https://github.com/Emasoft/fastedit@v1.2.3"
+        )
 
     def test_extras_flag_adds_bracketed_extras_to_package_spec(self) -> None:
         """--extras mlx,mcp installs fastedits[mlx,mcp] rather than the bare package."""
         result = run("--extras", "mlx,mcp", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert (
-            "fastedits[mlx,mcp] @ git+https://github.com/Emasoft/fastedit@"
-        ) in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == (
+            "fastedits[mlx,mcp] @ git+https://github.com/Emasoft/fastedit@feat/create-file"
+        )
 
 
 class TestInstallForkRevert:
@@ -76,7 +94,7 @@ class TestInstallForkRevert:
         result = run("--revert", "--dry-run")
         assert result.returncode == 0, result.stderr
         assert "uv tool uninstall fastedits" in result.stdout
-        assert "uv tool install fastedits" in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == "fastedits"
 
     def test_revert_dry_run_never_mentions_a_git_url(self) -> None:
         """--revert must install from PyPI, never reference the fork's git URL."""

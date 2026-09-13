@@ -91,12 +91,36 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
+# Render argv as a shell-quoted line a user can copy-paste and get the
+# same invocation (so a spec like "fastedits @ git+https://..." stays one
+# paste-able token). An argument made only of characters that never need
+# quoting (word chars, path/URL punctuation) is left bare -- that's the
+# common case (uv, tool, uninstall, fastedits) and unquoted reads best.
+# Anything else is wrapped in single quotes -- far more readable than
+# printf %q's backslash-per-space/bracket escaping -- except when the
+# argument itself contains a single quote, where %q is used instead so
+# correctness never depends on the nicer-looking branch.
+quote_argv() {
+  local out="" arg quoted
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^[A-Za-z0-9_./:+@=-]+$ ]]; then
+      quoted="$arg"
+    elif [[ "$arg" == *"'"* ]]; then
+      printf -v quoted '%q' "$arg"
+    else
+      quoted="'${arg}'"
+    fi
+    out+="${out:+ }${quoted}"
+  done
+  printf '%s' "$out"
+}
+
 # Run one uninstall command, tolerating "there was nothing to remove"
 # in whatever shape that tool spells it, without masking a real failure.
 run_uninstall_step() {
   local label="$1"
   shift
-  echo "+ $*"
+  echo "+ $(quote_argv "$@")"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
@@ -136,7 +160,7 @@ sweep_uninstall() {
 
 do_install() {
   local spec="$1"
-  echo "+ uv tool install ${spec}"
+  echo "+ uv tool install $(quote_argv "$spec")"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
@@ -165,11 +189,25 @@ detect_model() {
 
 pull_model() {
   local model="$1"
-  echo "+ fastedit pull --model ${model}"
+  echo "+ fastedit pull --model $(quote_argv "$model")"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
   fastedit pull --model "$model"
+}
+
+# A failed postflight is only useful if it tells the user how to fix it,
+# not just what's wrong -- otherwise it gets shrugged off as noise ("it
+# always says that") and the safety check it guards stops being trusted.
+# The usual fix is the one `uv tool install` itself hints at moments
+# earlier: uv's own bin dir isn't on PATH yet.
+print_path_hint() {
+  local uv_bin=""
+  uv_bin=$(uv tool dir --bin 2>/dev/null || true)
+  if [[ -n "$uv_bin" ]]; then
+    echo "hint: uv installs tools into ${uv_bin} -- make sure it's on PATH." >&2
+  fi
+  echo "hint: run 'uv tool update-shell' (then open a new shell) or add uv's tool bin dir to PATH yourself." >&2
 }
 
 # POSTFLIGHT — the whole point of this script. Resolve the fastedit that
@@ -180,6 +218,7 @@ verify_fork_install() {
   local resolved
   if ! resolved=$(command -v fastedit); then
     echo "error: no 'fastedit' found on PATH after install" >&2
+    print_path_hint
     exit 1
   fi
 
@@ -210,6 +249,7 @@ verify_fork_install() {
       printf '  %s\n' "$all_matches" >&2
     fi
     echo "error: the install did not actually put the fork in place — aborting" >&2
+    print_path_hint
     exit 1
   fi
 
