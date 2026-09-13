@@ -109,8 +109,16 @@ fi
 # floor of 0.5.0 is well below that and well above the issue. Warn rather than
 # abort -- the bound is inferred from an issue, not measured on old versions,
 # so refusing to install on it would be a guess with teeth.
+#
+# The MAJOR.MINOR shape is validated before comparing, and that guard is not
+# decoration -- it was measured. Without it, a `uv --version` whose second field
+# is not the version (a wrapper, a shim, a localized build printing
+# "uv version 0.12.12") makes the comparison operate on the literal word, and
+# bash arithmetic treats an unset name as 0, so BOTH tests pass and a MODERN uv
+# gets warned at. A warning that cries wolf is worse than no warning: it teaches
+# the reader to scroll past the one line that would have mattered.
 _uv_ver="$(uv --version 2>/dev/null | awk '{print $2}')"
-if [[ -n "$_uv_ver" ]]; then
+if [[ "$_uv_ver" =~ ^[0-9]+\.[0-9]+ ]]; then
   _uv_major="${_uv_ver%%.*}"
   _uv_minor="${_uv_ver#*.}"; _uv_minor="${_uv_minor%%.*}"
   if [[ "$_uv_major" -eq 0 && "$_uv_minor" -lt 5 ]]; then

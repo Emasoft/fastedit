@@ -58,6 +58,53 @@ def _default_extras() -> str:
         return "[vllm,mcp]"
     return "[mcp]"
 
+class TestUvVersionFloor:
+    """The preflight warns on a uv too old for bracket extras -- and only then."""
+
+    def _run_with_fake_uv(self, tmp_path: Path, version_line: str):
+        """Run the installer with a stub uv that prints `version_line`."""
+        import os
+
+        fake = tmp_path / "bin"
+        fake.mkdir(exist_ok=True)
+        stub = fake / "uv"
+        stub.write_text(
+            "#!/bin/bash\n"
+            '[[ "$1" == "--version" ]] && { echo "' + version_line + '"; exit 0; }\n'
+            "exit 0\n"
+        )
+        stub.chmod(0o755)
+        env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ["PATH"])
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--dry-run"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+
+    def test_old_uv_warns_about_silently_dropped_extras(self, tmp_path: Path) -> None:
+        """A sub-0.5 uv must warn: it drops bracket extras SILENTLY, so nothing else would tell you."""
+        r = self._run_with_fake_uv(tmp_path, "uv 0.4.30 (x 2024-01-01)")
+        assert "older than 0.5" in r.stdout + r.stderr
+
+    def test_modern_uv_is_silent(self, tmp_path: Path) -> None:
+        """A current uv must produce no version warning at all."""
+        r = self._run_with_fake_uv(tmp_path, "uv 0.12.12 (Homebrew)")
+        assert "older than 0.5" not in r.stdout + r.stderr
+
+    def test_unparseable_version_does_not_cry_wolf(self, tmp_path: Path) -> None:
+        """A shifted or absent version field must NOT warn.
+
+        MEASURED regression guard. Before the MAJOR.MINOR shape check, a
+        `uv --version` whose second field is not the version -- a wrapper or a
+        localized build printing "uv version 0.12.12" -- made the comparison
+        operate on the literal word, and bash arithmetic treats an unset name as
+        0, so both tests passed and a MODERN uv was warned at. A warning that
+        cries wolf is worse than none: it teaches the reader to scroll past the
+        one line that would have mattered.
+        """
+        for line in ("uv version 0.12.12", "uv"):
+            r = self._run_with_fake_uv(tmp_path, line)
+            assert "older than 0.5" not in r.stdout + r.stderr, line
+
 
 class TestInstallForkScriptExists:
     def test_script_exists_and_is_executable(self) -> None:
