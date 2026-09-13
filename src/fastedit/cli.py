@@ -243,6 +243,24 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # Parse invalid: fall through to model-based chunked_merge
     return None
 
+def _refuse_if_edit_broke_parse(path, original_code, merged_code, language):
+    """Raise when THIS edit is what broke the parse.
+
+    Gated on the original parsing so a file that was already unparseable
+    stays repairable by the only sanctioned writer on this machine; in
+    that case we abstain and the caller's existing warning stands.
+    """
+    from .data_gen.ast_analyzer import validate_parse
+    if not language:
+        return
+    if validate_parse(merged_code, language):
+        return
+    if not validate_parse(original_code, language):
+        return
+    raise ValueError(
+        f"merged output for {path} has parse errors; refusing to write. "
+        f"The file is unchanged."
+    )
 
 def cmd_edit(args):
     """Apply an edit snippet to a file using the FastEdit model."""
@@ -309,6 +327,11 @@ def cmd_edit(args):
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         if result is not None:
+            try:
+                _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
             _atomic_write(path, result.merged_code, backups=backups)
             note = _maybe_impact_note(result.merged_code)
             print(
@@ -337,6 +360,12 @@ def cmd_edit(args):
             after=after_sym,
             replace=replace_sym,
         )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -406,6 +435,11 @@ def cmd_batch_edit(args):
         merge_fn=backend.merge_auto,
         language=language,
     )
+    try:
+        _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     _atomic_write(path, result.merged_code, backups=backups)
     print(
         f"Applied {len(batch)} edits to {args.file}. "
@@ -493,6 +527,7 @@ def cmd_multi_edit(args):
                 merge_fn=backend.merge_auto,
                 language=detect_language(path),
             )
+            _refuse_if_edit_broke_parse(path, original_code, result.merged_code, detect_language(path))
         except (ValueError, OSError) as e:
             print(f"Error: {path}: {e}", file=sys.stderr)
             print("Error: no files were modified.", file=sys.stderr)
@@ -540,6 +575,7 @@ def cmd_delete(args):
         sys.exit(1)
 
     language = detect_language(path)
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     backups = BackupStore()
 
     # Cross-file caller-safety check (M2). Skipped when --force is set.
@@ -572,6 +608,12 @@ def cmd_delete(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     _atomic_write(path, result.merged_code, backups=backups)
 
     warn = ""
@@ -596,6 +638,7 @@ def cmd_move(args):
         sys.exit(1)
 
     language = detect_language(path)
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     backups = BackupStore()
 
     try:
@@ -605,6 +648,12 @@ def cmd_move(args):
             after=args.after,
             language=language,
         )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
