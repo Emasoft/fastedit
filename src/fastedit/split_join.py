@@ -81,18 +81,18 @@ def split_csv_rows(text: str, n: int) -> list[str]:
     return ["".join([header, *rows[i : i + n]]) for i in range(0, len(rows), n)]
 
 
-def join_csv_chunks(chunks: list[str]) -> str:
+def join_csv_chunks(chunks: list[bytes]) -> bytes:
     """Undo split_csv_rows: keep the first chunk whole, strip the repeated header from the rest."""
     if not chunks:
-        return ""
+        return b""
     out = [chunks[0]]
-    header = chunks[0].splitlines(keepends=True)[0] if chunks[0] else ""
+    header = chunks[0].splitlines(keepends=True)[0] if chunks[0] else b""
     for chunk in chunks[1:]:
         lines = chunk.splitlines(keepends=True)
         if lines and lines[0] == header:
             lines = lines[1:]
-        out.append("".join(lines))
-    return "".join(out)
+        out.append(b"".join(lines))
+    return b"".join(out)
 
 
 # --- Markdown heading chunking ---
@@ -173,14 +173,14 @@ def split_json_array(text: str) -> tuple[str, list[str], list[str], str]:
         raise SplitJoinError("malformed JSON array (expected ',' or ']')")
 
 
-def join_json_array(prefix: str, elements: list[str], separators: list[str], suffix: str) -> str:
+def join_json_array(prefix: str, elements: list[bytes], separators: list[str], suffix: str) -> bytes:
     """Undo split_json_array."""
     body = []
     for idx, element in enumerate(elements):
         body.append(element)
         if idx < len(separators):
-            body.append(separators[idx])
-    return prefix + "".join(body) + suffix
+            body.append(separators[idx].encode("utf-8"))
+    return prefix.encode("utf-8") + b"".join(body) + suffix.encode("utf-8")
 
 
 # --- XML/HTML top-level-child splitting (read-only: split, never join) ---

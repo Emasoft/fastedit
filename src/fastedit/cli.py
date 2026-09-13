@@ -946,7 +946,11 @@ def cmd_join(args):
         )
         sys.exit(1)
 
-    chunks = [p.read_text(encoding="utf-8") for p in part_paths]
+    # Read parts as raw bytes and write back as raw bytes: text-mode I/O here
+    # would run universal-newline translation on read (CRLF/CR -> LF), silently
+    # corrupting any part whose line endings are not bare LF. Bytes bypass that
+    # translation entirely, so join is byte-exact regardless of line ending.
+    chunks = [p.read_bytes() for p in part_paths]
     mode = manifest.get("mode") if manifest else None
     fmt = manifest.get("format") if manifest else detect_format(Path(args.out))
 
@@ -957,9 +961,9 @@ def cmd_join(args):
     elif fmt in ("csv", "tsv"):
         result = join_csv_chunks(chunks)
     else:
-        result = "".join(chunks)
+        result = b"".join(chunks)
 
-    Path(args.out).write_text(result, encoding="utf-8")
+    Path(args.out).write_bytes(result)
     print(f"Joined {len(part_paths)} part(s) into {args.out}.")
 
 

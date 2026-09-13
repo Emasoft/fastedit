@@ -147,6 +147,96 @@ class TestCLISplitJoinRoundTrip:
         assert result.returncode == 0
         assert rejoined.read_text(encoding="utf-8") == original
 
+    def test_crlf_round_trip_via_lines(self, tmp_path: Path) -> None:
+        """--lines split+join is byte-exact on CRLF line endings (no universal-newline translation)."""
+        original = b"l1\r\nl2\r\nl3\r\n"
+        source = tmp_path / "crlf.txt"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--lines", "2")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.txt"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
+    def test_cr_only_round_trip_via_lines(self, tmp_path: Path) -> None:
+        """--lines split+join is byte-exact on lone-CR (classic Mac) line endings."""
+        original = b"l1\rl2\rl3\r"
+        source = tmp_path / "cronly.txt"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--lines", "1")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.txt"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
+    def test_mixed_line_endings_round_trip_via_lines(self, tmp_path: Path) -> None:
+        """--lines split+join is byte-exact when a file mixes CRLF, LF and lone-CR endings."""
+        original = b"l1\r\nl2\nl3\r"
+        source = tmp_path / "mixed.txt"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--lines", "1")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.txt"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
+    def test_crlf_round_trip_via_rows(self, tmp_path: Path) -> None:
+        """--rows (CSV) split+join is byte-exact on CRLF line endings, including header de-dup."""
+        original = b"h1,h2\r\nr1a,r1b\r\nr2a,r2b\r\n"
+        source = tmp_path / "crlf.csv"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--rows", "1")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.csv"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
+    def test_cr_only_round_trip_via_rows(self, tmp_path: Path) -> None:
+        """--rows (CSV) split+join is byte-exact on lone-CR endings, including header de-dup."""
+        original = b"h1,h2\rr1a,r1b\rr2a,r2b\r"
+        source = tmp_path / "cronly.csv"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--rows", "1")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.csv"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
+    def test_mixed_line_endings_round_trip_via_rows(self, tmp_path: Path) -> None:
+        """--rows (CSV) split+join is byte-exact when the file mixes CRLF and lone-CR endings."""
+        original = b"h1,h2\r\nr1a,r1b\rr2a,r2b\r\n"
+        source = tmp_path / "mixed.csv"
+        source.write_bytes(original)
+
+        out_dir = tmp_path / "parts"
+        result = run_cli("split", str(source), "--out", str(out_dir), "--rows", "1")
+        assert result.returncode == 0
+
+        rejoined = tmp_path / "rejoined.csv"
+        result = run_cli("join", str(out_dir), "-o", str(rejoined))
+        assert result.returncode == 0
+        assert rejoined.read_bytes() == original
+
 
 class TestCLISplitXmlHtmlElement:
     def test_xml_by_element_splits_top_level_children(self, tmp_path: Path) -> None:

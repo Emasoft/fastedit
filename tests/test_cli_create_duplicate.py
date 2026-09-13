@@ -113,6 +113,18 @@ class TestCLICreate:
         assert result.returncode == 0
         assert new_file.read_text(encoding="utf-8") == "x = 1\n"
 
+    def test_create_preserves_crlf_content_from_file(self, tmp_path: Path) -> None:
+        """--content-file with CRLF line endings is written back byte-for-byte, not normalized to LF."""
+        new_file = tmp_path / "hello.txt"
+        content_file = tmp_path / "content.txt"
+        original = b"line1\r\nline2\r\nline3\r\n"
+        content_file.write_bytes(original)
+
+        result = run_cli("create", str(new_file), "--content-file", str(content_file))
+
+        assert result.returncode == 0
+        assert new_file.read_bytes() == original
+
     def test_create_reads_content_file_dash_from_stdin(self, tmp_path: Path) -> None:
         """--content-file - reads content from stdin."""
         new_file = tmp_path / "hello.py"
@@ -164,6 +176,18 @@ class TestCLIDuplicate:
         assert result.returncode == 0
         assert dest.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
         assert "Duplicated" in result.stdout
+
+    def test_duplicate_preserves_crlf_content(self, tmp_path: Path) -> None:
+        """duplicate copies CRLF line endings byte-for-byte, not normalized to LF."""
+        source = tmp_path / "a.txt"
+        original = b"line1\r\nline2\r\nline3\r\n"
+        source.write_bytes(original)
+        dest = tmp_path / "b.txt"
+
+        result = run_cli("duplicate", str(source), str(dest))
+
+        assert result.returncode == 0
+        assert dest.read_bytes() == original
 
     def test_duplicate_refuses_missing_source(self, tmp_path: Path) -> None:
         """A source that doesn't exist is refused with a clear message."""
