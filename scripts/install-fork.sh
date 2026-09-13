@@ -167,6 +167,22 @@ do_install() {
   uv tool install "$spec"
 }
 
+# Same install, but a failure is REPORTED rather than fatal. This exists for
+# exactly one caller: the optional backend-extra attempt below. The sweep
+# uninstalls before it installs, so any install step that can fail is a step
+# that can leave this machine with NO fastedit at all — and with no fastedit
+# there is no sanctioned way to edit source and repair it. A compiled extra
+# (mlx) is the only genuinely failure-prone spec this script builds, so it is
+# the one install that must never be allowed to abort the run.
+do_install_optional() {
+  local spec="$1"
+  echo "+ uv tool install $(quote_argv "$spec")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  uv tool install "$spec" || return 1
+}
+
 # `fastedit pull` (get_model_path) already resolves env var -> local dir
 # -> cache dir -> download, in that order, so it's a no-op when the
 # model is already cached. We don't re-implement that lookup here —
@@ -182,6 +198,25 @@ detect_model() {
   fi
   if [[ "$os" == "Linux" ]] && command -v nvidia-smi >/dev/null 2>&1; then
     echo "bf16"
+    return 0
+  fi
+  return 1
+}
+
+# The backend EXTRA that makes detect_model's choice loadable. Only the
+# Darwin/arm64 -> mlx pair is asserted here, because it is the only one
+# measured: on 2026-09-13 an extras-less install on this machine cached 1.7 GB
+# at mlx-8bit and then died with `ModuleNotFoundError: No module named 'mlx'`
+# on the first model-merge edit. The Linux/bf16 case is deliberately NOT
+# mapped -- which runtime serves bf16 was never verified here, and guessing
+# `vllm` would put one of the most install-hostile packages in the ecosystem
+# on the failure path of a platform this repo cannot test.
+detect_backend_extra() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  if [[ "$os" == "Darwin" && "$arch" == "arm64" ]]; then
+    echo "mlx"
     return 0
   fi
   return 1
@@ -270,13 +305,47 @@ if [[ "$REVERT" -eq 1 ]]; then
 else
   echo "Installing fork ${FORK_URL}@${REF} in place of upstream ${PACKAGE}..."
   sweep_uninstall "$PACKAGE"
-  do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
+
+  # Two-phase, and the order is the whole point. The model is only useful if
+  # the backend that loads it is installed, so try the backend extra FIRST --
+  # but never let that attempt decide whether this machine ends up with a
+  # fastedit. `mlx` is a compiled wheel; resolution or build CAN fail, and the
+  # sweep above has already removed the previous install. So a failure falls
+  # back to the bare spec (the near-unfailable pure-Python one) and downgrades
+  # to deterministic-edit-only, which still works.
+  # BACKEND_READY is tracked rather than probed: we know what we installed,
+  # whereas grepping `fastedit doctor` would mean parsing decorated human
+  # output to rediscover a fact we already hold.
+  BACKEND_READY=0
+  BACKEND_EXTRA=""
+  if [[ -z "$EXTRAS" ]] && BACKEND_EXTRA=$(detect_backend_extra); then
+    if do_install_optional "${PACKAGE}[${BACKEND_EXTRA}] @ git+${FORK_URL}@${REF}"; then
+      BACKEND_READY=1
+    else
+      echo "warning: installing the '${BACKEND_EXTRA}' backend extra failed; falling back to a bare install." >&2
+      echo "warning: deterministic edits will work; model-merge edits will not, and the model pull is skipped." >&2
+      echo "warning: to retry the backend later: uv tool install --force '${PACKAGE}[${BACKEND_EXTRA}] @ git+${FORK_URL}@${REF}'" >&2
+      do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
+    fi
+  else
+    # An explicit --extras (including --extras "") is the user's call: honour
+    # it exactly and make no backend guess on top of it.
+    do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
+    case ",${EXTRAS}," in *,mlx,*|*,vllm,*) BACKEND_READY=1 ;; esac
+  fi
+
   if [[ "$DRY_RUN" -eq 0 ]]; then
     verify_fork_install
   fi
 
   if [[ "$NO_MODEL" -eq 0 ]]; then
-    if MODEL=$(detect_model); then
+    if [[ "$BACKEND_READY" -eq 0 ]]; then
+      # Skipping is the point: pulling ~1.7 GB that nothing can load is what
+      # this script used to do, and it produced a green install whose first
+      # model-merge edit raised ModuleNotFoundError.
+      echo "note: no merge backend installed — skipping the model pull (it would be ~1.7 GB nothing can load)."
+      echo "note: install a backend first, then run 'fastedit pull' — see the warnings above."
+    elif MODEL=$(detect_model); then
       pull_model "$MODEL"
       if [[ "$DRY_RUN" -eq 0 ]]; then
         fastedit doctor || true
