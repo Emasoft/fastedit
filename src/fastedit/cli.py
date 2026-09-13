@@ -454,6 +454,12 @@ def cmd_multi_edit(args):
             problems.append(f"file not found: {path}")
         elif not path.is_file():
             problems.append(f"not a regular file: {path}")
+        if not isinstance(entry["edits"], list) or not all(
+            isinstance(e, dict) and "snippet" in e for e in entry["edits"]
+        ):
+            problems.append(
+                f"entry {index}: 'edits' must be a list of objects each with 'snippet'"
+            )
     if problems:
         for problem in problems:
             print(f"Error: {problem}", file=sys.stderr)
@@ -478,8 +484,8 @@ def cmd_multi_edit(args):
             )
             for e in entry["edits"]
         ]
-        original_code = path.read_bytes().decode("utf-8", errors="replace")
         try:
+            original_code = path.read_bytes().decode("utf-8", errors="replace")
             result = batch_chunked_merge(
                 original_code=original_code,
                 edits=batch,
@@ -487,7 +493,7 @@ def cmd_multi_edit(args):
                 merge_fn=backend.merge_auto,
                 language=detect_language(path),
             )
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             print(f"Error: {path}: {e}", file=sys.stderr)
             print("Error: no files were modified.", file=sys.stderr)
             sys.exit(1)
