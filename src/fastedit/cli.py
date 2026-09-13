@@ -675,6 +675,147 @@ def cmd_move_to_file(args):
     print(plan.message)
 
 
+
+def _report_symbols_after_write(file_str: str, content: str, total_lines: int) -> None:
+    """Print a symbol summary for a just-written file, or say why there isn't one.
+
+    Shared by cmd_create and cmd_duplicate so both report the same way: a
+    small file gets the inline preview, a large parseable file gets a
+    tldr-structure summary, and an unparseable language just gets a note.
+    """
+    import json as json_mod
+    import subprocess
+
+    from .data_gen.ast_analyzer import detect_language
+
+    language = detect_language(Path(file_str))
+    if language is None:
+        print(f"Note: {file_str} has no fastedit/tldr language support -- skipped the symbol check.")
+        return
+
+    if total_lines <= 100:
+        print(_format_small_file(file_str, content, total_lines))
+        return
+
+    try:
+        result = subprocess.run(
+            ["tldr", "structure", file_str, "--format", "compact"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            print(f"Warning: tldr structure failed for {file_str}: {result.stderr.strip()}", file=sys.stderr)
+            return
+        data = json_mod.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        print(f"Warning: tldr structure timed out for {file_str}", file=sys.stderr)
+        return
+    except FileNotFoundError:
+        return
+    except json_mod.JSONDecodeError as e:
+        print(f"Warning: {e}", file=sys.stderr)
+        return
+
+    print(_format_structure(file_str, data, total_lines))
+
+def cmd_create(args):
+    """Create a new text file with the given content.
+
+    Content comes from --content, --content-file (a path, or '-' for
+    stdin), or stdin directly when neither flag is given. Refuses to
+    overwrite an existing file unless --force is set, refuses a missing
+    parent directory unless --parents is set, and refuses content the
+    fastedit.data_gen.ast_analyzer text/binary detector sniffs as binary
+    (never by extension).
+    """
+    from .data_gen.ast_analyzer import is_text_file
+    from .mcp.backup import BackupStore, _atomic_write
+
+    path = Path(args.file)
+    if path.exists() and not args.force:
+        print(f"Error: file already exists: {args.file} (use --force to overwrite)", file=sys.stderr)
+        sys.exit(2)
+    if not path.parent.exists():
+        if not args.parents:
+            print(f"Error: parent directory not found: {path.parent} (use --parents to create it)", file=sys.stderr)
+            sys.exit(1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.content is not None and args.content_file is not None:
+        print("Error: --content and --content-file are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if args.content is not None:
+        raw = args.content.encode("utf-8")
+    elif args.content_file is not None:
+        raw = sys.stdin.buffer.read() if args.content_file == "-" else Path(args.content_file).read_bytes()
+    else:
+        raw = sys.stdin.buffer.read()
+
+    detection = is_text_file(raw)
+    if not detection.is_text:
+        print(f"Error: refusing to create a binary file: {args.file} ({detection.reason})", file=sys.stderr)
+        sys.exit(1)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(f"Error: content for {args.file} is not valid UTF-8 text ({e})", file=sys.stderr)
+        sys.exit(1)
+
+    backups = BackupStore()
+    _atomic_write(path, content, backups=backups)
+    total_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+    print(f"Created {args.file} ({total_lines} lines).")
+
+    _report_symbols_after_write(args.file, content, total_lines)
+
+
+
+def cmd_duplicate(args):
+    """Duplicate a text file byte-for-byte to a new path.
+
+    Refuses when the source doesn't exist, when the source's content is
+    sniffed as binary by the fastedit.data_gen.ast_analyzer text/binary
+    detector (never by extension), when the destination already exists
+    unless --force is set, or when the destination's parent directory is
+    missing unless --parents is set.
+    """
+    from .data_gen.ast_analyzer import is_text_file
+    from .mcp.backup import BackupStore, _atomic_write
+
+    src = Path(args.src)
+    if not src.exists():
+        print(f"Error: source file not found: {args.src}", file=sys.stderr)
+        sys.exit(1)
+
+    raw = src.read_bytes()
+    detection = is_text_file(raw)
+    if not detection.is_text:
+        print(f"Error: refusing to duplicate a binary file: {args.src} ({detection.reason})", file=sys.stderr)
+        sys.exit(1)
+
+    dst = Path(args.dst)
+    if dst.exists() and not args.force:
+        print(f"Error: file already exists: {args.dst} (use --force to overwrite)", file=sys.stderr)
+        sys.exit(2)
+    if not dst.parent.exists():
+        if not args.parents:
+            print(f"Error: parent directory not found: {dst.parent} (use --parents to create it)", file=sys.stderr)
+            sys.exit(1)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(f"Error: {args.src} is not valid UTF-8 text ({e})", file=sys.stderr)
+        sys.exit(1)
+
+    backups = BackupStore()
+    _atomic_write(dst, content, backups=backups)
+    total_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+    print(f"Duplicated {args.src} to {args.dst} ({total_lines} lines).")
+
+    _report_symbols_after_write(args.dst, content, total_lines)
+
+
 def _format_search_results(stdout: str, mode: str) -> str:
     text = stdout.strip()
     if text:
@@ -934,6 +1075,51 @@ def main():
         help="Preview the plan without writing any files",
     )
 
+    # --- create (no model) ---
+    create_p = sub.add_parser(
+        "create",
+        help="Create a new source file with the given content",
+    )
+    create_p.add_argument("file", help="Path of the file to create")
+    create_p.add_argument(
+        "--content",
+        default=None,
+        help="File content (alternative: --content-file, or stdin if neither is given)",
+    )
+    create_p.add_argument(
+        "--content-file",
+        default=None,
+        help="Read file content from this path, or '-' for stdin",
+    )
+    create_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the file if it already exists",
+    )
+    create_p.add_argument(
+        "--parents",
+        action="store_true",
+        help="Create missing parent directories",
+    )
+
+    # --- duplicate (no model) ---
+    duplicate_p = sub.add_parser(
+        "duplicate",
+        help="Duplicate a text file to a new path",
+    )
+    duplicate_p.add_argument("src", help="Path of the file to duplicate")
+    duplicate_p.add_argument("dst", help="Destination path")
+    duplicate_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the destination if it already exists",
+    )
+    duplicate_p.add_argument(
+        "--parents",
+        action="store_true",
+        help="Create missing destination parent directories",
+    )
+
     # --- undo (no model) ---
     undo_p = sub.add_parser("undo", help="Revert the last edit to a file")
     undo_p.add_argument("file", help="Path to source file")
@@ -980,6 +1166,10 @@ def main():
         cmd_rename_all(args)
     elif args.command == "move-to-file":
         cmd_move_to_file(args)
+    elif args.command == "create":
+        cmd_create(args)
+    elif args.command == "duplicate":
+        cmd_duplicate(args)
     elif args.command == "undo":
         cmd_undo(args)
     elif args.command == "pull":
