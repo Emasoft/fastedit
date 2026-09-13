@@ -578,10 +578,17 @@ def _merge_preserve_siblings(
     """
     import logging
 
+    from ..split_join import detect_line_ending, normalize_line_endings
+
     _log = logging.getLogger("fastedit.chunked_merge")
 
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
+
+    # The file's own prevailing ending must win over the snippet's --
+    # inserted/edited spans are normalized to it, untouched original
+    # lines are never touched (TRDD-CMRMA2YG line-ending fix).
+    line_ending = detect_line_ending(original_code)
 
     # Race-free in-memory AST parse. `original_code` may differ from what
     # the tldr daemon has cached on disk; parsing in-memory is the only
@@ -622,7 +629,7 @@ def _merge_preserve_siblings(
     class_first_line = original_lines[class_start - 1] if class_start - 1 < total_lines else ""
     indent = class_first_line[: len(class_first_line) - len(class_first_line.lstrip())]
 
-    snippet_lines = snippet.splitlines(keepends=True)
+    snippet_lines = normalize_line_endings(snippet, line_ending).splitlines(keepends=True)
     snippet_first_nonblank = next(
         (ln for ln in snippet_lines if ln.strip()), class_first_line
     )
@@ -670,14 +677,15 @@ def _merge_preserve_siblings(
     assembled: list[str] = []
     assembled.extend(snippet_lines[:close_idx])
     # Blank-line separator before preserved siblings if the snippet doesn't
-    # already end with a blank line.
+    # already end with a blank line. Uses the file's own line ending so the
+    # splice does not leave a mixed-ending seam (TRDD-CMRMA2YG).
     if preserved_blocks and assembled and assembled[-1].strip() != "":
-        assembled.append("\n")
+        assembled.append(line_ending)
     for i, block in enumerate(preserved_blocks):
         assembled.append(block)
         # Blank-line separator between preserved siblings (not after last).
-        if i < len(preserved_blocks) - 1 and not block.endswith("\n\n"):
-            assembled.append("\n")
+        if i < len(preserved_blocks) - 1 and not block.endswith(("\n\n", "\r\n\r\n")):
+            assembled.append(line_ending)
     assembled.extend(snippet_lines[close_idx:])
 
     # Splice the assembled class body back into the original file.
