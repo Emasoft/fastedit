@@ -66,7 +66,7 @@ class BackupStore:
         key = self._key_path(file_path)
         if not key.exists():
             raise KeyError(file_path)
-        content = key.read_text(encoding="utf-8")
+        content = key.read_bytes().decode("utf-8")
         key.unlink()
         meta = self._meta_path(file_path)
         if meta.exists():
@@ -105,7 +105,7 @@ def _atomic_write(path: Path, content: str | bytes, backups=None) -> None:
     unrelated, pre-existing edge case this does not change.
     """
     if backups is not None and path.exists():
-        backups[str(path)] = path.read_text(encoding="utf-8")
+        backups[str(path)] = path.read_bytes().decode("utf-8")
     fd, tmp = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
     )
@@ -113,8 +113,8 @@ def _atomic_write(path: Path, content: str | bytes, backups=None) -> None:
     try:
         data = content if isinstance(content, bytes) else content.encode("utf-8")
         os.write(fd, data)
-        os.close(fd)
         closed = True
+        os.close(fd)
         os.replace(tmp, path)  # atomic on POSIX
     except BaseException:
         if not closed:
