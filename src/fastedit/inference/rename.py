@@ -359,14 +359,14 @@ def do_cross_file_rename(
 ) -> dict:
     """Rename old_name -> new_name across all supported code files under root_dir.
 
-    Drives edits from `tldr references <old_name> <root> --format json`, which
+    Drives edits from tldr references <old_name> <root> --format json, which
     uses tree-sitter + language-aware name resolution to distinguish real
     references from coincidental substrings in strings, comments, and
     docstrings. The previous text-based word-boundary engine is no longer the
-    primary match source — it used regex plus a tree-sitter skip-zone filter
-    and could not tell a variable `foo` from a class `Foo` at the same name.
+    primary match source -- it used regex plus a tree-sitter skip-zone filter
+    and could not tell a variable foo from a class Foo at the same name.
 
-    Does NOT write any files — returns a plan that callers can apply
+    Does NOT write any files -- returns a plan that callers can apply
     atomically or preview (dry-run).
 
     Args:
@@ -378,11 +378,11 @@ def do_cross_file_rename(
         ignore_dirs: Directory basenames to skip. Defaults to
             DEFAULT_IGNORE_DIRS.
         kind_filter: When set, restrict the rename to targets whose
-            tldr-resolved `definition.kind` matches. Valid values:
-            'class', 'function', 'method', 'variable'. Semantics: this
-            filters on the *definition's* kind (not per-reference usage kind)
+            tldr-resolved definition.kind matches. Valid values:
+            class, function, method, variable. Semantics: this
+            filters on the definition's kind (not per-reference usage kind)
             because tldr groups all refs under one resolved definition. An
-            unmatched filter returns an empty plan — the caller can retry
+            unmatched filter returns an empty plan -- the caller can retry
             without the filter or pick a different kind.
 
     Returns:
@@ -390,7 +390,7 @@ def do_cross_file_rename(
         for every file where replacement_count > 0. Files with zero matches
         are omitted. Binary / unreadable files are silently skipped. An
         empty dict is returned when old_name == new_name (no-op guard), when
-        tldr is unavailable, or when kind_filter doesn't match.
+        tldr is unavailable, or when kind_filter does not match.
     """
     from pathlib import Path
 
@@ -410,7 +410,7 @@ def do_cross_file_rename(
     ignore = ignore_dirs if ignore_dirs is not None else DEFAULT_IGNORE_DIRS
 
     # Walk once, keeping both a resolved->original map (so we can return the
-    # caller-facing Path as the dict key, not the realpath — tmp_path on
+    # caller-facing Path as the dict key, not the realpath -- tmp_path on
     # macOS contains a /private prefix after resolve()) and an allowed set.
     # The intersection with tldr's output enforces fastedit's pruning rules
     # (pyvenv.cfg marker, symlink non-following, supported_exts filter) which
@@ -427,9 +427,9 @@ def do_cross_file_rename(
 
     data = _run_tldr_references(old_name, root)
 
-    # kind_filter applies to the definition's kind. When the filter doesn't
+    # kind_filter applies to the definition's kind. When the filter does not
     # match the resolved definition, we return {} rather than silently
-    # dropping refs — avoids accidentally renaming a same-name variable
+    # dropping refs -- avoids accidentally renaming a same-name variable
     # when the caller asked for a class-only rename.
     if kind_filter is not None:
         definition = data.get("definition") or {}
@@ -438,7 +438,7 @@ def do_cross_file_rename(
 
     # Group refs by resolved path. Filter on confidence rather than kind so
     # non-AST-native langs (java/kotlin/ruby/swift/php/c#/cpp/c/scala/
-    # elixir/lua) still get real coverage — they receive kind="other" with
+    # elixir/lua) still get real coverage -- they receive kind="other" with
     # confidence=1.0 for real code hits and 0.5 for string substrings.
     refs_by_file: dict[Path, list[dict]] = {}
     for ref in data.get("references") or []:
@@ -460,7 +460,7 @@ def do_cross_file_rename(
     for resolved, refs in refs_by_file.items():
         original_path = resolved_to_original[resolved]
         try:
-            original = original_path.read_text(encoding="utf-8")
+            original = original_path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         new_content, count = _apply_refs_to_content(
@@ -469,9 +469,9 @@ def do_cross_file_rename(
         if count == 0:
             continue
         # 'skipped' is the number of raw word-boundary occurrences that tldr
-        # did *not* verify as a reference — i.e. hits that live inside
+        # did *not* verify as a reference -- i.e. hits that live inside
         # strings, comments, or docstrings. Computed client-side because
-        # tldr's output doesn't carry a per-file skip count.
+        # tldr's output does not carry a per-file skip count.
         raw_hits = len(word_pattern.findall(original))
         skipped = max(0, raw_hits - count)
         plan[original_path] = (new_content, count, skipped)
