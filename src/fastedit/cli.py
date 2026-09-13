@@ -158,6 +158,57 @@ def cmd_read(args):
 
     print(_format_structure(args.file, data, total_lines))
 
+def _snippet_has_any_definition(snippet):
+    """True if the snippet carries a definition line of its own.
+
+    Deliberately name-AGNOSTIC: renaming through --replace is legitimate
+    (the snippet defines a *different* name than the target), so requiring
+    the targets own name here would refuse a working rename edit. This only
+    asks "does the snippet define *something*", never "does it define the
+    targets name".
+    """
+    import re
+
+    from .inference.chunked_merge import _DEFINITION_PATTERNS
+
+    for line in snippet.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("//", "#", "*", "--")):
+            continue
+        for pattern in _DEFINITION_PATTERNS:
+            if pattern.search(line):
+                return True
+        if re.search(
+            r"\b(?:class|struct|enum|trait|interface|protocol|module|object|impl)\s+\w+",
+            line,
+        ):
+            return True
+    return False
+
+def _snippet_is_single_matching_definition(snippet, target_node):
+    """Python-only refinement: exactly one non-comment top-level node, of a
+    type matching target_node.kind (a decorated def/class always counts,
+    since the decorator wraps a real definition of either kind).
+    """
+    import textwrap
+
+    from .data_gen.ast_analyzer import parse_code
+
+    dedented = textwrap.dedent(snippet)
+    tree = parse_code(dedented, "python")
+    nodes = [c for c in tree.root_node.children if c.type != "comment"]
+    if len(nodes) != 1:
+        return False
+    node = nodes[0]
+    if node.type == "decorated_definition":
+        return True
+    kind_to_node_type = {
+        "function": "function_definition",
+        "method": "function_definition",
+        "class": "class_definition",
+    }
+    return node.type == kind_to_node_type.get(target_node.kind)
+
 
 def _try_deterministic_replace(path, original_code, original_lines, snippet, replace_sym, language, backups):
     from .data_gen.ast_analyzer import validate_parse
@@ -224,6 +275,39 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
             f"snippet for '{replace_sym}' contains a keep-marker but no anchor line "
             f"matched the original body, so fastedit cannot place the edit. "
             f"Pass the full replacement body instead of a marker."
+        )
+
+    # TRDD-8M0MXRJO. A body-only snippet for a definition-kind target (function/
+    # method/class/...) splices over the FULL AST line span -- signature line
+    # included -- so a snippet missing its own definition line silently deletes
+    # the targets signature. The result still parses (a lone `return 99` is
+    # valid Python), so validate_parse below never catches it. Only refuse for
+    # definition-kind targets (never a constant/variable, whose "signature" IS
+    # its one line and is meant to be replaced whole), and only require SOME
+    # definition line in the snippet -- not one named replace_sym, because a
+    # --replace edit that legitimately renames the symbol defines a different
+    # name on purpose.
+    #
+    # TRDD-CMRMA2YG follow-up. The line-based regex above cannot tell a real
+    # top-level definition from a `def ...` that only appears as TEXT inside a
+    # nested closure, a class body, or a multiline string literal -- each of
+    # those still contains a matching line, so the guard passed while the
+    # actual target symbol was destroyed. For python, tighten the check with
+    # an AST-based single-definition test; other languages keep the
+    # line-regex floor only (no AST refinement is defined for them).
+    _DEFINITION_KINDS = {
+        "function", "method", "class", "interface", "struct", "enum",
+        "trait", "protocol", "module", "object", "impl",
+    }
+    has_def = _snippet_has_any_definition(snippet)
+    if has_def and language == "python":
+        has_def = _snippet_is_single_matching_definition(snippet, target_node)
+    if target_node.kind in _DEFINITION_KINDS and not has_def:
+        raise ValueError(
+            f"snippet for '{replace_sym}' (kind: {target_node.kind}) has no definition "
+            f"line of its own, so splicing it over the symbol would delete its "
+            f"signature. Pass the full replacement including the definition line, "
+            f"or use --after to insert."
         )
 
     # Direct replacement: snippet IS the new symbol. Swap line ranges.
