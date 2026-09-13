@@ -135,6 +135,43 @@ def _is_marker(line: str) -> bool:
     )
 
 
+
+
+# Exact-form set used by `snippet_has_keep_marker` -- deliberately NOT the
+# permissive `_MARKER_PHRASES` substring set (see the docstring below for why:
+# "# ..." / "// ..." as bare substrings misclassify real code).
+_EXACT_SHORT_MARKERS = ("#...", "//...", "…", "#…", "//…")
+
+
+
+# Exact-form set used by `snippet_has_keep_marker` -- deliberately NOT the
+# permissive `_MARKER_PHRASES` substring set (see the docstring below for why:
+# "# ..." / "// ..." as bare substrings misclassify real code).
+_EXACT_SHORT_MARKERS = ("#...", "//...", "…", "#…", "//…")
+
+
+def snippet_has_keep_marker(snippet: str) -> bool:
+    """True when a snippet contains a line that is ONLY a keep-marker.
+
+    Deliberately STRICTER than `_is_marker`. Inside `deterministic_edit` a false
+    positive is cheap -- a line is merely classified as "keep". Here the cost
+    model is inverted: this predicate REFUSES to write a file, so a false
+    positive rejects a valid edit. Hence an exact-match check on the CANONICAL
+    long-form phrase plus an exact-match whitelist of the short forms, rather
+    than `_is_marker`'s permissive substring match against `_MARKER_PHRASES`
+    (which also contains the bare "# ..." / "// ..." phrases -- using THOSE as a
+    substring test would misclassify real code like `x = 1  # ... trailing
+    prose` or a lone `# ...` as a keep-marker; verified by direct test).
+    """
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if stripped in _EXACT_SHORT_MARKERS:
+            return True
+        if _CANONICAL_HASH_MARKER in stripped or _CANONICAL_SLASH_MARKER in stripped:
+            return True
+    return False
+
+
 def _replacement_key(line: str) -> str | None:
     """Extract the LHS of an assignment-like line, for replacement matching.
 

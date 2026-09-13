@@ -167,7 +167,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         _resolve_symbol,
         get_ast_map,
     )
-    from .inference.text_match import deterministic_edit
+    from .inference.text_match import deterministic_edit, snippet_has_keep_marker
     from .split_join import detect_line_ending, normalize_line_endings
 
     total_lines = len(original_lines)
@@ -207,6 +207,23 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         return ChunkedMergeResult(
             merged_code=merged, parse_valid=parse_valid,
             chunks_used=0, chunk_regions=[], model_tokens=0, latency_ms=0.0,
+        )
+
+    # STOPGAP (TRDD-CMRMA2YG). "snippet IS the new symbol" is an assumption this
+    # branch never checked. A snippet carrying a keep-marker is NOT a complete
+    # symbol -- the marker stands in for lines the author deliberately did not
+    # repeat -- so splicing it verbatim deletes exactly those lines. validate_parse
+    # below CANNOT catch it: `#...` is a valid Python comment and `//...` a valid
+    # JS one, so the mangled result parses clean and is written with exit 0.
+    # The PROPER predicate is "the snippet parses as exactly one top-level symbol
+    # named replace_sym"; that is filed separately. Refuse loudly meanwhile --
+    # returning None would route to a merge backend that may not be installed and
+    # surface as a bare ModuleNotFoundError, which tells the user nothing.
+    if snippet_has_keep_marker(snippet):
+        raise ValueError(
+            f"snippet for '{replace_sym}' contains a keep-marker but no anchor line "
+            f"matched the original body, so fastedit cannot place the edit. "
+            f"Pass the full replacement body instead of a marker."
         )
 
     # Direct replacement: snippet IS the new symbol. Swap line ranges.
@@ -280,9 +297,17 @@ def cmd_edit(args):
         return "\n" + note
 
     if replace_sym and not after_sym:
-        result = _try_deterministic_replace(
-            path, original_code, original_lines, snippet, replace_sym, language, backups,
-        )
+        try:
+            result = _try_deterministic_replace(
+                path, original_code, original_lines, snippet, replace_sym, language, backups,
+            )
+        except ValueError as e:
+            # TRDD-CMRMA2YG: the keep-marker guard in _try_deterministic_replace
+            # raises ValueError instead of returning None so the failure is a
+            # clean diagnostic here, not a bare traceback nor a silent fall-through
+            # to a merge backend that may not be installed.
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         if result is not None:
             _atomic_write(path, result.merged_code, backups=backups)
             note = _maybe_impact_note(result.merged_code)
