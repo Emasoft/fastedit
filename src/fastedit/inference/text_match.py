@@ -202,7 +202,7 @@ def snippet_has_keep_marker(snippet: str) -> bool:
                     quote = None
                 i += 1
                 continue
-            if ch in ("'", '"'):
+            if ch == '"' or (ch == "'" and line.find("'", i + 1) != -1):
                 quote = ch
                 i += 1
                 continue

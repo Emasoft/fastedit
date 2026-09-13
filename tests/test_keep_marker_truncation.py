@@ -40,6 +40,61 @@ def run_cli(*args: str, input_text: str | None = None):
         env=env,
     )
 
+def test_rust_lifetimes_do_not_hide_a_marker(tmp_path: Path) -> None:
+    """A Rust lifetime must not swallow the rest of the line and hide a marker.
+
+    MEASURED code-loss regression, and the fifth distinct shape to reach the
+    silent path. Rust writes lifetimes with a lone apostrophe -- `&'static str`,
+    `&'a mut T` -- which has no closing partner. A scanner that treats every
+    apostrophe as a string opener therefore stays "inside a string" for the rest
+    of the line, never reaches the `//`, and misses the marker; the partial
+    snippet is then spliced and code is lost. Rust is a supported language.
+
+    The rule: an apostrophe opens a string only when a partner appears later on
+    the SAME line, so a genuine char literal still counts and a lifetime does not.
+
+    Note the near-miss that makes this worth pinning: `fn f<'a>(x: &'a str)` has
+    TWO apostrophes which accidentally pair, so it passed even while the
+    single-lifetime form silently failed. Testing only that shape would have
+    reported success.
+    """
+    slash = "// " + "... existing code ..."
+    a = chr(39)
+
+    assert snippet_has_keep_marker("let s: &" + a + "static str = x; " + slash) is True
+    assert snippet_has_keep_marker("fn f<" + a + "a>(x: &" + a + "a str) { " + slash) is True
+    assert snippet_has_keep_marker("let c = " + a + "x" + a + "; " + slash) is True
+    assert snippet_has_keep_marker("    this.#count = 1;  " + slash) is True
+
+def test_marker_detection_survives_awkward_string_syntax(tmp_path: Path) -> None:
+    """Raw strings, escaped quotes and f-strings must not hide or invent a marker.
+
+    The whole defect history of this predicate is UNCONSIDERED INPUT SHAPES, not
+    broken lines -- three versions shipped, each correct on the cases its author
+    imagined and wrong on one nobody had tried. Mutating the implementation
+    cannot catch that class; only widening the input space can. So this pins the
+    awkward shapes directly.
+
+    The three that could LOSE code (a real marker going undetected, letting a
+    partial snippet splice) are the first three. The last three must NOT be
+    treated as markers: a marker that lives inside a string literal is data, not
+    an instruction to keep lines.
+    """
+    canonical = "# " + "... existing code ..."
+    q = chr(34)
+    a = chr(39)
+    bs = chr(92)
+
+    # Must DETECT -- a real marker in a comment, after awkward-but-closed syntax.
+    assert snippet_has_keep_marker("    x = r" + a + "a" + a + "  " + canonical) is True
+    assert snippet_has_keep_marker("    x = " + q + "a" + bs + q + "b" + q + "  " + canonical) is True
+    assert snippet_has_keep_marker("    x = f" + q + "{a}#b" + q + "  " + canonical) is True
+
+    # Must NOT detect -- the marker text is inside a string, so it is data.
+    assert snippet_has_keep_marker("    s = " + q * 3 + "text " + canonical) is False
+    assert snippet_has_keep_marker("    x = " + q + "#not a marker" + q) is False
+    assert snippet_has_keep_marker("    x = f" + q + "{" + canonical + "}" + q) is False
+
 def test_marker_after_a_comment_containing_an_apostrophe_is_refused(tmp_path: Path) -> None:
     """A marker after an ordinary comment with an apostrophe must still be caught.
 
