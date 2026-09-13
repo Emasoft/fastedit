@@ -177,6 +177,31 @@ class TestEncodingMatrixEditReplace:
         assert result.returncode != 0
         assert target.read_bytes() == UTF16LE_SRC
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="TRDD-8M0MXRJO: a body-only snippet deletes the symbol signature; the result still parses so the parse-refusal guard cannot catch it",
+    )
+    def test_body_only_snippet_must_not_delete_the_symbol_signature(
+        self, tmp_path: Path
+    ) -> None:
+        """A body-only snippet must not destroy the target symbol's signature line; expected-fail until TRDD-8M0MXRJO is fixed.
+
+        Documents TRDD-8M0MXRJO: the deterministic text-match branch of
+        _try_deterministic_replace splices `snippet` in as a literal
+        statement-level replacement of the ENTIRE symbol span (including its
+        `def` line), so a snippet that is only the new body -- no `def f():`
+        line of its own -- deletes the signature outright. tree-sitter's
+        Python grammar does not set `has_error` on a bare over-indented
+        top-level statement, so `validate_parse` reports the result as valid
+        and C1's `_refuse_if_edit_broke_parse` guard never fires. This asserts
+        the CORRECT behaviour -- the `def f(` signature must survive -- so it
+        currently XFAILs; the day it XPASSes is the day the real fix landed.
+        """
+        target = tmp_path / ("fixture" + ".py")
+        target.write_bytes(b"def f():\n    return 1\n")
+        run_cli("edit", str(target), "--replace", "f", "--snippet", "    return 99")
+        assert b"def f(" in target.read_bytes()
+
 
 class TestEncodingMatrixEditAfter:
     """`edit --after` (insertion) across the encoding axis."""
