@@ -29,7 +29,6 @@ _HTML_EXTS = {".html", ".htm"}
 class SplitJoinError(ValueError):
     """A requested mode doesn't fit the file (wrong --by, --rows on non-csv, ...)."""
 
-
 def detect_format(path: Path) -> str:
     """Guess a split/join format from the file extension, defaulting to plain text."""
     ext = path.suffix.lower()
@@ -48,6 +47,40 @@ def detect_format(path: Path) -> str:
     if ext in _TSV_EXTS:
         return "tsv"
     return "text"
+
+
+def detect_line_ending(text: str) -> str:
+    """Return the line-ending terminator that dominates text: CRLF, lone-CR, or LF.
+
+    Counted directly (splitlines also treats several other Unicode characters
+    as line breaks and would misreport a Python-only boundary as missing).
+    No terminator at all, or a genuine tie between kinds, falls back to
+    os.linesep rather than guessing which convention the caller wants.
+    """
+    import os
+
+    crlf = text.count("\r\n")
+    lone_cr = text.count("\r") - crlf
+    lone_lf = text.count("\n") - crlf
+    counts = {"\r\n": crlf, "\n": lone_lf, "\r": lone_cr}
+    top = max(counts.values())
+    if top == 0 or sum(1 for v in counts.values() if v == top) > 1:
+        return os.linesep
+    return next(k for k, v in counts.items() if v == top)
+
+
+def normalize_line_endings(text: str, target: str) -> str:
+    """Rewrite every line ending in text to target (CRLF, lone-CR, or LF).
+
+    Used to make snippet/inserted text match the prevailing convention of the
+    file it is being spliced into. Callers apply this only to the new or
+    replaced span, never to a whole file, so untouched regions stay byte-exact.
+    """
+    canonical = text.replace("\r\n", "\n").replace("\r", "\n")
+    return canonical if target == "\n" else canonical.replace("\n", target)
+
+
+
 
 
 # --- line-count chunking (works on any text file) ---

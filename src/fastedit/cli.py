@@ -222,6 +222,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
 
 def cmd_edit(args):
     """Apply an edit snippet to a file using the FastEdit model."""
+
     from .data_gen.ast_analyzer import detect_language
     from .inference.caller_safety import (
         _find_project_root,
@@ -237,7 +238,7 @@ def cmd_edit(args):
         sys.exit(1)
 
     backups = BackupStore()
-    original_code = path.read_text(encoding="utf-8", errors="replace")
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     language = detect_language(path)
     original_lines = original_code.splitlines(keepends=True)
 
@@ -247,11 +248,11 @@ def cmd_edit(args):
     def _maybe_impact_note(merged_code: str) -> str:
         """Build the pre-flight impact note (VAL-M3-001) or empty str.
 
-        Informational only — the edit has already landed on disk by the
-        time we call this. When ``replace=`` isn't used or the signature
-        is unchanged the helper returns ``None`` without invoking
-        ``tldr`` (VAL-M3-002 hot path). We swallow any exception so
-        infra hiccups can't break the edit-success print.
+        Informational only -- the edit has already landed on disk by the
+        time we call this. When replace= is not used or the signature
+        is unchanged the helper returns None without invoking
+        tldr (VAL-M3-002 hot path). We swallow any exception so
+        infra hiccups cannot break the edit-success print.
         """
         if not replace_sym:
             return ""
@@ -309,6 +310,7 @@ def cmd_edit(args):
         sys.exit(1)
 
     _atomic_write(path, result.merged_code, backups=backups)
+    note = _maybe_impact_note(result.merged_code)
 
     tok_per_sec = (
         result.model_tokens / (result.latency_ms / 1000)
@@ -327,9 +329,8 @@ def cmd_edit(args):
         )
     elif language and not result.parse_valid:
         print(f"Warning: merged output has parse errors. Wrote anyway. {metrics}")
-    else:
-        note = _maybe_impact_note(result.merged_code)
-        print(f"Applied edit to {args.file}. {metrics}{note}")
+
+    print(f"Applied edit to {args.file}. {metrics}{note}")
 
 
 def cmd_batch_edit(args):
@@ -363,7 +364,7 @@ def cmd_batch_edit(args):
 
     backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
-    original_code = path.read_text(encoding="utf-8", errors="replace")
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     language = detect_language(path)
 
     result = batch_chunked_merge(
@@ -415,7 +416,7 @@ def cmd_multi_edit(args):
             for e in edits
         ]
 
-        original_code = path.read_text(encoding="utf-8", errors="replace")
+        original_code = path.read_bytes().decode("utf-8", errors="replace")
         language = detect_language(path)
 
         result = batch_chunked_merge(
