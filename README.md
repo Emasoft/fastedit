@@ -117,6 +117,21 @@ fastedit pull --model mlx-8bit
 
 Avoid `pip install fastedits` into a Homebrew / distro-managed Python — it will fail with `error: externally-managed-environment` (PEP 668).
 
+### This fork
+
+This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with the bundled swap script instead:
+
+```bash
+git clone https://github.com/Emasoft/fastedit && cd fastedit
+scripts/install-fork.sh                       # swaps in the fork (default: feat/create-file)
+scripts/install-fork.sh --extras mlx,mcp      # with extras
+scripts/install-fork.sh --ref v1.2.3          # pin a branch/tag/sha
+scripts/install-fork.sh --no-model            # skip the ~3 GB model download
+scripts/install-fork.sh --revert              # undo — back to upstream from PyPI
+```
+
+The fork ships under the same PyPI name and console-script names as upstream, so the script uninstalls any existing `fastedits` from every method it finds (uv tool, pipx, pip) before installing, then verifies the `fastedit` that actually ends up on PATH is the fork — not a shadowed leftover. Add `--dry-run` to any of the above to see the commands without running them.
+
 ### Pointing at an external LLM server
 
 ```bash
