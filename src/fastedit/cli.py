@@ -414,7 +414,7 @@ def cmd_batch_edit(args):
 
 
 def cmd_multi_edit(args):
-    """Apply edits across multiple files."""
+    """Apply edits across multiple files, writing nothing unless every file succeeds."""
     import json as json_mod
 
     from .data_gen.ast_analyzer import detect_language
@@ -431,36 +431,59 @@ def cmd_multi_edit(args):
     backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
 
-    for entry in file_edits_list:
-        file_path = entry["file_path"]
-        edits = entry["edits"]
-        path = Path(file_path)
-        if not path.exists():
+    # PHASE 1 -- validate EVERY target before touching any of them.
+    #
+    # This used to validate, merge and write one file at a time inside a single
+    # loop, so a missing second file exited non-zero AFTER the first had already
+    # been written: the command reported failure and had modified the tree
+    # anyway (TRDD-IUVBCTW3). That combination is worse than either a clean
+    # failure or a silent success, because the error message actively tells the
+    # caller nothing happened.
+    #
+    # Every missing path is reported, not just the first, so one run tells the
+    # caller everything they must fix.
+    missing = [e["file_path"] for e in file_edits_list if not Path(e["file_path"]).exists()]
+    if missing:
+        for file_path in missing:
             print(f"Error: file not found: {file_path}", file=sys.stderr)
-            sys.exit(1)
+        sys.exit(1)
 
+    # PHASE 2 -- compute every merge, still writing nothing. A merge that raises
+    # here leaves the tree exactly as it was found.
+    pending: list[tuple[Path, str, int, object]] = []
+    for entry in file_edits_list:
+        path = Path(entry["file_path"])
         batch = [
             BatchEdit(
                 snippet=e["snippet"],
                 after=e.get("after") or None,
                 replace=e.get("replace") or None,
             )
-            for e in edits
+            for e in entry["edits"]
         ]
-
         original_code = path.read_bytes().decode("utf-8", errors="replace")
-        language = detect_language(path)
-
         result = batch_chunked_merge(
             original_code=original_code,
             edits=batch,
-            file_path=file_path,
+            file_path=str(path),
             merge_fn=backend.merge_auto,
-            language=language,
+            language=detect_language(path),
         )
-        _atomic_write(path, result.merged_code, backups=backups)
+        pending.append((path, result.merged_code, len(batch), result))
+
+    # PHASE 3 -- commit. Only reached when every file validated and every merge
+    # succeeded.
+    #
+    # HONEST LIMIT: this is not a cross-file transaction. Each write is
+    # individually atomic, but a crash or a filesystem error partway through
+    # this loop can still leave earlier files written and later ones not. Real
+    # cross-file atomicity needs a journal. What this DOES guarantee is that no
+    # file is written because of an error that was knowable beforehand -- a
+    # missing target or a failed merge -- which is the entire defect above.
+    for path, merged_code, edit_count, result in pending:
+        _atomic_write(path, merged_code, backups=backups)
         print(
-            f"Applied {len(batch)} edits to {file_path}. "
+            f"Applied {edit_count} edits to {path}. "
             f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
         )
 
