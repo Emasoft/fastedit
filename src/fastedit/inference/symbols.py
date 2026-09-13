@@ -51,14 +51,18 @@ def delete_symbol(
         ValueError: If the symbol is not found in the file's AST.
     """
     from .ast_utils import get_ast_map_from_source
+    from ..split_join import normalize_bare_cr_for_ast
 
     path = Path(file_path)
     original_code = path.read_bytes().decode("utf-8", errors="replace")
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
 
-    # In-memory AST -- bypasses tldr's decorator-span bug.
-    ast_nodes = get_ast_map_from_source(original_code, file_path)
+    # In-memory AST -- bypasses tldr's decorator-span bug. Feed it an
+    # LF-normalized copy so a lone CR (invisible to tree-sitter's row
+    # counting) does not collapse the whole file into one line; the
+    # returned line numbers stay valid against original_lines either way.
+    ast_nodes = get_ast_map_from_source(normalize_bare_cr_for_ast(original_code), file_path)
     if not ast_nodes:
         ast_nodes = get_ast_map(file_path, total_lines)
 
@@ -133,6 +137,13 @@ def move_symbol(
 
     path = Path(file_path)
     original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # A UTF-8 BOM is a file-level marker, not part of line 1's content.
+    # Strip it before splitting into lines so it can never ride along as
+    # embedded text on whichever symbol happens to occupy line 1 -- _atomic_write
+    # restores it at the true start of the file once the move is written.
+    had_bom = original_code.startswith("﻿")
+    if had_bom:
+        original_code = original_code[1:]
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
     line_ending = detect_line_ending(original_code)
@@ -187,6 +198,8 @@ def move_symbol(
     # Insert after target
     result_lines = remaining[:tgt_end_0] + extracted + remaining[tgt_end_0:]
     merged_code = "".join(result_lines)
+    if had_bom:
+        merged_code = "﻿" + merged_code
 
     # Calculate new position
     new_start = tgt_end_0 + 1  # 1-indexed

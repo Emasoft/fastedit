@@ -1709,6 +1709,13 @@ def _extract_span(
     """
     path = Path(file_path)
     original = path.read_bytes().decode("utf-8", errors="replace")
+    # A UTF-8 BOM is a file-level marker, not part of line 1's content --
+    # strip it here so it can never ride along inside `extracted` if the
+    # moved symbol happens to be the file's first one. The source file's
+    # own write-back (via _atomic_write on `remaining`) restores its BOM
+    # unconditionally, independent of which symbol was removed.
+    if original.startswith("﻿"):
+        original = original[1:]
     lines = original.splitlines(keepends=True)
     total = len(lines)
 

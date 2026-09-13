@@ -391,26 +391,60 @@ def get_ast_map(file_path: str, total_lines: int = 0) -> list[ASTNode]:
     """Get AST definitions with line ranges and parent class info.
 
     Primary: tldr structure (has line_start + line_end for most languages),
-    enriched with parent info from tldr extract (class→method hierarchy).
+    enriched with parent info from tldr extract (class->method hierarchy).
     Fallback: tldr extract only (has line_number + parent, end lines computed).
 
     .. note::
-       This reads from disk and delegates to the ``tldr`` daemon, which
+       This reads from disk and delegates to the tldr daemon, which
        has a well-known file-watcher invalidation race. For callers that
-       already hold the source text, prefer :func:`get_ast_map_from_source`
-       — it parses in-memory and is race-free.
+       already hold the source text, prefer get_ast_map_from_source
+       -- it parses in-memory and is race-free.
     """
+    import contextlib
     import logging
+    import os
+    import re
+    import tempfile
+    from pathlib import Path
+
     _log = logging.getLogger("fastedit.chunked_merge")
-    nodes = _get_ast_via_structure(file_path)
-    if nodes:
-        _enrich_parents_from_extract(nodes, file_path)
-        _log.info("get_ast_map: %d nodes via structure for %s", len(nodes), file_path)
+
+    # tldr (like tree-sitter) counts rows by scanning for "\n" -- a bare CR
+    # (classic-Mac line ending) is invisible to it, collapsing every line of
+    # a CR-only or CR-mixed file into one, which silently corrupts the
+    # returned line_start/line_end for every symbol. Point tldr at an
+    # LF-normalized temp copy instead when a bare CR is present: swapping a
+    # "\r" not followed by "\n" for "\n" is a same-length, same-position
+    # substitution, so the line numbers it returns stay valid indices into
+    # the real file's own line list -- callers always slice their own
+    # in-memory original_lines, never this temp file's content.
+    query_path = file_path
+    tmp_path = None
+    try:
+        raw = Path(file_path).read_bytes()
+        if re.search(rb"\r(?!\n)", raw):
+            normalized = re.sub(rb"\r(?!\n)", b"\n", raw)
+            fd, tmp_path = tempfile.mkstemp(suffix=Path(file_path).suffix)
+            os.write(fd, normalized)
+            os.close(fd)
+            query_path = tmp_path
+    except OSError:
+        pass
+
+    try:
+        nodes = _get_ast_via_structure(query_path)
+        if nodes:
+            _enrich_parents_from_extract(nodes, query_path)
+            _log.info("get_ast_map: %d nodes via structure for %s", len(nodes), file_path)
+            return nodes
+        _log.debug("get_ast_map: structure returned 0 nodes, trying extract for %s", file_path)
+        nodes = _get_ast_via_extract(query_path, total_lines)
+        _log.info("get_ast_map: %d nodes via extract for %s", len(nodes), file_path)
         return nodes
-    _log.debug("get_ast_map: structure returned 0 nodes, trying extract for %s", file_path)
-    nodes = _get_ast_via_extract(file_path, total_lines)
-    _log.info("get_ast_map: %d nodes via extract for %s", len(nodes), file_path)
-    return nodes
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
 
 def _enrich_parents_from_extract(nodes: list[ASTNode], file_path: str) -> None:

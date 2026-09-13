@@ -234,38 +234,69 @@ def _run_tldr_references(
         scope: tldr's --scope flag. 'workspace' for cross-file rename,
             'file' for single-file rename.
 
-    Returns an empty payload ({"references": []}) on any failure — tldr
+    Returns an empty payload ({"references": []}) on any failure -- tldr
     missing, timeout, non-zero exit, or unparseable output. The rename then
     becomes a no-op rather than crashing the caller.
     """
+    import contextlib
     import json
+    import os
+    import re
     import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
+    # tldr counts rows by scanning for "\n" -- a bare CR (classic-Mac line
+    # ending) is invisible to it and collapses a single-file lookup's rows
+    # into one, corrupting the line/column it reports. Point it at an
+    # LF-normalized temp copy for the file-scope case (same-length,
+    # same-position substitution, so the reported positions stay valid
+    # against the real file). Workspace-scope (a whole directory) is left
+    # as-is -- normalizing an entire tree is out of scope here.
+    query_root = root
+    tmp_path = None
+    if scope == "file":
+        try:
+            raw = _Path(root).read_bytes()
+            if re.search(rb"\r(?!\n)", raw):
+                normalized = re.sub(rb"\r(?!\n)", b"\n", raw)
+                fd, tmp_path = tempfile.mkstemp(suffix=_Path(root).suffix)
+                os.write(fd, normalized)
+                os.close(fd)
+                query_root = _Path(tmp_path)
+        except OSError:
+            pass
 
     cmd = [
-        "tldr", "references", old_name, str(root),
+        "tldr", "references", old_name, str(query_root),
         "--format", "json",
         "--scope", scope,
         "--min-confidence", "0.9",
         "--limit", "10000",
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=60, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return {"references": []}
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return {"references": []}
 
-    payload = _extract_json_object(result.stdout or "")
-    if not payload:
-        return {"references": []}
-    try:
-        data = json.loads(payload)
-    except (json.JSONDecodeError, ValueError):
-        return {"references": []}
-    if not isinstance(data, dict):
-        return {"references": []}
-    data.setdefault("references", [])
-    return data
+        payload = _extract_json_object(result.stdout or "")
+        if not payload:
+            return {"references": []}
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            return {"references": []}
+        if not isinstance(data, dict):
+            return {"references": []}
+        data.setdefault("references", [])
+        return data
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
 
 
 def _tldr_col_to_byte_offset(line_bytes: bytes, col_1_indexed: int) -> int:

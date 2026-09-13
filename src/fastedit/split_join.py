@@ -79,6 +79,23 @@ def normalize_line_endings(text: str, target: str) -> str:
     canonical = text.replace("\r\n", "\n").replace("\r", "\n")
     return canonical if target == "\n" else canonical.replace("\n", target)
 
+def normalize_bare_cr_for_ast(text: str) -> str:
+    """Replace a lone CR (not part of CRLF) with LF -- same length, same positions.
+
+    Tree-sitter and the external tldr binary both count rows by scanning for
+    a plain LF; a bare CR (classic-Mac line ending) is invisible to them and
+    collapses every line of a CR-only or CR-mixed file into one, corrupting
+    any line_start/line_end an AST tool returns for it. This substitution is
+    always a 1-byte-for-1-byte swap (it never touches an existing "\r\n" or
+    "\n"), so line counts, line positions, and byte offsets computed against
+    the result stay valid against the original text -- callers pass this
+    normalized copy only to an AST/structure tool for line-number purposes,
+    and keep slicing their own original text for the actual content.
+    """
+    import re
+
+    return re.sub(r"\r(?!\n)", "\n", text)
+
 
 
 

@@ -103,6 +103,15 @@ def _atomic_write(path: Path, content: str | bytes, backups=None) -> None:
     decodes the source). Backups themselves are still always read/stored
     as text -- overwriting an existing *binary* destination is an
     unrelated, pre-existing edge case this does not change.
+
+    A UTF-8 BOM is a file-level marker, not line content: every write verb
+    funnels its final write through here, so restoring a BOM the on-disk
+    file already had -- when *content* is str and did not already keep
+    it -- is done once, here, rather than in every caller. This matters
+    because a merge/replace/delete/move touching the symbol at the very
+    top of the file naturally rewrites line 1 as ordinary text and has no
+    reason to know a BOM was riding on it; str content is the only case
+    this applies to (`duplicate`'s byte-for-byte copy is never touched).
     """
     if backups is not None and path.exists():
         backups[str(path)] = path.read_bytes().decode("utf-8")
@@ -112,6 +121,13 @@ def _atomic_write(path: Path, content: str | bytes, backups=None) -> None:
     closed = False
     try:
         data = content if isinstance(content, bytes) else content.encode("utf-8")
+        if not isinstance(content, bytes) and path.exists():
+            try:
+                had_bom = path.read_bytes()[:3] == b"\xef\xbb\xbf"
+            except OSError:
+                had_bom = False
+            if had_bom and not data.startswith(b"\xef\xbb\xbf"):
+                data = b"\xef\xbb\xbf" + data
         os.write(fd, data)
         closed = True
         os.close(fd)
