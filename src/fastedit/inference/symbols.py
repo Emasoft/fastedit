@@ -27,17 +27,17 @@ def delete_symbol(
 ) -> DeleteResult:
     """Delete a function, method, or class from a file using AST line ranges.
 
-    Pure deterministic operation — no model inference. Uses in-memory
-    tree-sitter (via ``get_ast_map_from_source``) for authoritative line
+    Pure deterministic operation -- no model inference. Uses in-memory
+    tree-sitter (via get_ast_map_from_source) for authoritative line
     ranges. Works across all 16 languages supported by tree-sitter.
 
-    Prefers the in-memory path over ``get_ast_map`` (which shells out to
-    ``tldr structure``) because tldr's structure extractor has a known
-    bug where ``@decorator``-wrapped Python functions are mis-reported:
+    Prefers the in-memory path over get_ast_map (which shells out to
+    tldr structure) because tldr's structure extractor has a known
+    bug where @decorator-wrapped Python functions are mis-reported:
     the decorated function's span is missing and the NEXT function
     inherits its line numbers, silently corrupting deletes. See
     docs/testing-matrix.md for the repro. The in-memory walker correctly
-    spans the ``decorated_definition`` AST node including the decorator.
+    spans the decorated_definition AST node including the decorator.
 
     Args:
         file_path: Path to the source file.
@@ -53,15 +53,13 @@ def delete_symbol(
     from .ast_utils import get_ast_map_from_source
 
     path = Path(file_path)
-    original_code = path.read_text(encoding="utf-8", errors="replace")
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
 
-    # In-memory AST — bypasses tldr's decorator-span bug.
+    # In-memory AST -- bypasses tldr's decorator-span bug.
     ast_nodes = get_ast_map_from_source(original_code, file_path)
     if not ast_nodes:
-        # Fall back to the tldr-backed path for any language / parser
-        # combination the in-memory walker doesn't support yet.
         ast_nodes = get_ast_map(file_path, total_lines)
 
     # Find the target node (supports 'Class.method' qualification)
@@ -112,7 +110,7 @@ def move_symbol(
 ) -> MoveResult:
     """Move a function, method, or class to after another symbol.
 
-    Pure deterministic operation — no model inference. Uses tldr to find
+    Pure deterministic operation -- no model inference. Uses tldr to find
     the exact line ranges and splices the code. Handles decorators, trailing
     blank lines, and proper spacing.
 
@@ -128,13 +126,16 @@ def move_symbol(
     Raises:
         ValueError: If either symbol is not found, or they are the same.
     """
+    from ..split_join import detect_line_ending
+
     if symbol == after:
         raise ValueError(f"Cannot move '{symbol}' after itself.")
 
     path = Path(file_path)
-    original_code = path.read_text(encoding="utf-8", errors="replace")
+    original_code = path.read_bytes().decode("utf-8", errors="replace")
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
+    line_ending = detect_line_ending(original_code)
 
     ast_nodes = get_ast_map(file_path, total_lines)
 
@@ -171,17 +172,17 @@ def move_symbol(
     # Recalculate target position in the remaining lines.
     # The target may have shifted if it was after the source.
     shift = src_end - src_start
-    tgt_end_0 = target_node.line_end  # 1-indexed end → 0-indexed exclusive
+    tgt_end_0 = target_node.line_end  # 1-indexed end -> 0-indexed exclusive
     if target_node.line_start > source_node.line_end:
         tgt_end_0 -= shift
 
     # Ensure blank line separator before inserted code
-    if tgt_end_0 < len(remaining) and remaining[tgt_end_0 - 1].strip() != "" and not extracted[0].startswith("\n"):
-            extracted = ["\n"] + extracted
+    if tgt_end_0 < len(remaining) and remaining[tgt_end_0 - 1].strip() != "" and extracted[0].strip() != "":
+            extracted = [line_ending] + extracted
 
     # Ensure trailing blank line after inserted code
     if extracted and extracted[-1].strip() != "":
-        extracted.append("\n")
+        extracted.append(line_ending)
 
     # Insert after target
     result_lines = remaining[:tgt_end_0] + extracted + remaining[tgt_end_0:]
