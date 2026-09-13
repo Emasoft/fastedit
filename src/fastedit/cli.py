@@ -431,25 +431,42 @@ def cmd_multi_edit(args):
     backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
 
-    # PHASE 1 -- validate EVERY target before touching any of them.
+    # PHASE 1 -- reject EVERY knowable-beforehand error before touching anything.
     #
-    # This used to validate, merge and write one file at a time inside a single
-    # loop, so a missing second file exited non-zero AFTER the first had already
-    # been written: the command reported failure and had modified the tree
-    # anyway (TRDD-IUVBCTW3). That combination is worse than either a clean
-    # failure or a silent success, because the error message actively tells the
-    # caller nothing happened.
+    # This used to validate, merge and write one file at a time in a single
+    # loop, so a missing second target exited non-zero AFTER the first had been
+    # written: the command reported failure and had modified the tree anyway
+    # (TRDD-IUVBCTW3). That is worse than either a clean failure or a silent
+    # success, because the error actively tells the caller nothing happened.
     #
-    # Every missing path is reported, not just the first, so one run tells the
-    # caller everything they must fix.
-    missing = [e["file_path"] for e in file_edits_list if not Path(e["file_path"]).exists()]
-    if missing:
-        for file_path in missing:
-            print(f"Error: file not found: {file_path}", file=sys.stderr)
+    # Every problem is collected and reported, not just the first, so one run
+    # tells the caller everything they must fix. Shape errors are checked here
+    # rather than left to blow up as a KeyError mid-merge, and `is_file` is
+    # checked rather than `exists` because a directory passes `exists` and then
+    # raises IsADirectoryError during the merge phase -- both are knowable now.
+    problems: list[str] = []
+    for index, entry in enumerate(file_edits_list):
+        if not isinstance(entry, dict) or "file_path" not in entry or "edits" not in entry:
+            problems.append(f"entry {index}: expected an object with 'file_path' and 'edits'")
+            continue
+        path = Path(entry["file_path"])
+        if not path.exists():
+            problems.append(f"file not found: {path}")
+        elif not path.is_file():
+            problems.append(f"not a regular file: {path}")
+    if problems:
+        for problem in problems:
+            print(f"Error: {problem}", file=sys.stderr)
         sys.exit(1)
 
-    # PHASE 2 -- compute every merge, still writing nothing. A merge that raises
+    # PHASE 2 -- compute every merge, still writing nothing. A merge that fails
     # here leaves the tree exactly as it was found.
+    #
+    # The ValueError catch matters: batch_chunked_merge raises for a symbol that
+    # does not exist and for a whole-file merge over the size limit. Letting
+    # that escape would swap a corrupt tree for a bare traceback -- safe, but
+    # telling the user nothing. The same swap was rejected elsewhere in this
+    # codebase and is rejected here.
     pending: list[tuple[Path, str, int, object]] = []
     for entry in file_edits_list:
         path = Path(entry["file_path"])
@@ -462,24 +479,36 @@ def cmd_multi_edit(args):
             for e in entry["edits"]
         ]
         original_code = path.read_bytes().decode("utf-8", errors="replace")
-        result = batch_chunked_merge(
-            original_code=original_code,
-            edits=batch,
-            file_path=str(path),
-            merge_fn=backend.merge_auto,
-            language=detect_language(path),
-        )
+        try:
+            result = batch_chunked_merge(
+                original_code=original_code,
+                edits=batch,
+                file_path=str(path),
+                merge_fn=backend.merge_auto,
+                language=detect_language(path),
+            )
+        except ValueError as e:
+            print(f"Error: {path}: {e}", file=sys.stderr)
+            print("Error: no files were modified.", file=sys.stderr)
+            sys.exit(1)
         pending.append((path, result.merged_code, len(batch), result))
 
-    # PHASE 3 -- commit. Only reached when every file validated and every merge
-    # succeeded.
+    # PHASE 3 -- commit. Only reached when every target validated and every
+    # merge succeeded.
     #
-    # HONEST LIMIT: this is not a cross-file transaction. Each write is
-    # individually atomic, but a crash or a filesystem error partway through
-    # this loop can still leave earlier files written and later ones not. Real
-    # cross-file atomicity needs a journal. What this DOES guarantee is that no
-    # file is written because of an error that was knowable beforehand -- a
-    # missing target or a failed merge -- which is the entire defect above.
+    # TWO HONEST LIMITS, both real and neither fixed here:
+    #
+    # 1. This is not a cross-file transaction. Each write is individually
+    #    atomic, but a crash partway through this loop can still leave earlier
+    #    files written. Real cross-file atomicity needs a journal.
+    # 2. The read-to-write window is now WIDER than before, not narrower. Each
+    #    file is read in phase 2 and written here, so a concurrent edit landing
+    #    in between is overwritten from stale bytes. The old code had the same
+    #    hazard over milliseconds; this spans the whole merge phase. Accepted
+    #    for a single-user CLI, and the safety it buys is worth more.
+    #
+    # What this DOES guarantee is that no file is written because of an error
+    # that was knowable beforehand, which is the entire defect above.
     for path, merged_code, edit_count, result in pending:
         _atomic_write(path, merged_code, backups=backups)
         print(
