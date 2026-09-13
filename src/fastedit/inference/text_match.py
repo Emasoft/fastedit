@@ -151,23 +151,41 @@ _EXACT_SHORT_MARKERS = ("#...", "//...", "…", "#…", "//…")
 
 
 def snippet_has_keep_marker(snippet: str) -> bool:
-    """True when a snippet contains a line that is ONLY a keep-marker.
+    """True when a snippet contains a line that IS a keep-marker.
 
     Deliberately STRICTER than `_is_marker`. Inside `deterministic_edit` a false
     positive is cheap -- a line is merely classified as "keep". Here the cost
     model is inverted: this predicate REFUSES to write a file, so a false
-    positive rejects a valid edit. Hence an exact-match check on the CANONICAL
-    long-form phrase plus an exact-match whitelist of the short forms, rather
-    than `_is_marker`'s permissive substring match against `_MARKER_PHRASES`
-    (which also contains the bare "# ..." / "// ..." phrases -- using THOSE as a
-    substring test would misclassify real code like `x = 1  # ... trailing
-    prose` or a lone `# ...` as a keep-marker; verified by direct test).
+    positive rejects a valid edit.
+
+    Two narrow tests, and NEITHER is a bare substring match:
+
+    * the stripped line is exactly one of the short forms, or
+    * the stripped line STARTS WITH a canonical long-form marker.
+
+    `startswith`, not `in`, is load-bearing and was a MEASURED defect. With
+    containment, a complete and valid snippet whose DOCSTRING merely mentioned
+    the canonical phrase was refused -- verified by hand, and then demonstrated
+    the hard way when the containment version refused the very edit that
+    introduced this docstring. That is the classic detector failure of flagging
+    the documentation ABOUT a hazard as the hazard, and it is not academic:
+    fastedit's own source documents markers in docstrings, so containment made
+    the tool unable to edit itself.
+
+    A docstring line begins with a quote character, so `startswith` excludes it
+    while still accepting a genuine marker comment that carries a trailing note.
+
+    Using the permissive `_MARKER_PHRASES` set here would be worse still: it
+    holds the bare hash-ellipsis and slash-ellipsis phrases, which as substrings
+    match ordinary code such as a statement with a trailing elided comment.
     """
     for line in snippet.splitlines():
         stripped = line.strip()
         if stripped in _EXACT_SHORT_MARKERS:
             return True
-        if _CANONICAL_HASH_MARKER in stripped or _CANONICAL_SLASH_MARKER in stripped:
+        if stripped.startswith(_CANONICAL_HASH_MARKER) or stripped.startswith(
+            _CANONICAL_SLASH_MARKER
+        ):
             return True
     return False
 

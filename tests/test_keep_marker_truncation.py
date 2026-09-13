@@ -40,6 +40,34 @@ def run_cli(*args: str, input_text: str | None = None):
         env=env,
     )
 
+def test_docstring_mentioning_the_marker_phrase_is_not_refused(tmp_path: Path) -> None:
+    """A complete snippet whose DOCSTRING mentions a marker phrase must still apply.
+
+    Regression for a MEASURED false positive. The guard originally tested the
+    canonical long-form marker with `in` rather than `startswith`, so a valid,
+    complete replacement body whose docstring merely described the marker was
+    refused. Not academic: this project's own source documents markers in
+    docstrings, and the containment version refused the very edit that fixed it.
+
+    A refusal predicate's defect space is the inputs nobody thought to try, so
+    this asserts the NEGATIVE case -- that a legitimate snippet is ACCEPTED --
+    which is the half that behavioural testing of a guard usually omits.
+    """
+    marker_words = "# " + "... existing code ..."
+    assert snippet_has_keep_marker(marker_words) is True
+    assert snippet_has_keep_marker('    """Docs: write ' + marker_words + ' here."""') is False
+
+    target = tmp_path / ("mod" + "." + "py")
+    target.write_bytes(b"def f():\n    return 1\n")
+    body = (
+        "def f():\n"
+        '    """Docs: write ' + marker_words + ' to keep lines."""\n'
+        "    return 42\n"
+    )
+    result = run_cli("edit", str(target), "--replace", "f", "--snippet", body)
+    assert result.returncode == 0, result.stderr
+    assert b"return 42" in target.read_bytes()
+
 
 class TestSnippetHasKeepMarker:
     """Unit tests for the predicate itself, independent of the CLI."""
