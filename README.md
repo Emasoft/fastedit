@@ -119,16 +119,29 @@ Avoid `pip install fastedits` into a Homebrew / distro-managed Python — it wil
 
 ### This fork
 
-This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with the bundled swap script instead:
+This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with the swap script instead.
+
+**Remote install (no clone needed)** — download the script, then run it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/feat/create-file/scripts/install-fork.sh -o /tmp/install-fork.sh
+bash /tmp/install-fork.sh
+```
+
+Download-then-run, deliberately, rather than `curl … | bash`: piping straight into a shell executes a **partial** script if the connection drops mid-transfer, and a shell will happily run the first half of an installer. Downloading first makes the fetch either succeed or fail as a whole, and leaves the script on disk to read before running it — which you should.
+
+**From a clone**, if you have one:
 
 ```bash
 git clone https://github.com/Emasoft/fastedit && cd fastedit
 scripts/install-fork.sh                       # swaps in the fork (default: feat/create-file)
-scripts/install-fork.sh --extras mlx,mcp      # with extras
+scripts/install-fork.sh --extras mlx,mcp      # override the auto-selected extras
 scripts/install-fork.sh --ref v1.2.3          # pin a branch/tag/sha
 scripts/install-fork.sh --no-model            # skip the ~3 GB model download
 scripts/install-fork.sh --revert              # undo — back to upstream from PyPI
 ```
+
+By default the script installs **every extra this platform can install** — `mlx,mcp` on Apple Silicon, `vllm,mcp` on Linux with an NVIDIA driver, `mcp` elsewhere — because an extras-less install leaves the downloaded merge model unloadable. Note `--ref` applies to the *package* the script installs; to install from a different branch you must also fetch that branch's script, since the URL above pins `feat/create-file`.
 
 The fork ships under the same PyPI name and console-script names as upstream, so the script uninstalls any existing `fastedits` from every method it finds (uv tool, pipx, pip) before installing, then verifies the `fastedit` that actually ends up on PATH is the fork — not a shadowed leftover. Add `--dry-run` to any of the above to see the commands without running them.
 

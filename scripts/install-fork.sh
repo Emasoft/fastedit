@@ -39,7 +39,10 @@ Usage: install-fork.sh [--ref REF] [--extras LIST] [--revert] [--no-model] [--dr
 
   --ref REF      Branch, tag or commit SHA of the fork to install
                  (default: feat/create-file)
-  --extras LIST  Comma-separated extras, e.g. mlx,mcp (default: none)
+  --extras LIST  Comma-separated extras. DEFAULT: every extra this platform
+                 can install (mlx,mcp on Apple Silicon; vllm,mcp on Linux with
+                 an NVIDIA driver; mcp elsewhere). Pass --extras "" for none --
+                 the model pull is then skipped, since nothing could load it.
   --revert       Uninstall the fork and reinstall upstream fastedits
                  from PyPI (undoes the swap; leaves downloaded model
                  weights in place — they're shared with the fork)
