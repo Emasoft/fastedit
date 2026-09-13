@@ -114,7 +114,25 @@ _MIN_ANCHOR_LENGTH = 4
 
 
 def _is_marker(line: str) -> bool:
-    return any(m in line for m in _MARKER_PHRASES)
+    # Recognize markers WITHOUT relying on `_normalize_markers` having run
+    # first. Only `chunked_merge()` calls `_normalize_markers()` before
+    # classification; `deterministic_edit()` can also be reached directly
+    # (e.g. the CLI's fast deterministic-replace path), where a short-form
+    # marker (`#...`, `//...`, a lone unicode ellipsis) never gets expanded
+    # to the canonical "# ... existing code ..." phrase this function used
+    # to require. An unrecognized marker line was misclassified as plain
+    # "new" content: it got written into the file literally, AND its
+    # presence among the trailing entries suppressed the fallback that
+    # re-appends the untouched original suffix -- silently deleting every
+    # line after it, at both a trailing and a mid-snippet position.
+    # (TRDD-CMRMA2YG)
+    stripped = line.strip()
+    return (
+        any(m in line for m in _MARKER_PHRASES)
+        or bool(_SHORT_HASH_RE.match(stripped))
+        or bool(_SHORT_SLASH_RE.match(stripped))
+        or bool(_UNICODE_ELLIPSIS_RE.match(stripped))
+    )
 
 
 def _replacement_key(line: str) -> str | None:
