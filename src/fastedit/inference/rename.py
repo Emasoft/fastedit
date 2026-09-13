@@ -485,11 +485,11 @@ def do_rename_ast(
 ) -> tuple[str, int, int]:
     """Rename all AST-verified references to old_name in a single file.
 
-    Drives matching through ``tldr references <name> <file> --scope file``,
+    Drives matching through tldr references <name> <file> --scope file,
     which uses tree-sitter + language-aware name resolution to distinguish
     real code references from coincidental substrings in strings, comments,
     and docstrings. This replaces the previous regex + tree-sitter skip-zone
-    engine (``do_rename``) for the single-file code path.
+    engine (do_rename) for the single-file code path.
 
     Behaviour when tldr is unavailable or emits no references: returns the
     original content unchanged with count=0 and skipped=0. Callers treat
@@ -506,7 +506,7 @@ def do_rename_ast(
         skipped_count is the number of raw word-boundary occurrences that
         tldr did *not* verify as a real reference (i.e., substrings inside
         strings, comments, or docstrings). Computed client-side because
-        ``tldr references`` does not carry a per-file skip count.
+        tldr references does not carry a per-file skip count.
     """
     from pathlib import Path
 
@@ -514,13 +514,13 @@ def do_rename_ast(
 
     if old_name == new_name:
         try:
-            original = path.read_text(encoding="utf-8")
+            original = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             return "", 0, 0
         return original, 0, 0
 
     try:
-        original = path.read_text(encoding="utf-8")
+        original = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return "", 0, 0
 
