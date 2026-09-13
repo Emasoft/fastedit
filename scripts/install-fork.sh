@@ -210,23 +210,40 @@ detect_model() {
   return 1
 }
 
-# The backend EXTRA that makes detect_model's choice loadable. Only the
-# Darwin/arm64 -> mlx pair is asserted here, because it is the only one
-# measured: on 2026-09-13 an extras-less install on this machine cached 1.7 GB
-# at mlx-8bit and then died with `ModuleNotFoundError: No module named 'mlx'`
-# on the first model-merge edit. The Linux/bf16 case is deliberately NOT
-# mapped -- which runtime serves bf16 was never verified here, and guessing
-# `vllm` would put one of the most install-hostile packages in the ecosystem
-# on the failure path of a platform this repo cannot test.
+# EVERY extra this platform can actually install (owner directive 2026-09-13:
+# "it must install with all extras by default"). A default install must not be
+# crippled -- an extras-less one cached 1.7 GB at mlx-8bit and then died with
+# `ModuleNotFoundError: No module named 'mlx'` on the first model-merge edit.
+#
+# "All extras" cannot be taken literally, and that is the whole reason this is
+# a function rather than a constant: the three declared extras are not
+# co-installable. `mlx` ships no Linux wheels; `vllm` ships no macOS wheels.
+# Asking for both guarantees a failed resolve on EVERY platform, which would
+# turn a crippled install into no install at all. So it means every extra that
+# is installable HERE:
+#
+#   Darwin/arm64      -> mlx,mcp     (mlx is the backend for the mlx-8bit model)
+#   Linux + nvidia    -> vllm,mcp    (vllm is the declared CUDA backend extra)
+#   anything else     -> mcp         (pure Python, installs anywhere)
+#
+# `mcp` is unconditional: it is the MCP server, part of the advertised surface,
+# and pure Python via fastmcp. The install is non-fatal (see do_install_optional)
+# precisely because mlx and vllm are compiled wheels that CAN fail to build --
+# a failure falls back to the bare spec rather than leaving no fastedit at all.
 detect_backend_extra() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
   if [[ "$os" == "Darwin" && "$arch" == "arm64" ]]; then
-    echo "mlx"
+    echo "mlx,mcp"
     return 0
   fi
-  return 1
+  if [[ "$os" == "Linux" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    echo "vllm,mcp"
+    return 0
+  fi
+  echo "mcp"
+  return 0
 }
 
 pull_model() {
@@ -339,9 +356,19 @@ else
   BACKEND_READY=0
   BACKEND_EXTRA=""
   if [[ "$EXTRAS_SET" -eq 0 ]] && BACKEND_EXTRA=$(detect_backend_extra); then
-    BACKEND_ATTEMPTED=1
+    # `mcp` is NOT a merge backend -- it is the MCP server. On a platform where
+    # the auto-selected set is mcp-only (neither mlx nor vllm is installable),
+    # the install succeeding tells us nothing about merge capability, so the
+    # model pull must stay withheld. Setting READY on a bare `mcp` success would
+    # silently restore the original defect: 1.8 GB downloaded with nothing able
+    # to load it.
+    case ",${BACKEND_EXTRA}," in
+      *,mlx,*|*,vllm,*) BACKEND_ATTEMPTED=1 ;;
+    esac
     if do_install_optional "${PACKAGE}[${BACKEND_EXTRA}] @ git+${FORK_URL}@${REF}"; then
-      BACKEND_READY=1
+      case ",${BACKEND_EXTRA}," in
+        *,mlx,*|*,vllm,*) BACKEND_READY=1 ;;
+      esac
     else
       echo "warning: installing the '${BACKEND_EXTRA}' backend extra failed; falling back to a bare install." >&2
       echo "warning: deterministic edits will work; model-merge edits will not, and the model pull is skipped." >&2

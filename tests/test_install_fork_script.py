@@ -35,20 +35,28 @@ def spec_argv(stdout: str, prefix: str) -> str:
 
 
 def _default_extras() -> str:
-    """The bracketed extras install-fork.sh auto-selects for THIS platform, or "" if none.
+    """The bracketed extras install-fork.sh auto-selects for THIS platform.
 
-    Mirrors detect_backend_extra in the script. The default install carries the
-    backend extra matching the model the script will pull, because an
-    extras-less install left the 1.7 GB model unloadable -- the first
-    model-merge edit died with ModuleNotFoundError. Only Darwin/arm64 -> mlx is
-    mapped; every other platform deliberately gets a bare spec, since which
-    runtime serves the Linux bf16 model was never verified.
+    Mirrors detect_backend_extra in the script, which installs EVERY extra this
+    platform can actually install (owner directive: a default install must not
+    be crippled). "All extras" cannot be literal -- mlx ships no Linux wheels
+    and vllm no macOS wheels, so asking for both would fail to resolve on every
+    platform. Hence: mlx+mcp on Apple Silicon, vllm+mcp on Linux with an NVIDIA
+    driver, mcp alone elsewhere. mcp is unconditional: pure Python, and it is
+    the MCP server other tools launch.
+
+    Imports are local and complete on purpose: the Linux branch never executes
+    on the machine this is developed on, so a missing module-level import would
+    be a NameError that only ever fires on Linux and is invisible here.
     """
     import platform
+    import shutil
 
     if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "[mlx]"
-    return ""
+        return "[mlx,mcp]"
+    if platform.system() == "Linux" and shutil.which("nvidia-smi"):
+        return "[vllm,mcp]"
+    return "[mcp]"
 
 
 class TestInstallForkScriptExists:
