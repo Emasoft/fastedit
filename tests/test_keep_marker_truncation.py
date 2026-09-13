@@ -40,6 +40,30 @@ def run_cli(*args: str, input_text: str | None = None):
         env=env,
     )
 
+@pytest.mark.xfail(
+    reason="KNOWN, MEASURED code-loss shape -- see TRDD-CMRMA2YG. Tracked, not fixed.",
+    strict=True,
+)
+def test_rust_lifetime_paired_with_a_later_apostrophe_hides_the_marker() -> None:
+    """KNOWN HOLE: a lifetime pairing with an apostrophe AFTER the marker hides it.
+
+    `let s: &'static str;  // <marker> don't` -- the apostrophe in `'static` finds
+    a partner in `don't`, which sits AFTER the marker, so the scanner enters
+    string mode and never sees the `//`. The marker is missed, the partial
+    snippet is spliced, and code is lost silently at exit 0.
+
+    This is xfail(strict) ON PURPOSE rather than a card note. Four successive
+    predicates were written today and each fix opened a new hole, so a fifth
+    written by the same author was judged worse than a tracked defect. A card is
+    invisible to the suite; this is not. strict=True means the day someone makes
+    the predicate catch this, the test fails as XPASS and forces them to notice
+    they closed it -- so the hole cannot be quietly fixed OR quietly forgotten.
+    """
+    slash = "// " + "... existing code ..."
+    a = chr(39)
+    line = "let s: &" + a + "static str;  " + slash + " don" + a + "t"
+    assert snippet_has_keep_marker(line) is True
+
 def test_rust_lifetimes_do_not_hide_a_marker(tmp_path: Path) -> None:
     """A Rust lifetime must not swallow the rest of the line and hide a marker.
 

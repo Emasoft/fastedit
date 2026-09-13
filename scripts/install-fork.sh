@@ -101,6 +101,25 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
+# Extras in a PEP 508 direct reference (`pkg[extra] @ git+...`) are what this
+# script installs, and older uv did not support bracket extras on a tool
+# install (astral-sh/uv#6296). The failure mode there is the one this whole
+# script exists to prevent and it is SILENT: extras quietly dropped, the model
+# still downloaded, the backend absent, exit 0. Verified working on 0.12.12; a
+# floor of 0.5.0 is well below that and well above the issue. Warn rather than
+# abort -- the bound is inferred from an issue, not measured on old versions,
+# so refusing to install on it would be a guess with teeth.
+_uv_ver="$(uv --version 2>/dev/null | awk '{print $2}')"
+if [[ -n "$_uv_ver" ]]; then
+  _uv_major="${_uv_ver%%.*}"
+  _uv_minor="${_uv_ver#*.}"; _uv_minor="${_uv_minor%%.*}"
+  if [[ "$_uv_major" -eq 0 && "$_uv_minor" -lt 5 ]]; then
+    echo "warning: uv $_uv_ver is older than 0.5; bracket extras on a tool install may be" >&2
+    echo "warning: silently ignored, leaving the merge model installed but unloadable." >&2
+    echo "warning: run 'fastedit doctor' afterwards and check the backend line." >&2
+  fi
+fi
+
 # Render argv as a shell-quoted line a user can copy-paste and get the
 # same invocation (so a spec like "fastedits @ git+https://..." stays one
 # paste-able token). An argument made only of characters that never need
