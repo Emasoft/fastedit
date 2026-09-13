@@ -8,3 +8,7 @@ dist/
 build/
 .mypy_cache/
 .ruff_cache/
+
+# Agent reports carry absolute paths and internal detail -- never commit them.
+reports/
+reports_dev/
