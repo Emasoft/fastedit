@@ -62,17 +62,25 @@ class TestSymbolAtFileStart:
         assert f.read_bytes() == expected
 
     def test_delete_symbol_at_absolute_start_of_file_leaves_remainder_byte_exact(self, tmp_path: Path) -> None:
-        """Deleting the very first symbol must leave the second symbol byte-for-byte untouched.
+        """Deleting the very first symbol leaves the second at byte 0, no stray blank line.
 
-        Observed: delete of a leading symbol also consumes one of the two
-        blank separator lines that followed it (verified empirically, not
-        assumed) -- pinned here as the actual, current contract.
+        UPDATED 2026-09-13. This test previously pinned OBSERVED behaviour -- its
+        own docstring said so -- where delete consumed only ONE of the two blank
+        separator lines, leaving the file starting with a stray newline. That was
+        a characterization test, not a requirement, and the behaviour it pinned
+        was wrong in both directions: not byte-exact (which would keep BOTH
+        blanks) and not tidy (which keeps neither).
+
+        delete now consumes the FULL separator following a removed symbol.
+        Verified on a middle delete: in a PEP 8 three-function file, consuming one
+        blank leaves THREE blank lines between the surviving neighbours; consuming
+        all leaves exactly two, matching the original style byte for byte.
         """
         f = tmp_path / "m.py"
         f.write_bytes(b"def first():\n    return 1\n\n\ndef second():\n    return 2\n")
         result = run_cli("delete", str(f), "first")
         assert result.returncode == 0, result.stderr
-        assert f.read_bytes() == b"\ndef second():\n    return 2\n"
+        assert f.read_bytes() == b"def second():\n    return 2\n"
 
 
 class TestSymbolAtFileEnd:
@@ -208,12 +216,12 @@ class TestEmptyBodySymbols:
         assert f.read_bytes() == b"def stub():\n    return 42\n"
 
     def test_delete_a_pass_only_class_removes_exactly_its_two_lines(self, tmp_path: Path) -> None:
-        """Deleting a pass-only class must remove exactly its lines and nothing from its neighbour."""
+        """Deleting a pass-only class removes its lines and its trailing separator, nothing of its neighbour."""
         f = tmp_path / "m.py"
         f.write_bytes(b"class Empty:\n    pass\n\n\nclass Keep:\n    pass\n")
         result = run_cli("delete", str(f), "Empty")
         assert result.returncode == 0, result.stderr
-        assert f.read_bytes() == b"\nclass Keep:\n    pass\n"
+        assert f.read_bytes() == b"class Keep:\n    pass\n"
 
 
 class TestOneLineFileNoTrailingNewline:
@@ -328,7 +336,7 @@ class TestSubstringSymbolNames:
         f.write_bytes(b"def get():\n    return 1\n\n\ndef getAll():\n    return 2\n")
         result = run_cli("delete", str(f), "get")
         assert result.returncode == 0, result.stderr
-        assert f.read_bytes() == b"\ndef getAll():\n    return 2\n"
+        assert f.read_bytes() == b"def getAll():\n    return 2\n"
 
     def test_rename_getAll_does_not_touch_get(self, tmp_path: Path) -> None:
         """Renaming the longer 'getAll' must not affect the shorter 'get' it contains as a substring."""
@@ -386,7 +394,7 @@ class TestSymbolNameInStringLiteralAndComment:
         )
         result = run_cli("delete", str(f), "get")
         assert result.returncode == 0, result.stderr
-        assert f.read_bytes() == b'\ndef other():\n    return "get is a common name"\n'
+        assert f.read_bytes() == b'def other():\n    return "get is a common name"\n'
 
 
 class TestDuplicateNamesDifferentScopes:
@@ -709,7 +717,7 @@ class TestIdempotenceAndRecovery:
         r1 = run_cli("delete", str(f), "a")
         assert r1.returncode == 0, r1.stderr
         after_first = f.read_bytes()
-        assert after_first == b"\ndef b():\n    return 2\n"
+        assert after_first == b"def b():\n    return 2\n"
         r2 = run_cli("delete", str(f), "a")
         assert r2.returncode != 0
         assert f.read_bytes() == after_first

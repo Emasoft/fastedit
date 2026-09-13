@@ -33,6 +33,24 @@ def spec_argv(stdout: str, prefix: str) -> str:
     raise AssertionError(f"no dry-run line starting with +{prefix!r} in:\n{stdout}")
 
 
+
+def _default_extras() -> str:
+    """The bracketed extras install-fork.sh auto-selects for THIS platform, or "" if none.
+
+    Mirrors detect_backend_extra in the script. The default install carries the
+    backend extra matching the model the script will pull, because an
+    extras-less install left the 1.7 GB model unloadable -- the first
+    model-merge edit died with ModuleNotFoundError. Only Darwin/arm64 -> mlx is
+    mapped; every other platform deliberately gets a bare spec, since which
+    runtime serves the Linux bf16 model was never verified.
+    """
+    import platform
+
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "[mlx]"
+    return ""
+
+
 class TestInstallForkScriptExists:
     def test_script_exists_and_is_executable(self) -> None:
         """The fork-swap script ships in the repo and is directly runnable."""
@@ -43,12 +61,12 @@ class TestInstallForkScriptExists:
 
 class TestInstallForkDryRun:
     def test_dry_run_exits_zero_and_shows_default_install(self) -> None:
-        """--dry-run succeeds and prints the default uninstall+install commands."""
+        """--dry-run succeeds and prints the uninstall sweep plus a platform-matched install spec."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
         assert "uv tool uninstall fastedits" in result.stdout
         assert spec_argv(result.stdout, "uv tool install ") == (
-            "fastedits @ git+https://github.com/Emasoft/fastedit@feat/create-file"
+            f"fastedits{_default_extras()} @ git+https://github.com/Emasoft/fastedit@feat/create-file"
         )
 
     def test_dry_run_sweeps_every_install_method(self) -> None:
@@ -76,7 +94,7 @@ class TestInstallForkDryRun:
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
         assert spec_argv(result.stdout, "uv tool install ") == (
-            "fastedits @ git+https://github.com/Emasoft/fastedit@v1.2.3"
+            f"fastedits{_default_extras()} @ git+https://github.com/Emasoft/fastedit@v1.2.3"
         )
 
     def test_extras_flag_adds_bracketed_extras_to_package_spec(self) -> None:
