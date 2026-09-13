@@ -18,6 +18,12 @@ FORK_URL="https://github.com/Emasoft/fastedit"
 PACKAGE="fastedits"
 REF="feat/create-file"
 EXTRAS=""
+# Whether --extras was PASSED, tracked separately from its value. `--extras ""`
+# is a deliberate opt-out and must be distinguishable from never passing the
+# flag at all; testing `-z "$EXTRAS"` alone conflates the two and silently
+# installs a backend the user explicitly declined (measured: it did exactly
+# that before this flag existed).
+EXTRAS_SET=0
 REVERT=0
 DRY_RUN=0
 NO_MODEL=0
@@ -52,6 +58,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --extras)
       EXTRAS="$2"
+      EXTRAS_SET=1
       shift 2
       ;;
     --revert)
@@ -313,12 +320,26 @@ else
   # sweep above has already removed the previous install. So a failure falls
   # back to the bare spec (the near-unfailable pure-Python one) and downgrades
   # to deterministic-edit-only, which still works.
-  # BACKEND_READY is tracked rather than probed: we know what we installed,
-  # whereas grepping `fastedit doctor` would mean parsing decorated human
-  # output to rediscover a fact we already hold.
+  # BACKEND_READY is tracked rather than probed. It records what we INSTALLED,
+  # which is not the same as what is IMPORTABLE: a wheel can install and still
+  # fail to load (wrong arch under Rosetta, a broken build). So this closes the
+  # common case, not the whole class -- if the import fails anyway, the pull is
+  # a wasted download, not a corruption.
+  #
+  # 0 means "we have positive evidence there is no backend", NOT "we don't
+  # know". Absence of a mapping is not evidence of an absent backend: on a
+  # platform where we never attempted an install we must NOT infer failure,
+  # because the user may already have a working runtime we know nothing about.
+  # Downgrading their previously-working model pull on a guess would be the
+  # same unverified inference we refused to encode in detect_backend_extra.
+  # Tri-state, deliberately. BACKEND_ATTEMPTED distinguishes "we tried to
+  # install a backend and it failed" from "we never tried, so we know
+  # nothing" -- and ONLY the first is grounds for withholding the model.
+  BACKEND_ATTEMPTED=0
   BACKEND_READY=0
   BACKEND_EXTRA=""
-  if [[ -z "$EXTRAS" ]] && BACKEND_EXTRA=$(detect_backend_extra); then
+  if [[ "$EXTRAS_SET" -eq 0 ]] && BACKEND_EXTRA=$(detect_backend_extra); then
+    BACKEND_ATTEMPTED=1
     if do_install_optional "${PACKAGE}[${BACKEND_EXTRA}] @ git+${FORK_URL}@${REF}"; then
       BACKEND_READY=1
     else
@@ -329,7 +350,9 @@ else
     fi
   else
     # An explicit --extras (including --extras "") is the user's call: honour
-    # it exactly and make no backend guess on top of it.
+    # it exactly and make no backend guess on top of it. BACKEND_ATTEMPTED
+    # stays 0 -- we installed what was asked for and learned nothing about
+    # what runtime this machine already has.
     do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
     case ",${EXTRAS}," in *,mlx,*|*,vllm,*) BACKEND_READY=1 ;; esac
   fi
@@ -339,11 +362,18 @@ else
   fi
 
   if [[ "$NO_MODEL" -eq 0 ]]; then
-    if [[ "$BACKEND_READY" -eq 0 ]]; then
-      # Skipping is the point: pulling ~1.7 GB that nothing can load is what
-      # this script used to do, and it produced a green install whose first
-      # model-merge edit raised ModuleNotFoundError.
-      echo "note: no merge backend installed — skipping the model pull (it would be ~1.7 GB nothing can load)."
+    if [[ "$BACKEND_ATTEMPTED" -eq 1 && "$BACKEND_READY" -eq 0 ]]; then
+      # Skip ONLY on positive evidence: we tried to install the backend on this
+      # platform and the install failed. Pulling ~1.7 GB that nothing can load
+      # is what this script used to do, and it produced a green install whose
+      # first model-merge edit raised ModuleNotFoundError.
+      #
+      # The condition is deliberately NOT `BACKEND_READY -eq 0` alone. That
+      # would also catch the case where we never attempted an install (no
+      # extra is mapped for this platform), and withhold the model from a
+      # machine that may well have a working runtime already -- a downgrade of
+      # previously-working behaviour, inferred from our own ignorance.
+      echo "note: the merge backend failed to install — skipping the model pull (it would be ~1.7 GB nothing can load)."
       echo "note: install a backend first, then run 'fastedit pull' — see the warnings above."
     elif MODEL=$(detect_model); then
       pull_model "$MODEL"

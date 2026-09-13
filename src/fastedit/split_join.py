@@ -54,18 +54,26 @@ def detect_line_ending(text: str) -> str:
 
     Counted directly (splitlines also treats several other Unicode characters
     as line breaks and would misreport a Python-only boundary as missing).
-    No terminator at all, or a genuine tie between kinds, falls back to
-    os.linesep rather than guessing which convention the caller wants.
-    """
-    import os
 
+    Falls back to "\n" -- never os.linesep -- when text carries no line
+    ending at all (empty string or a single line) or when two styles tie
+    exactly. os.linesep is a HOST property ("\n" on macOS/Linux, "\r\n" on
+    Windows): picking it here would make the SAME edit on the SAME file
+    emit different bytes depending on which machine ran fastedit, breaking
+    this tool's byte-exactness contract (TRDD-J8Q28MED). "\n" is the
+    deterministic, host-independent choice: every caller of this function
+    passes it the text being edited with no other signal to fall back on,
+    so there is nothing platform-specific left to infer from -- LF is also
+    the git/POSIX convention. DO NOT reintroduce os.linesep in either branch
+    below.
+    """
     crlf = text.count("\r\n")
     lone_cr = text.count("\r") - crlf
     lone_lf = text.count("\n") - crlf
     counts = {"\r\n": crlf, "\n": lone_lf, "\r": lone_cr}
     top = max(counts.values())
     if top == 0 or sum(1 for v in counts.values() if v == top) > 1:
-        return os.linesep
+        return "\n"
     return next(k for k, v in counts.items() if v == top)
 
 
