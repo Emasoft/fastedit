@@ -160,39 +160,67 @@ def snippet_has_keep_marker(snippet: str) -> bool:
         passes the full replacement body instead.
       * false NEGATIVE -- lets a partial snippet reach the direct-replacement
         splice, which deletes every original line the snippet did not restate.
-        SILENT, exit 0, data lost.
+        SILENT, exit 0, code lost.
 
-    So where the two cannot both be satisfied, this errs toward refusing.
+    Where the two cannot both be satisfied, err toward refusing.
 
-    Both earlier versions were MEASURED wrong, in opposite directions:
+    THREE earlier versions were each MEASURED wrong, and every failure but the
+    first was in the silent direction:
 
-      * `in` containment refused a valid body whose DOCSTRING merely mentioned
-        the phrase -- and proved it by refusing the very edit that fixed it,
-        since this project documents markers in its own docstrings.
-      * `startswith` on the stripped line missed a marker sitting AFTER code
-        (`x = 1  <marker>`), and an end-to-end run confirmed that snippet
-        truncated a four-line body to one, exit 0.
+      * substring containment refused a valid body whose DOCSTRING merely
+        mentioned the phrase -- proving it by refusing the very edit that fixed
+        it, since this project documents markers in its own docstrings.
+      * `startswith` on the stripped line missed a marker sitting after code;
+        end-to-end that truncated a four-line body to one, exit 0.
+      * a quote-in-prefix test missed BOTH a marker after an ordinary comment
+        containing an apostrophe (`don't`, `won't`, `it's` -- routine English)
+        and a marker after any earlier string literal on the same line.
 
-    The rule below catches both. A canonical long-form marker begins a COMMENT,
-    so it is a marker when nothing before it on that line opens a string: the
-    trailing-after-code case has a quote-free prefix and is caught, while a
-    docstring mentioning the phrase has a quote in its prefix and is not.
+    Each of those was a threshold guess. This is not: a marker only means
+    anything inside a COMMENT, so find where the comment actually starts by
+    scanning the line with quote state, then look for the marker after it.
+    That is the property itself rather than a proxy for it.
 
-    KNOWN LIMIT, deliberately accepted: a marker alone on its own line inside a
-    multi-line string still refuses, because that needs real parsing to see.
-    That is the loud direction, and it is far rarer than the docstring case.
+    KNOWN LIMIT, accepted and deliberate: a marker alone on its own line inside
+    a multi-line string is still treated as a marker, because seeing that needs
+    a real parser. That is the LOUD direction -- it refuses a valid snippet
+    rather than losing code -- and it is far rarer than the cases above.
     """
+
+    def comment_start(line: str) -> int:
+        """Index where a comment opens on this line, ignoring quoted text."""
+        quote = None
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+            if quote is not None:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if ch == "#":
+                return i
+            if ch == "/" and i + 1 < n and line[i + 1] == "/":
+                return i
+            i += 1
+        return -1
+
     for line in snippet.splitlines():
-        stripped = line.strip()
-        if stripped in _EXACT_SHORT_MARKERS:
+        if line.strip() in _EXACT_SHORT_MARKERS:
             return True
-        for canonical in (_CANONICAL_HASH_MARKER, _CANONICAL_SLASH_MARKER):
-            idx = line.find(canonical)
-            if idx == -1:
-                continue
-            prefix = line[:idx]
-            if '"' in prefix or "'" in prefix:
-                continue
+        start = comment_start(line)
+        if start == -1:
+            continue
+        comment = line[start:]
+        if _CANONICAL_HASH_MARKER in comment or _CANONICAL_SLASH_MARKER in comment:
             return True
     return False
 

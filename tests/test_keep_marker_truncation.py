@@ -40,6 +40,35 @@ def run_cli(*args: str, input_text: str | None = None):
         env=env,
     )
 
+def test_marker_after_a_comment_containing_an_apostrophe_is_refused(tmp_path: Path) -> None:
+    """A marker after an ordinary comment with an apostrophe must still be caught.
+
+    Regression for a MEASURED silent-truncation path, and the third distinct
+    shape to reach it. A guard that decided comment-vs-string by asking whether
+    any quote character appeared before the marker treated the apostrophe in
+    everyday English -- don't, won't, it's, the caller's -- as an open string,
+    so the marker after it was invisible and the partial snippet was spliced.
+    The same hole swallowed a marker following any earlier string literal.
+
+    The fix scans the line with real quote state to find where the comment
+    actually opens, which is the property itself rather than a proxy. This test
+    pins the two shapes that defeated the proxy.
+    """
+    canonical = "# " + "... existing code ..."
+    apostrophe = chr(39)
+    quote = chr(34)
+
+    assert snippet_has_keep_marker("    # don" + apostrophe + "t touch  " + canonical) is True
+    assert snippet_has_keep_marker("    x = " + quote + "a" + quote + "  " + canonical) is True
+
+    target = tmp_path / ("mod" + "." + "py")
+    original = b"def f():\n    a = 1\n    b = 2\n    return a + b\n"
+    target.write_bytes(original)
+    body = "def f():\n    # don" + apostrophe + "t touch  " + canonical + "\n"
+    result = run_cli("edit", str(target), "--replace", "f", "--snippet", body)
+    assert result.returncode != 0
+    assert target.read_bytes() == original, "target must be byte-identical on refusal"
+
 def test_marker_after_code_on_the_same_line_is_refused(tmp_path: Path) -> None:
     """A marker sitting AFTER code on the same line must still be caught.
 
