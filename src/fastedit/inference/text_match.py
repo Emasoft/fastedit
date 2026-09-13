@@ -153,39 +153,46 @@ _EXACT_SHORT_MARKERS = ("#...", "//...", "…", "#…", "//…")
 def snippet_has_keep_marker(snippet: str) -> bool:
     """True when a snippet contains a line that IS a keep-marker.
 
-    Deliberately STRICTER than `_is_marker`. Inside `deterministic_edit` a false
-    positive is cheap -- a line is merely classified as "keep". Here the cost
-    model is inverted: this predicate REFUSES to write a file, so a false
-    positive rejects a valid edit.
+    This predicate REFUSES to write a file, so its two failure directions are
+    NOT symmetric and the design follows that asymmetry:
 
-    Two narrow tests, and NEITHER is a bare substring match:
+      * false POSITIVE -- refuses a valid snippet. Loud, recoverable: the user
+        passes the full replacement body instead.
+      * false NEGATIVE -- lets a partial snippet reach the direct-replacement
+        splice, which deletes every original line the snippet did not restate.
+        SILENT, exit 0, data lost.
 
-    * the stripped line is exactly one of the short forms, or
-    * the stripped line STARTS WITH a canonical long-form marker.
+    So where the two cannot both be satisfied, this errs toward refusing.
 
-    `startswith`, not `in`, is load-bearing and was a MEASURED defect. With
-    containment, a complete and valid snippet whose DOCSTRING merely mentioned
-    the canonical phrase was refused -- verified by hand, and then demonstrated
-    the hard way when the containment version refused the very edit that
-    introduced this docstring. That is the classic detector failure of flagging
-    the documentation ABOUT a hazard as the hazard, and it is not academic:
-    fastedit's own source documents markers in docstrings, so containment made
-    the tool unable to edit itself.
+    Both earlier versions were MEASURED wrong, in opposite directions:
 
-    A docstring line begins with a quote character, so `startswith` excludes it
-    while still accepting a genuine marker comment that carries a trailing note.
+      * `in` containment refused a valid body whose DOCSTRING merely mentioned
+        the phrase -- and proved it by refusing the very edit that fixed it,
+        since this project documents markers in its own docstrings.
+      * `startswith` on the stripped line missed a marker sitting AFTER code
+        (`x = 1  <marker>`), and an end-to-end run confirmed that snippet
+        truncated a four-line body to one, exit 0.
 
-    Using the permissive `_MARKER_PHRASES` set here would be worse still: it
-    holds the bare hash-ellipsis and slash-ellipsis phrases, which as substrings
-    match ordinary code such as a statement with a trailing elided comment.
+    The rule below catches both. A canonical long-form marker begins a COMMENT,
+    so it is a marker when nothing before it on that line opens a string: the
+    trailing-after-code case has a quote-free prefix and is caught, while a
+    docstring mentioning the phrase has a quote in its prefix and is not.
+
+    KNOWN LIMIT, deliberately accepted: a marker alone on its own line inside a
+    multi-line string still refuses, because that needs real parsing to see.
+    That is the loud direction, and it is far rarer than the docstring case.
     """
     for line in snippet.splitlines():
         stripped = line.strip()
         if stripped in _EXACT_SHORT_MARKERS:
             return True
-        if stripped.startswith(_CANONICAL_HASH_MARKER) or stripped.startswith(
-            _CANONICAL_SLASH_MARKER
-        ):
+        for canonical in (_CANONICAL_HASH_MARKER, _CANONICAL_SLASH_MARKER):
+            idx = line.find(canonical)
+            if idx == -1:
+                continue
+            prefix = line[:idx]
+            if '"' in prefix or "'" in prefix:
+                continue
             return True
     return False
 

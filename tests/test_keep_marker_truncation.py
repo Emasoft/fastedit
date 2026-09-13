@@ -40,6 +40,30 @@ def run_cli(*args: str, input_text: str | None = None):
         env=env,
     )
 
+def test_marker_after_code_on_the_same_line_is_refused(tmp_path: Path) -> None:
+    """A marker sitting AFTER code on the same line must still be caught.
+
+    Regression for a MEASURED silent-truncation path. An earlier guard tested
+    the canonical marker with `startswith` on the stripped line, so a marker
+    preceded by code was invisible to it. End-to-end, that snippet reduced a
+    four-line body to one line and exited 0 -- the exact data loss this guard
+    exists to prevent, reachable again through a guard meant to stop it.
+
+    The two failure directions are NOT symmetric: a false positive refuses a
+    valid edit (loud, recoverable), a false negative destroys code (silent).
+    This asserts the dangerous direction; its sibling test asserts the other.
+    """
+    canonical = "# " + "... existing code ..."
+    assert snippet_has_keep_marker("    x = 1  " + canonical) is True
+
+    target = tmp_path / ("mod" + "." + "py")
+    original = b"def f():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n"
+    target.write_bytes(original)
+    body = "def f():\n    x = 1  " + canonical + "\n"
+    result = run_cli("edit", str(target), "--replace", "f", "--snippet", body)
+    assert result.returncode != 0
+    assert target.read_bytes() == original, "target must be byte-identical on refusal"
+
 def test_docstring_mentioning_the_marker_phrase_is_not_refused(tmp_path: Path) -> None:
     """A complete snippet whose DOCSTRING mentions a marker phrase must still apply.
 
