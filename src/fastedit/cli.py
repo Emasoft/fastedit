@@ -168,6 +168,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         get_ast_map,
     )
     from .inference.text_match import deterministic_edit
+    from .split_join import detect_line_ending, normalize_line_endings
 
     total_lines = len(original_lines)
     ast_nodes = get_ast_map(str(path), total_lines)
@@ -185,12 +186,18 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     func_end = target_node.line_end  # exclusive
     original_func = "".join(original_lines[func_start:func_end])
 
+    # New/replaced content is normalized to the file's prevailing line
+    # ending so the splice does not leave a mixed-ending seam; untouched
+    # original_lines outside [func_start:func_end] are never touched.
+    line_ending = detect_line_ending(original_code)
+
     # Try deterministic text-match first
     edited = deterministic_edit(original_func, snippet)
     if edited is not None:
+        edited = normalize_line_endings(edited, line_ending)
         edited_lines = edited.splitlines(keepends=True)
-        if edited_lines and not edited_lines[-1].endswith("\n"):
-            edited_lines[-1] += "\n"
+        if edited_lines and not edited_lines[-1].endswith(("\n", "\r")):
+            edited_lines[-1] += line_ending
         result_lines = list(original_lines)
         result_lines[func_start:func_end] = edited_lines
         merged = "".join(result_lines)
@@ -203,7 +210,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         )
 
     # Direct replacement: snippet IS the new symbol. Swap line ranges.
-    snippet_text = snippet.rstrip("\n") + "\n"
+    snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n") + line_ending
     snippet_lines = snippet_text.splitlines(keepends=True)
     result_lines = list(original_lines)
     result_lines[func_start:func_end] = snippet_lines
