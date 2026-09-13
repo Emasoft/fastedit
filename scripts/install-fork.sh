@@ -349,12 +349,21 @@ else
       do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
     fi
   else
-    # An explicit --extras (including --extras "") is the user's call: honour
-    # it exactly and make no backend guess on top of it. BACKEND_ATTEMPTED
-    # stays 0 -- we installed what was asked for and learned nothing about
-    # what runtime this machine already has.
+    # An explicit --extras is the user's call: honour it exactly and make no
+    # backend guess on top of it.
     do_install "${PKG_SPEC} @ git+${FORK_URL}@${REF}"
     case ",${EXTRAS}," in *,mlx,*|*,vllm,*) BACKEND_READY=1 ;; esac
+    # `--extras ""` is not ignorance, it is an instruction. The user just told
+    # us not to install a backend, so this install provides none -- that is
+    # POSITIVE evidence, and pulling 1.7 GB of weights for the backend they
+    # declined would be the same "act on an inference" error as the Linux
+    # branch above, with the sign flipped. An unmapped PLATFORM teaches us
+    # nothing (attempted stays 0); an explicit empty --extras teaches us
+    # something (attempted is 1). They are different states and must not
+    # collapse into one flag value.
+    if [[ "$EXTRAS_SET" -eq 1 && "$BACKEND_READY" -eq 0 ]]; then
+      BACKEND_ATTEMPTED=1
+    fi
   fi
 
   if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -373,8 +382,17 @@ else
       # extra is mapped for this platform), and withhold the model from a
       # machine that may well have a working runtime already -- a downgrade of
       # previously-working behaviour, inferred from our own ignorance.
-      echo "note: the merge backend failed to install — skipping the model pull (it would be ~1.7 GB nothing can load)."
-      echo "note: install a backend first, then run 'fastedit pull' — see the warnings above."
+      # Two different reasons land here and they must not share a message: a
+      # FAILED attempt (BACKEND_EXTRA names what we tried) versus the user
+      # DECLINING extras. Telling someone who passed --extras "" that an
+      # install "failed" sends them debugging a failure that never happened.
+      if [[ -n "$BACKEND_EXTRA" ]]; then
+        echo "note: the '${BACKEND_EXTRA}' backend failed to install — skipping the model pull (~1.7 GB nothing could load)."
+        echo "note: install a backend first, then run 'fastedit pull' — see the warnings above."
+      else
+        echo "note: no backend extra was installed (--extras \"\") — skipping the model pull (~1.7 GB nothing could load)."
+        echo "note: if you already have a backend, run 'fastedit pull' yourself, or re-run without --extras."
+      fi
     elif MODEL=$(detect_model); then
       pull_model "$MODEL"
       if [[ "$DRY_RUN" -eq 0 ]]; then
