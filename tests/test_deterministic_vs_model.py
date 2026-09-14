@@ -293,12 +293,12 @@ class TestProductionPath:
         if det_pass > 0:
             print(f"Free edits (0 tokens): {det_pass}/{total} = {det_pass/total*100:.1f}%")
 
-        # Invariant: deterministic_edit must never silently produce a WRONG
-        # edit; a miss should return None (falling back to the model), never a
-        # confident bad splice. Never yet run against data: the benchmark file
-        # is not in the repo, so this test skips. Expect it to catch known
-        # wrong-splice defects the first time the benchmark is present.
+        # Invariant: no benchmark case may end with a result that differs from
+        # the expected output after normalization (AST scope -> deterministic_edit
+        # -> splice). A case the pipeline cannot handle should return None and fall
+        # back to the model. Never yet run against data: the benchmark file is not
+        # in the repo, so this test skips.
         assert det_fail == 0, (
-            f"deterministic_edit produced {det_fail} WRONG edit(s) instead of "
-            f"skipping to the model -- see the failures list printed above."
+            f"{det_fail} case(s) produced a result differing from the expected output "
+            f"after normalization (scope + deterministic_edit + splice) -- see the failures list printed above."
         )
