@@ -26,6 +26,34 @@ from fastedit.inference.text_match import deterministic_edit
 def _normalize(code: str) -> str:
     return "\n".join(line.rstrip() for line in code.splitlines()).strip()
 
+# Per-case ground truth for whether deterministic_edit() can resolve this
+# edit without falling back to the model. Measured on a49a758 with mlx
+# installed. A case flipping either direction is a real behavior change
+# and MUST fail loudly here (never silently skip) so it gets reviewed and
+# this table updated deliberately -- see the two assertion branches below.
+HANDLED_DETERMINISTICALLY = {
+    "python_add_validation_line": True,
+    "python_change_condition": True,
+    "python_add_try_except": False,
+    "python_add_guard": True,
+    "python_modify_return": False,
+    "python_multiline_insert": True,
+    "python_replace_block": True,
+    "python_add_logging": True,
+    "js_add_param_and_modify": True,
+    "ts_add_type_guard": True,
+    "rust_add_error_handling": False,
+    "go_add_context_param": False,
+    "python_change_middle": True,
+    "python_add_caching": True,
+    "js_simple_change": True,
+    "python_modify_class_method": True,
+    "python_marker_at_start": True,
+    "ts_replace_implementation": True,
+    "python_two_markers": True,
+    "ruby_add_rescue": True,
+}
+
 
 # ── Test cases: (name, original_func, snippet, expected) ──
 
@@ -669,12 +697,22 @@ class TestDeterministicProduction:
     @pytest.mark.parametrize("name,original,snippet,expected", CASES, ids=[c[0] for c in CASES])
     def test_edit(self, name, original, snippet, expected):
         result = deterministic_edit(original, snippet)
-        if result is None:
-            pytest.skip("deterministic returned None (would need model)")
-        assert _normalize(result) == _normalize(expected), (
-            f"Deterministic produced wrong result for {name}.\n"
-            f"Expected:\n{expected}\n\nGot:\n{result}"
-        )
+        if HANDLED_DETERMINISTICALLY[name]:
+            assert result is not None, (
+                f"{name} REGRESSED: deterministic_edit now returns None "
+                f"(was handled deterministically). Investigate before flipping "
+                f"HANDLED_DETERMINISTICALLY[{name!r}] to False."
+            )
+            assert _normalize(result) == _normalize(expected), (
+                f"Deterministic produced wrong result for {name}.\n"
+                f"Expected:\n{expected}\n\nGot:\n{result}"
+            )
+        else:
+            assert result is None, (
+                f"{name} IMPROVED: deterministic_edit now returns a result "
+                f"(was None / needs-model). Verify it against `expected` and "
+                f"flip HANDLED_DETERMINISTICALLY[{name!r}] to True."
+            )
 
     def test_summary(self):
         """Run all cases and print a summary report."""
@@ -723,3 +761,12 @@ class TestDeterministicProduction:
                 print(f"\nDeterministic handles {accuracy:.0f}% — model needed for ~half")
             else:
                 print(f"\nDeterministic handles {accuracy:.0f}% — model does most of the work")
+
+    def test_handled_matrix_matches_cases(self):
+        """HANDLED_DETERMINISTICALLY must name exactly the cases in CASES, so a new case can never silently skip via a missing entry."""
+        case_names = {c[0] for c in CASES}
+        assert set(HANDLED_DETERMINISTICALLY) == case_names, (
+            f"HANDLED_DETERMINISTICALLY / CASES drifted apart.\n"
+            f"Only in CASES: {case_names - set(HANDLED_DETERMINISTICALLY)}\n"
+            f"Only in HANDLED_DETERMINISTICALLY: {set(HANDLED_DETERMINISTICALLY) - case_names}"
+        )

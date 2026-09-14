@@ -292,3 +292,13 @@ class TestProductionPath:
         print(f"Deterministic skips (model needed): {det_skip}/{total}")
         if det_pass > 0:
             print(f"Free edits (0 tokens): {det_pass}/{total} = {det_pass/total*100:.1f}%")
+
+        # Invariant: deterministic_edit must never silently produce a WRONG
+        # edit; a miss should return None (falling back to the model), never a
+        # confident bad splice. Never yet run against data: the benchmark file
+        # is not in the repo, so this test skips. Expect it to catch known
+        # wrong-splice defects the first time the benchmark is present.
+        assert det_fail == 0, (
+            f"deterministic_edit produced {det_fail} WRONG edit(s) instead of "
+            f"skipping to the model -- see the failures list printed above."
+        )
