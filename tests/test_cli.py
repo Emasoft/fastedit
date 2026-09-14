@@ -111,6 +111,11 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
     )
 
 
+import importlib.util
+
+_MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
+
+
 # ===================================================================
 # 1. fastedit read
 # ===================================================================
@@ -800,6 +805,7 @@ class TestCLIMultiEdit:
         result = run_cli("multi-edit", "--file-edits", "-", input_text=file_edits)
         assert result.returncode == 0, f"multi-edit stdin failed: {result.stderr}"
 
+    @pytest.mark.skipif(not _MLX_AVAILABLE, reason="multi-edit constructs a backend unconditionally; needs mlx")
     def test_multi_edit_refuses_all_writes_when_a_target_changes_after_being_read(
         self, tmp_path: Path, monkeypatch, capsys
     ):
@@ -858,6 +864,7 @@ class TestCLIMultiEdit:
         assert first_py.read_bytes() == mutator_bytes
         assert second_py.read_bytes() == original_second_bytes
 
+    @pytest.mark.skipif(not _MLX_AVAILABLE, reason="multi-edit constructs a backend unconditionally; needs mlx")
     def test_multi_edit_refuses_all_writes_when_a_target_vanishes_after_being_read(
         self, tmp_path: Path, monkeypatch, capsys
     ):
