@@ -533,6 +533,7 @@ def cmd_batch_edit(args):
 
 def cmd_multi_edit(args):
     """Apply edits across multiple files, writing nothing unless every file succeeds."""
+    import hashlib
     import json as json_mod
 
     from .data_gen.ast_analyzer import detect_language
@@ -584,14 +585,16 @@ def cmd_multi_edit(args):
         sys.exit(1)
 
     # PHASE 2 -- compute every merge, still writing nothing. A merge that fails
-    # here leaves the tree exactly as it was found.
+    # here leaves the tree exactly as it was found. Each target's original bytes
+    # are hashed as they are read, so PHASE 2.5 can detect a concurrent write
+    # without keeping the (potentially large) original bytes around.
     #
     # The ValueError catch matters: batch_chunked_merge raises for a symbol that
     # does not exist and for a whole-file merge over the size limit. Letting
     # that escape would swap a corrupt tree for a bare traceback -- safe, but
     # telling the user nothing. The same swap was rejected elsewhere in this
     # codebase and is rejected here.
-    pending: list[tuple[Path, str, int, object]] = []
+    pending: list[tuple[Path, str, int, object, str]] = []
     for entry in file_edits_list:
         path = Path(entry["file_path"])
         batch = [
@@ -603,7 +606,9 @@ def cmd_multi_edit(args):
             for e in entry["edits"]
         ]
         try:
-            original_code = path.read_bytes().decode("utf-8", errors="replace")
+            original_bytes = path.read_bytes()
+            original_hash = hashlib.sha256(original_bytes).hexdigest()
+            original_code = original_bytes.decode("utf-8", errors="replace")
             result = batch_chunked_merge(
                 original_code=original_code,
                 edits=batch,
@@ -616,25 +621,61 @@ def cmd_multi_edit(args):
             print(f"Error: {path}: {e}", file=sys.stderr)
             print("Error: no files were modified.", file=sys.stderr)
             sys.exit(1)
-        pending.append((path, result.merged_code, len(batch), result))
+        pending.append((path, result.merged_code, len(batch), result, original_hash))
 
-    # PHASE 3 -- commit. Only reached when every target validated and every
-    # merge succeeded.
+    # PHASE 2.5 -- re-verify every target BEFORE writing any of them.
+    #
+    # PHASE 2's merges can take seconds (they may call a model backend), so a
+    # file can be modified -- or removed -- by something else between its own
+    # read/hash and this point. Re-hashing target N immediately before writing
+    # target N would be the wrong fix: by the time target N+1's re-hash caught
+    # a change, target N would already be written -- reproducing the exact
+    # TRDD-IUVBCTW3 partial-write defect this command exists to prevent, merely
+    # re-triggered by a race instead of a merge error. Checking every target
+    # here, before PHASE 3's write loop starts, is what makes "no target is
+    # EVER written because of a race that was detectable" true.
+    #
+    # A target that vanished or became unreadable between PHASE 2 and here is
+    # reported the same way as a target that changed -- it is unambiguously
+    # "no longer what was read" -- rather than letting FileNotFoundError /
+    # PermissionError escape as a bare traceback.
+    changed: list[str] = []
+    for path, _merged_code, _edit_count, _result, original_hash in pending:
+        try:
+            still_matches = hashlib.sha256(path.read_bytes()).hexdigest() == original_hash
+        except OSError as e:
+            changed.append(f"{path} (unreadable: {e})")
+            continue
+        if not still_matches:
+            changed.append(str(path))
+    if changed:
+        for description in changed:
+            print(
+                f"Error: file changed since being read, refusing to write any target: {description}",
+                file=sys.stderr,
+            )
+        print("Error: no files were modified.", file=sys.stderr)
+        sys.exit(1)
+
+    # PHASE 3 -- commit. Only reached when every target validated, every merge
+    # succeeded, and PHASE 2.5 confirmed every target still matches what was
+    # read.
     #
     # TWO HONEST LIMITS, both real and neither fixed here:
     #
     # 1. This is not a cross-file transaction. Each write is individually
     #    atomic, but a crash partway through this loop can still leave earlier
     #    files written. Real cross-file atomicity needs a journal.
-    # 2. The read-to-write window is now WIDER than before, not narrower. Each
-    #    file is read in phase 2 and written here, so a concurrent edit landing
-    #    in between is overwritten from stale bytes. The old code had the same
-    #    hazard over milliseconds; this spans the whole merge phase. Accepted
-    #    for a single-user CLI, and the safety it buys is worth more.
+    # 2. PHASE 2.5 narrows the read-to-write race, it does not close it: a
+    #    change landing between PHASE 2.5's check and this loop's first write,
+    #    or between writing file N and file N+1, is still possible and still
+    #    overwrites from stale bytes. True cross-file atomicity needs a journal
+    #    or file locks; neither exists here, and this patch does not add either.
     #
     # What this DOES guarantee is that no file is written because of an error
-    # that was knowable beforehand, which is the entire defect above.
-    for path, merged_code, edit_count, result in pending:
+    # that was knowable beforehand -- including a concurrent change to any
+    # target that PHASE 2.5 could detect -- which is the entire defect above.
+    for path, merged_code, edit_count, result, _original_hash in pending:
         _atomic_write(path, merged_code, backups=backups)
         print(
             f"Applied {edit_count} edits to {path}. "

@@ -800,6 +800,115 @@ class TestCLIMultiEdit:
         result = run_cli("multi-edit", "--file-edits", "-", input_text=file_edits)
         assert result.returncode == 0, f"multi-edit stdin failed: {result.stderr}"
 
+    def test_multi_edit_refuses_all_writes_when_a_target_changes_after_being_read(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A file mutated after being read/merged but before the write phase aborts the WHOLE batch untouched.
+
+        Uses a deterministic seam (wrapping `_refuse_if_edit_broke_parse`, which multi-edit
+        already calls once per entry in list order) instead of real threads/sleeps: a genuine
+        concurrent writer would be timing-dependent and flaky, while this reproduces "a target
+        changed between being read and the write phase" on every run. Runs multi-edit IN-PROCESS
+        (`cli.main()` with a patched `sys.argv`) rather than via subprocess, because the
+        monkeypatched spy cannot reach across a `subprocess.run` process boundary. Neither target
+        is stubbed or skipped -- both go through the real merge backend.
+        """
+        from fastedit import cli as cli_module
+
+        first_py = tmp_path / "first.py"
+        second_py = tmp_path / "second.py"
+        first_py.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        second_py.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        original_second_bytes = second_py.read_bytes()
+        mutator_bytes = b"# mutated by a concurrent writer\n"
+
+        real_refuse = cli_module._refuse_if_edit_broke_parse
+        call_count = 0
+
+        def spy(path, original_code, merged_code, language):
+            nonlocal call_count
+            call_count += 1
+            result = real_refuse(path, original_code, merged_code, language)
+            if path == second_py:
+                first_py.write_bytes(mutator_bytes)
+            return result
+
+        monkeypatch.setattr(cli_module, "_refuse_if_edit_broke_parse", spy)
+
+        file_edits = json.dumps([
+            {"file_path": str(first_py), "edits": [{"snippet": "def new(): pass", "after": "greet"}]},
+            {"file_path": str(second_py), "edits": [{"snippet": "def new(): pass", "after": "greet"}]},
+        ])
+        monkeypatch.setattr(sys, "argv", ["fastedit", "multi-edit", "--file-edits", file_edits])
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.main()
+
+        # Checked FIRST: `_refuse_if_edit_broke_parse` is called once per entry, in list order,
+        # inside PHASE 2 -- so a count of 2 proves both targets were actually merged (the fault
+        # was injected mid-run, not short-circuited by an early exit such as backend resolution
+        # failing before PHASE 2 ever starts). A count mismatch here means the test setup itself
+        # is broken, not that the fix under test is missing.
+        assert call_count == 2
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "changed since being read" in captured.err
+        assert str(first_py) in captured.err
+        assert "no files were modified" in captured.err
+        assert first_py.read_bytes() == mutator_bytes
+        assert second_py.read_bytes() == original_second_bytes
+
+    def test_multi_edit_refuses_all_writes_when_a_target_vanishes_after_being_read(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A target deleted after being read/merged but before the write phase aborts the WHOLE batch, no traceback.
+
+        Same deterministic seam as the mutation test above, but the spy deletes the earlier
+        target instead of overwriting it, exercising the FileNotFoundError re-read path in the
+        verification phase. Neither target is stubbed or skipped -- both go through the real
+        merge backend.
+        """
+        from fastedit import cli as cli_module
+
+        first_py = tmp_path / "first.py"
+        second_py = tmp_path / "second.py"
+        first_py.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        second_py.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        original_second_bytes = second_py.read_bytes()
+
+        real_refuse = cli_module._refuse_if_edit_broke_parse
+        call_count = 0
+
+        def spy(path, original_code, merged_code, language):
+            nonlocal call_count
+            call_count += 1
+            result = real_refuse(path, original_code, merged_code, language)
+            if path == second_py:
+                first_py.unlink()
+            return result
+
+        monkeypatch.setattr(cli_module, "_refuse_if_edit_broke_parse", spy)
+
+        file_edits = json.dumps([
+            {"file_path": str(first_py), "edits": [{"snippet": "def new(): pass", "after": "greet"}]},
+            {"file_path": str(second_py), "edits": [{"snippet": "def new(): pass", "after": "greet"}]},
+        ])
+        monkeypatch.setattr(sys, "argv", ["fastedit", "multi-edit", "--file-edits", file_edits])
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.main()
+
+        # Checked FIRST -- see the sibling test above for why this must come before the exit
+        # code / byte assertions.
+        assert call_count == 2
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "changed since being read" in captured.err
+        assert str(first_py) in captured.err
+        assert "no files were modified" in captured.err
+        assert not first_py.exists()
+        assert second_py.read_bytes() == original_second_bytes
+
 
 # ===================================================================
 # 14. Entry point tests
