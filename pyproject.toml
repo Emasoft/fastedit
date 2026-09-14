@@ -38,6 +38,11 @@ mcp = [
     "fastmcp>=0.4.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+]
+
 [project.scripts]
 fastedit = "fastedit.cli:main"
 fastedit-hook = "fastedit.hook:main"
