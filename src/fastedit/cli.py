@@ -16,7 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -138,7 +138,7 @@ def cmd_read(args):
     try:
         result = subprocess.run(
             ["tldr", "structure", args.file, "--format", "compact"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             print(f"Error: tldr structure failed for {args.file}: {result.stderr.strip()}", file=sys.stderr)
@@ -158,7 +158,7 @@ def cmd_read(args):
 
     print(_format_structure(args.file, data, total_lines))
 
-def _snippet_has_any_definition(snippet):
+def _snippet_has_any_definition(snippet, ext="", first_original_line=None):
     """True if the snippet carries a definition line of its own.
 
     Deliberately name-AGNOSTIC: renaming through --replace is legitimate
@@ -169,7 +169,10 @@ def _snippet_has_any_definition(snippet):
     """
     import re
 
-    from .inference.chunked_merge import _DEFINITION_PATTERNS
+    from .inference.chunked_merge import (
+        _DEFINITION_PATTERNS,
+        _try_tldr_snippet_parse,
+    )
 
     for line in snippet.splitlines():
         stripped = line.lstrip()
@@ -183,6 +186,33 @@ def _snippet_has_any_definition(snippet):
             line,
         ):
             return True
+    # The keyword-led floor above misses type-led C-family definitions
+    # (``int target_fn(int a, int b) {``, ``public class Cache {``) and
+    # similar declarations whose defining line carries no def/fn/func
+    # keyword. Two generic, language-agnostic fallbacks before refusing a
+    # --replace edit:
+    #
+    #   1. tldr parse — a snippet that parses as at least one top-level
+    #      definition DOES carry its own definition line (covers renames
+    #      of type-led definitions, where the definition line differs from
+    #      the original's).
+    #   2. definition-line restatement — a snippet whose first non-blank
+    #      line restates the target's own first line (the definition line
+    #      by AST construction) keeps the signature through the splice
+    #      even when no parser recognizes the grammar's definitions.
+    #
+    # (Preserve-by-default Step 2: deterministic_edit now declines
+    # single-line rewrites instead of replacing the gap, so this guard
+    # decides whether the snippet is a complete replacement.) tldr missing
+    # or misbehaving keeps the floor's answer.
+    if first_original_line is not None:
+        snippet_first = next(
+            (ln.strip() for ln in snippet.splitlines() if ln.strip()), ""
+        )
+        if snippet_first and snippet_first == first_original_line.strip():
+            return True
+    if ext:
+        return bool(_try_tldr_snippet_parse(snippet, ext))
     return False
 
 def _snippet_is_single_matching_definition(snippet, target_node):
@@ -214,6 +244,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     from .data_gen.ast_analyzer import validate_parse
     from .inference.chunked_merge import (
         ChunkedMergeResult,
+        _normalize_merged_eol,
         _qualified_symbol_names,
         _resolve_symbol,
         get_ast_map,
@@ -252,9 +283,23 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         result_lines = list(original_lines)
         result_lines[func_start:func_end] = edited_lines
         merged = "".join(result_lines)
+        # Step 14 (B31): the file's trailing-newline state comes from the
+        # ORIGINAL via the central normalizer, not from the terminator this
+        # branch appends for mid-file splices; the funnel also guarantees
+        # the parse gate below sees the final bytes.
+        merged = _normalize_merged_eol(merged, original_code)
         parse_valid = True
         if language:
             parse_valid = validate_parse(merged, language)
+        if not parse_valid:
+            # Same standard the direct-swap branch below applies to its own
+            # output: a parse-invalid text-match splice (e.g. a brace-language
+            # full-function snippet whose new body line cannot coexist with
+            # the kept original body line) must not be handed back for the
+            # parse gate to merely refuse. Fall through to chunked_merge,
+            # whose replace= path declines parse-invalid splices and tries
+            # the direct-swap / validated model route instead.
+            return None
         return ChunkedMergeResult(
             merged_code=merged, parse_valid=parse_valid,
             chunks_used=0, chunk_regions=[], model_tokens=0, latency_ms=0.0,
@@ -275,6 +320,28 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
             f"snippet for '{replace_sym}' contains a keep-marker but no anchor line "
             f"matched the original body, so fastedit cannot place the edit. "
             f"Pass the full replacement body instead of a marker."
+        )
+
+    # DIRECT-SWAP PARSE GATE (exit-0 regression, Step 5 follow-up). Everything
+    # below interprets the snippet as the WHOLESALE replacement of the target
+    # symbol: the has_def floor above, the single-definition refinement, and the
+    # direct line-range swap. That interpretation is only meaningful for a
+    # snippet that PARSES. tree-sitter is error-tolerant — a snippet like
+    # ``def f(:`` still yields a best-effort ``function_definition`` node — so
+    # regex/AST *detection* of a definition line cannot tell broken from valid,
+    # and the swap then produced parse-invalid output whose only remaining
+    # handler was the model backend. The model "repairs" the syntax error and
+    # the CLI reports success (exit 0) for code the user never wrote — a silent
+    # rewrite of intent. Refuse loudly instead: a snippet that does not parse
+    # has no edit semantics fastedit can honour, so nothing is written and the
+    # caller fixes the snippet. Generic across languages (no per-grammar
+    # branch); skipped when the file has no detected language, matching the
+    # other parse gates in this function.
+    if language and not validate_parse(snippet, language):
+        raise ValueError(
+            f"snippet for '{replace_sym}' is not valid {language} and cannot be "
+            f"applied as a replacement. Fix the snippet's syntax and retry -- "
+            f"fastedit will not guess at code that does not parse."
         )
 
     # TRDD-8M0MXRJO. A body-only snippet for a definition-kind target (function/
@@ -299,7 +366,9 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         "function", "method", "class", "interface", "struct", "enum",
         "trait", "protocol", "module", "object", "impl",
     }
-    has_def = _snippet_has_any_definition(snippet)
+    has_def = _snippet_has_any_definition(
+        snippet, ext=path.suffix, first_original_line=original_lines[func_start]
+    )
     if has_def and language == "python":
         has_def = _snippet_is_single_matching_definition(snippet, target_node)
     if target_node.kind in _DEFINITION_KINDS and not has_def:
@@ -316,6 +385,10 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     result_lines = list(original_lines)
     result_lines[func_start:func_end] = snippet_lines
     merged = "".join(result_lines)
+    # Step 14 (B31): same funnel as the text-match branch above — whether
+    # the edited file ends with a terminator is decided by the ORIGINAL's
+    # state, never by the constant appended above for splicing.
+    merged = _normalize_merged_eol(merged, original_code)
     parse_valid = True
     if language:
         parse_valid = validate_parse(merged, language)
@@ -355,7 +428,12 @@ def cmd_edit(args):
         compute_signature_impact_note,
     )
     from .inference.chunked_merge import chunked_merge
-    from .mcp.backup import BackupStore, _atomic_write
+    from .io_utils import UnsupportedEncodingError, read_source
+    from .mcp.backup import (
+        BackupStore,
+        ConcurrentModificationError,
+        _atomic_write,
+    )
 
     snippet = sys.stdin.read() if args.snippet == "-" else args.snippet
     path = Path(args.file)
@@ -364,7 +442,16 @@ def cmd_edit(args):
         sys.exit(1)
 
     backups = BackupStore()
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21: strict decode -- an undecodable byte must never become U+FFFD
+    # and be written back as EF BF BD. The codec captured here (B23) flows
+    # to every write below so untouched bytes round-trip exactly. B37: the
+    # stat of that same open rides along so the writes refuse (instead of
+    # clobbering) when the file changed on disk since this read.
+    try:
+        original_code, encoding, read_stat = read_source(path, return_stat=True)
+    except UnsupportedEncodingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     language = detect_language(path)
     original_lines = original_code.splitlines(keepends=True)
 
@@ -392,7 +479,7 @@ def cmd_edit(args):
                 file_path=path,
                 project_root=project_root,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 -- deliberate: we swallow any exception so an infra hiccup (tldr/AST) cannot fail the edit-success print (see docstring)
             return ""
         if not note:
             return ""
@@ -416,7 +503,14 @@ def cmd_edit(args):
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
-            _atomic_write(path, result.merged_code, backups=backups)
+            try:
+                _atomic_write(
+                    path, result.merged_code, backups=backups, encoding=encoding,
+                    expected_stat=read_stat,
+                )
+            except ConcurrentModificationError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
             note = _maybe_impact_note(result.merged_code)
             print(
                 f"Applied edit to {args.file}. "
@@ -454,7 +548,14 @@ def cmd_edit(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    _atomic_write(path, result.merged_code, backups=backups)
+    try:
+        _atomic_write(
+            path, result.merged_code, backups=backups, encoding=encoding,
+            expected_stat=read_stat,
+        )
+    except ConcurrentModificationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     note = _maybe_impact_note(result.merged_code)
 
     tok_per_sec = (
@@ -484,7 +585,12 @@ def cmd_batch_edit(args):
 
     from .data_gen.ast_analyzer import detect_language
     from .inference.chunked_merge import BatchEdit, batch_chunked_merge
-    from .mcp.backup import BackupStore, _atomic_write
+    from .io_utils import UnsupportedEncodingError, read_source
+    from .mcp.backup import (
+        BackupStore,
+        ConcurrentModificationError,
+        _atomic_write,
+    )
 
     edits_json = sys.stdin.read() if args.edits == "-" else args.edits
     try:
@@ -507,9 +613,15 @@ def cmd_batch_edit(args):
         print(f"Error: file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
 
-    backend_kind, backend = _make_backend_with_overrides(args)
+    _backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21/B23: strict-decode read; the codec flows to the write below. B37:
+    # the read-time stat guards the write against an external change.
+    try:
+        original_code, encoding, read_stat = read_source(path, return_stat=True)
+    except UnsupportedEncodingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     language = detect_language(path)
 
     result = batch_chunked_merge(
@@ -524,7 +636,14 @@ def cmd_batch_edit(args):
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    _atomic_write(path, result.merged_code, backups=backups)
+    try:
+        _atomic_write(
+            path, result.merged_code, backups=backups, encoding=encoding,
+            expected_stat=read_stat,
+        )
+    except ConcurrentModificationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     print(
         f"Applied {len(batch)} edits to {args.file}. "
         f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
@@ -535,10 +654,16 @@ def cmd_multi_edit(args):
     """Apply edits across multiple files, writing nothing unless every file succeeds."""
     import hashlib
     import json as json_mod
+    import os
 
     from .data_gen.ast_analyzer import detect_language
     from .inference.chunked_merge import BatchEdit, batch_chunked_merge
-    from .mcp.backup import BackupStore, _atomic_write
+    from .io_utils import read_source
+    from .mcp.backup import (
+        BackupStore,
+        ConcurrentModificationError,
+        _atomic_write,
+    )
 
     file_edits_json = sys.stdin.read() if args.file_edits == "-" else args.file_edits
     try:
@@ -547,7 +672,7 @@ def cmd_multi_edit(args):
         print(f"Error: invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
-    backend_kind, backend = _make_backend_with_overrides(args)
+    _backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
 
     # PHASE 1 -- reject EVERY knowable-beforehand error before touching anything.
@@ -594,7 +719,7 @@ def cmd_multi_edit(args):
     # that escape would swap a corrupt tree for a bare traceback -- safe, but
     # telling the user nothing. The same swap was rejected elsewhere in this
     # codebase and is rejected here.
-    pending: list[tuple[Path, str, int, object, str]] = []
+    pending: list[tuple[Path, str, int, object, str, os.stat_result, str]] = []
     for entry in file_edits_list:
         path = Path(entry["file_path"])
         batch = [
@@ -608,7 +733,10 @@ def cmd_multi_edit(args):
         try:
             original_bytes = path.read_bytes()
             original_hash = hashlib.sha256(original_bytes).hexdigest()
-            original_code = original_bytes.decode("utf-8", errors="replace")
+            # B21/B23: strict-decode read (UnsupportedEncodingError is a
+            # ValueError, caught below); the codec AND the read-time stat
+            # (B37) ride with the pending entry so PHASE 3 writes with them.
+            original_code, encoding, read_stat = read_source(path, return_stat=True)
             result = batch_chunked_merge(
                 original_code=original_code,
                 edits=batch,
@@ -621,7 +749,7 @@ def cmd_multi_edit(args):
             print(f"Error: {path}: {e}", file=sys.stderr)
             print("Error: no files were modified.", file=sys.stderr)
             sys.exit(1)
-        pending.append((path, result.merged_code, len(batch), result, original_hash))
+        pending.append((path, result.merged_code, len(batch), result, original_hash, read_stat, encoding))
 
     # PHASE 2.5 -- re-verify every target BEFORE writing any of them.
     #
@@ -640,7 +768,7 @@ def cmd_multi_edit(args):
     # "no longer what was read" -- rather than letting FileNotFoundError /
     # PermissionError escape as a bare traceback.
     changed: list[str] = []
-    for path, _merged_code, _edit_count, _result, original_hash in pending:
+    for path, _merged_code, _edit_count, _result, original_hash, _read_stat, _encoding in pending:
         try:
             still_matches = hashlib.sha256(path.read_bytes()).hexdigest() == original_hash
         except OSError as e:
@@ -666,17 +794,28 @@ def cmd_multi_edit(args):
     # 1. This is not a cross-file transaction. Each write is individually
     #    atomic, but a crash partway through this loop can still leave earlier
     #    files written. Real cross-file atomicity needs a journal.
-    # 2. PHASE 2.5 narrows the read-to-write race, it does not close it: a
-    #    change landing between PHASE 2.5's check and this loop's first write,
-    #    or between writing file N and file N+1, is still possible and still
-    #    overwrites from stale bytes. True cross-file atomicity needs a journal
-    #    or file locks; neither exists here, and this patch does not add either.
+    # 2. The read-to-write race is narrowed twice -- PHASE 2.5 re-verified
+    #    every target before this loop, and each write below carries the
+    #    stat captured at ITS read (B37): a target that changed on disk
+    #    since its own read is REFUSED at write time, not overwritten from
+    #    stale bytes. What remains is the residual window between the
+    #    write-time stat and os.replace itself, and cross-file windows
+    #    (refusing file N+2 cannot un-write file N). True cross-file
+    #    atomicity needs a journal or file locks; neither exists here.
     #
     # What this DOES guarantee is that no file is written because of an error
     # that was knowable beforehand -- including a concurrent change to any
-    # target that PHASE 2.5 could detect -- which is the entire defect above.
-    for path, merged_code, edit_count, result, _original_hash in pending:
-        _atomic_write(path, merged_code, backups=backups)
+    # target that PHASE 2.5 or the write-time stat check could detect -- which
+    # is the entire defect above.
+    for path, merged_code, edit_count, result, _original_hash, read_stat, encoding in pending:
+        try:
+            _atomic_write(
+                path, merged_code, backups=backups, encoding=encoding,
+                expected_stat=read_stat,
+            )
+        except ConcurrentModificationError as e:
+            print(f"Error: {path}: {e}", file=sys.stderr)
+            sys.exit(1)
         print(
             f"Applied {edit_count} edits to {path}. "
             f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
@@ -692,7 +831,12 @@ def cmd_delete(args):
         format_refusal_message,
     )
     from .inference.chunked_merge import delete_symbol
-    from .mcp.backup import BackupStore, _atomic_write
+    from .io_utils import UnsupportedEncodingError, read_source
+    from .mcp.backup import (
+        BackupStore,
+        ConcurrentModificationError,
+        _atomic_write,
+    )
 
     path = Path(args.file)
     if not path.exists():
@@ -700,7 +844,13 @@ def cmd_delete(args):
         sys.exit(1)
 
     language = detect_language(path)
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21/B23: strict-decode read; the codec flows to the write below. B37:
+    # the read-time stat guards the write against an external change.
+    try:
+        original_code, encoding, read_stat = read_source(path, return_stat=True)
+    except UnsupportedEncodingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     backups = BackupStore()
 
     # Cross-file caller-safety check (M2). Skipped when --force is set.
@@ -739,7 +889,14 @@ def cmd_delete(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    _atomic_write(path, result.merged_code, backups=backups)
+    try:
+        _atomic_write(
+            path, result.merged_code, backups=backups, encoding=encoding,
+            expected_stat=read_stat,
+        )
+    except ConcurrentModificationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     warn = ""
     if language and not result.parse_valid:
@@ -755,7 +912,12 @@ def cmd_move(args):
     """Move a symbol to after another symbol in the same file."""
     from .data_gen.ast_analyzer import detect_language
     from .inference.chunked_merge import move_symbol
-    from .mcp.backup import BackupStore, _atomic_write
+    from .io_utils import UnsupportedEncodingError, read_source
+    from .mcp.backup import (
+        BackupStore,
+        ConcurrentModificationError,
+        _atomic_write,
+    )
 
     path = Path(args.file)
     if not path.exists():
@@ -763,7 +925,13 @@ def cmd_move(args):
         sys.exit(1)
 
     language = detect_language(path)
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21/B23: strict-decode read; the codec flows to the write below. B37:
+    # the read-time stat guards the write against an external change.
+    try:
+        original_code, encoding, read_stat = read_source(path, return_stat=True)
+    except UnsupportedEncodingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     backups = BackupStore()
 
     try:
@@ -783,7 +951,14 @@ def cmd_move(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    _atomic_write(path, result.merged_code, backups=backups)
+    try:
+        _atomic_write(
+            path, result.merged_code, backups=backups, encoding=encoding,
+            expected_stat=read_stat,
+        )
+    except ConcurrentModificationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     warn = ""
     if language and not result.parse_valid:
@@ -965,7 +1140,7 @@ def _report_symbols_after_write(file_str: str, content: str, total_lines: int) -
     try:
         result = subprocess.run(
             ["tldr", "structure", file_str, "--format", "compact"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             print(f"Warning: tldr structure failed for {file_str}: {result.stderr.strip()}", file=sys.stderr)
@@ -1260,7 +1435,7 @@ def cmd_search(args):
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15,
+            cmd, capture_output=True, text=True, timeout=15, check=False,
         )
         if result.returncode != 0:
             print(f"Error: tldr {error_label} failed: {result.stderr.strip()}", file=sys.stderr)
@@ -1274,10 +1449,22 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def _decode_for_display(data: bytes, encoding: str | None) -> str:
+    """Decode raw bytes FOR DISPLAY ONLY (undo/diff output) -- the result is
+    never written anywhere. Prefers the codec ``read_source`` detected for
+    the current file so a latin-1 backup shows its real characters; falls
+    back to UTF-8 with errors="replace" when no codec is known (the current
+    file no longer decodes), where replacement characters in a display diff
+    are preferable to a crash. On disk, bytes are restored byte-for-byte.
+    """
+    return data.decode(encoding or "utf-8", errors="replace")
+
+
 def cmd_diff(args):
     """Show unified diff between the last backup and the current file content."""
     import difflib
 
+    from .io_utils import UnsupportedEncodingError, read_source
     from .mcp.backup import BackupStore
 
     path = Path(args.file)
@@ -1291,9 +1478,19 @@ def cmd_diff(args):
         print(f"No backup recorded for {args.file}. Run an edit command first.")
         return
 
-    # Peek without popping: read .bak file directly
-    backup_content = backups._key_path(args.file).read_text(encoding="utf-8")
-    current = path.read_text(encoding="utf-8", errors="replace")
+    # B38 layout: peek the NEWEST backup without popping -- diff must not
+    # consume the undo history.
+    backup_bytes = backups.peek(args.file)
+
+    # Display-only decode (see _decode_for_display): both sides are decoded
+    # with the codec the current file reads as, so a latin-1 file diffs
+    # against its real characters; the bytes themselves are never rewritten.
+    try:
+        current, display_encoding = read_source(path)
+    except UnsupportedEncodingError:
+        current = path.read_text(encoding="utf-8", errors="replace")
+        display_encoding = None
+    backup_content = _decode_for_display(backup_bytes, display_encoding)
 
     if backup_content == current:
         print(f"No changes detected in {args.file}.")
@@ -1312,6 +1509,7 @@ def cmd_undo(args):
     """Revert the last edit to a file using BackupStore."""
     import difflib
 
+    from .io_utils import UnsupportedEncodingError, read_source
     from .mcp.backup import BackupStore, _atomic_write
 
     backups = BackupStore()
@@ -1321,15 +1519,35 @@ def cmd_undo(args):
         print(f"Error: no undo history for {args.file}. Nothing to revert.", file=sys.stderr)
         sys.exit(1)
 
-    backup_content = backups.pop(args.file)
-    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    # The current file is read for the DISPLAY diff only -- the restore
+    # below writes raw bytes and no longer depends on any codec. A file
+    # that no longer decodes (edited externally into something undecodable)
+    # degrades the diff to replacement characters instead of crashing.
+    if path.exists():
+        try:
+            current, display_encoding = read_source(path)
+        except UnsupportedEncodingError:
+            current = path.read_text(encoding="utf-8", errors="replace")
+            display_encoding = None
+    else:
+        current, display_encoding = "", "utf-8"
 
-    # Write backup WITHOUT passing backups -- no backup-of-backup
-    _atomic_write(path, backup_content)
+    # B22/B38: backups are raw bytes; pop returns (and removes) the NEWEST
+    # one, so repeated undos walk back one step at a time.
+    backup_bytes = backups.pop(args.file)
+
+    # Byte-for-byte restore WITHOUT passing backups -- no backup-of-backup
+    # (no undo-of-undo). bytes content bypasses _atomic_write's str/BOM path
+    # and is written exactly as stored.
+    _atomic_write(path, backup_bytes)
+
+    # Display-only decode of the popped bytes (see _decode_for_display):
+    # the codec the current file reads as; never written back to disk.
+    backup_text = _decode_for_display(backup_bytes, display_encoding)
 
     diff = difflib.unified_diff(
         current.splitlines(keepends=True),
-        backup_content.splitlines(keepends=True),
+        backup_text.splitlines(keepends=True),
         fromfile=f"a/{path.name}",
         tofile=f"b/{path.name}",
     )
@@ -1642,13 +1860,13 @@ def main():
     # Passive update notice on exit. Silent when up-to-date, network-down,
     # or FASTEDIT_NO_UPDATE_CHECK=1. Runs after the command so it never
     # delays user-visible output.
-    try:
+    # Best-effort update notice -- an infra hiccup here must never fail the
+    # user's already-completed command, hence the blanket suppression.
+    with contextlib.suppress(Exception):
         from .update_check import get_update_notice
         notice = get_update_notice()
         if notice:
             sys.stderr.write("\n" + notice + "\n")
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":

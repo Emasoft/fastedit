@@ -13,10 +13,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-import pytest
-
 from fastedit.inference.rename import do_rename_ast
-
 
 # ---------------------------------------------------------------------------
 # Behavioral invariant (VAL-M1-002): strings/comments/docstrings preserved.
@@ -117,7 +114,7 @@ class TestDoRenameAstBasics:
     def test_no_matches_returns_zero_count(self, tmp_path: Path):
         path = tmp_path / "mod.py"
         path.write_text("def other():\n    return 0\n")
-        new_content, count, skipped = do_rename_ast(path, "missing", "replaced")
+        new_content, count, _skipped = do_rename_ast(path, "missing", "replaced")
         assert new_content == path.read_text()
         assert count == 0
 
@@ -171,7 +168,7 @@ class TestCmdRenameDryRun:
 
         # Simulate what cmd_rename does with --dry-run: call do_rename_ast then
         # branch on dry_run — must NOT write.
-        new_content, count, skipped = do_rename_ast(path, "old_func", "new_func")
+        _new_content, count, _skipped = do_rename_ast(path, "old_func", "new_func")
         assert count >= 1, "precondition: rename found references"
 
         # Dry-run branch: do NOT write
@@ -188,7 +185,7 @@ class TestCmdRenameDryRun:
             "result = compute()\n"
         )
 
-        new_content, count, skipped = do_rename_ast(path, "compute", "calculate")
+        new_content, count, _skipped = do_rename_ast(path, "compute", "calculate")
 
         # There are 3 code-level occurrences: def, recursive call, assignment call.
         assert count >= 2, f"expected >=2 replacements, got {count}"

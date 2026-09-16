@@ -15,7 +15,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-
 FASTEDIT_ENTRY = {
     "command": "fastedit-mcp",
     "type": "stdio",
@@ -70,7 +69,7 @@ def install_mcp_config(scope: str = "user") -> int:
         )
 
     if path.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")  # noqa: DTZ005 -- local wall-clock backup stamp is intentional; tz-aware would change the emitted filename
         backup = path.with_name(path.name + f".bak-{stamp}")
         shutil.copy(path, backup)
         print(f"backup: {backup}")

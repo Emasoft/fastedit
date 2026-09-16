@@ -20,6 +20,16 @@ from .ast_utils import (
     _get_ast_via_structure,
 )
 
+# Marker constants live in ONE module (B15 unification). Marker detection
+# goes through ``markers.is_marker_line`` — the shared line-anchored
+# predicate covering the legacy long forms AND the short forms (``#...``,
+# ``//...``, ``…``) — so this module can never disagree with the rest of the
+# pipeline about what a marker is (B17 remainder). ``_MARKER_RE`` itself is
+# kept importable from here purely for backward compatibility
+# (``chunked_merge`` re-exports it; tests/test_snippet_analysis.py imports
+# it from this module); no merge-semantic decision may use it directly.
+from .markers import _MARKER_RE, is_marker_line  # noqa: F401
+
 # --- Language extension mapping for temp file parsing ---
 _LANG_EXT = {
     "python": ".py", "typescript": ".ts", "javascript": ".js",
@@ -73,7 +83,10 @@ _IMPORT_CALL_NAMES: dict[str, set[str]] = {
     "lua": {"require"},
 }
 
-_MARKER_RE = re.compile(r'^\s*(?:#|//|/\*)\s*\.\.\..*(?:existing|rest).*\.\.\.')
+# Marker line detection is defined in ``fastedit.inference.markers`` (single
+# source of truth, B15) and imported at the top: ``is_marker_line`` drives
+# every marker decision here; ``_MARKER_RE`` (long forms only) is kept
+# importable for backward compatibility only.
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +140,7 @@ def _top_level_extras(
             os.close(fd)
             result = subprocess.run(
                 ["tldr", "structure", tmp_path, "--format", "compact"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, check=False,
             )
             if result.returncode == 0:
                 data = json.loads(result.stdout)
@@ -149,7 +162,7 @@ def _top_level_extras(
     try:
         from ..data_gen.ast_analyzer import analyze_file
         fs = analyze_file(snippet, language)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate: tree-sitter parse of arbitrary snippet input degrades to the regex extractor on any failure
         return [n for n in _extract_snippet_names(snippet, language) if n != target]
     extras: list[str] = []
     for fn in fs.functions:
@@ -171,7 +184,7 @@ def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
 
         result = subprocess.run(
             ["tldr", "structure", tmp_path, "--format", "compact"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         if result.returncode != 0:
             return []
@@ -247,7 +260,7 @@ def _get_import_line_set(source: str, language: str) -> set[int]:
     try:
         from ..data_gen.ast_analyzer import parse_code
         tree = parse_code(source, language)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate: parse of arbitrary source (unknown language/malformed) yields no import lines, never propagates
         return set()
 
     call_names = _IMPORT_CALL_NAMES.get(language)
@@ -376,7 +389,7 @@ def _extract_identifiers(source: str, language: str) -> set[str]:
     try:
         from ..data_gen.ast_analyzer import parse_code
         tree = parse_code(source, language)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate: parse of arbitrary source (unknown language/malformed) yields no identifiers, never propagates
         return set()
 
     identifiers: set[str] = set()
@@ -462,6 +475,86 @@ def _find_matching_nodes(
     return []
 
 
+def _region_bracketing_anchor(
+    anchor: int,
+    ast_nodes: list[ASTNode],
+    total_lines: int,
+) -> tuple[int, int] | None:
+    """Span the AST nodes bracketing ``anchor`` (1-indexed file line).
+
+    Exact port of the pre-B28 bracketing: the closest node ending at-or-
+    before the anchor (+2 slack) opens the region; the closest node
+    starting at-or-after it closes it. Returns ``None`` only when no nodes
+    exist on either side.
+    """
+    before_node = None
+    after_node = None
+    for node in ast_nodes:
+        if node.line_end <= anchor + 2 and (
+            before_node is None or node.line_end > before_node.line_end
+        ):
+            before_node = node
+        if node.line_start >= anchor and (
+            after_node is None or node.line_start < after_node.line_start
+        ):
+            after_node = node
+
+    if before_node and after_node:
+        return (before_node.line_start, after_node.line_end)
+    if before_node:
+        return (
+            before_node.line_start,
+            min(total_lines, before_node.line_end + 30),
+        )
+    if after_node:
+        return (max(1, after_node.line_start - 30), after_node.line_end)
+    return None
+
+
+def _consistent_insertion_region(
+    context_occurrences: list[tuple[str, list[int]]],
+    ast_nodes: list[ASTNode],
+    total_lines: int,
+) -> tuple[int, int] | None:
+    """Bracket one insertion region that ALL context lines agree on (B28).
+
+    The anchor is the RAREST context line — least frequent normalized
+    content across the original, ties broken by the longer (more
+    specific) line. Pre-fix every context line matched its FIRST
+    occurrence and ``max()`` picked the anchor, so one common line steered
+    the insertion anywhere. Every candidate anchor occurrence brackets a
+    region; the region wins only when it contains at least one occurrence
+    of EVERY context line, and only when exactly one distinct region does.
+    ``None`` means conflicting (or ambiguous) context — the caller must
+    fall back rather than guess a neighborhood.
+    """
+    if not ast_nodes:
+        return None
+
+    anchor_positions = min(
+        context_occurrences,
+        key=lambda item: (len(item[1]), -len(item[0])),
+    )[1]
+
+    regions: list[tuple[int, int]] = []
+    for anchor in anchor_positions:
+        region = _region_bracketing_anchor(anchor, ast_nodes, total_lines)
+        if region is None:
+            continue
+        start, end = region
+        consistent = all(
+            any(start <= pos <= end for pos in positions)
+            for _line, positions in context_occurrences
+        )
+        if consistent and region not in regions:
+            regions.append(region)
+
+    if len(regions) == 1:
+        return regions[0]
+    # No consistent region, or several distinct ones: a guess either way.
+    return None
+
+
 def _find_insertion_region(
     snippet: str,
     original_lines: list[str],
@@ -477,6 +570,13 @@ def _find_insertion_region(
     2. Identifying context lines (snippet lines outside new definitions)
     3. Matching context lines against the file to find the insertion neighborhood
     4. Creating a chunk spanning the neighboring AST nodes
+
+    B28 (Step 17): the anchor is the RAREST context line and the bracketed
+    region must contain at least one occurrence of EVERY context line;
+    conflicting context returns ``None`` so the caller's fallback runs
+    (for :func:`locate_chunks` that is the conservative whole-file
+    region). Context lines that match nothing in the original still
+    cannot vote — unchanged.
     """
     # Use tldr to parse both snippet and file
     snippet_defs = _get_snippet_definitions(snippet, language)
@@ -492,53 +592,38 @@ def _find_insertion_region(
         for ln in range(d.line_start, d.line_end + 1):
             new_def_lines.add(ln)
 
-    # Context lines: snippet lines NOT in new definitions, not blank, not markers
+    # Context lines: snippet lines NOT in new definitions, not blank, not
+    # markers. B28: collect ALL original occurrences per context line
+    # (1-indexed) — both the rarity ranking and the consistency check need
+    # the full picture, not the first match.
     snippet_lines = snippet.splitlines()
-    context_file_lines: list[int] = []  # 1-indexed in original file
+    context_occurrences: list[tuple[str, list[int]]] = []
 
     for si, sline in enumerate(snippet_lines, 1):
         if si in new_def_lines:
             continue
         stripped = sline.strip()
-        if not stripped or _MARKER_RE.match(sline):
+        if not stripped or is_marker_line(sline):
             continue
-        # Find this line in the original file
-        for fi, fline in enumerate(original_lines):
-            if fline.strip() == stripped:
-                context_file_lines.append(fi + 1)
-                break
+        positions = [
+            fi + 1 for fi, fline in enumerate(original_lines)
+            if fline.strip() == stripped
+        ]
+        if positions:
+            context_occurrences.append((stripped, positions))
 
-    if context_file_lines:
-        # Use the latest context line as anchor for insertion point
-        anchor = max(context_file_lines)
-
-        # Find AST nodes that bracket the anchor
-        before_node = None
-        after_node = None
-        for node in ast_nodes:
-            if node.line_end <= anchor + 2 and (before_node is None or node.line_end > before_node.line_end):
-                before_node = node
-            if node.line_start >= anchor and (after_node is None or node.line_start < after_node.line_start):
-                after_node = node
-
-        # Chunk spans from before_node through after_node
-        if before_node and after_node:
+    if context_occurrences and ast_nodes:
+        region = _consistent_insertion_region(
+            context_occurrences, ast_nodes, total_lines,
+        )
+        if region is not None:
             return ChunkRegion(
-                before_node.line_start, after_node.line_end,
-                [d.name for d in new_defs],
+                region[0], region[1], [d.name for d in new_defs],
             )
-        elif before_node:
-            end = min(total_lines, before_node.line_end + 30)
-            return ChunkRegion(
-                before_node.line_start, end,
-                [d.name for d in new_defs],
-            )
-        elif after_node:
-            start = max(1, after_node.line_start - 30)
-            return ChunkRegion(
-                start, after_node.line_end,
-                [d.name for d in new_defs],
-            )
+        # B28: context existed but cannot agree on one region — return no
+        # region so the caller's fallback runs, instead of letting a
+        # common line's first occurrence steer the insertion.
+        return None
 
     # No context matched — default to tail of file
     if len(ast_nodes) >= 2:

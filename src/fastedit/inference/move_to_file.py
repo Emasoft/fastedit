@@ -50,7 +50,6 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..data_gen.ast_analyzer import EXTENSION_TO_LANGUAGE, detect_language
 from .ast_utils import (
     _qualified_symbol_names,
     _resolve_symbol,
@@ -352,7 +351,6 @@ def _scan_file_named_imports(
         return []
 
     stem = from_file.stem
-    basename = from_file.name
     # Match any import line that contains the stem or basename as a
     # quoted / bracketed substring. The per-family regex below is
     # intentionally loose — we're already filtering by ``_is_import_
@@ -864,7 +862,7 @@ def _rewrite_dotted_import_line(
     # package is already in scope. Flag for manual review since the
     # semantics are: after the move, the symbol lives elsewhere and the
     # wildcard won't cover it.
-    if path.endswith(path_sep + "*") or path.endswith(".*"):
+    if path.endswith((path_sep + "*", ".*")):
         return None, False, "wildcard import"
 
     # Split on the path separator to find the symbol suffix.
@@ -1053,7 +1051,7 @@ def _rewrite_rust_import_line(
             True,
             (
                 "wildcard import may now be unused \u2014 consider "
-                f"removing ``use {path};`` if ``{path[:-3] if path.endswith('::*') else path}::*`` "
+                f"removing ``use {path};`` if ``{path.removesuffix('::*')}::*`` "
                 f"was only used for ``{symbol}``"
             ),
         )
@@ -1172,7 +1170,7 @@ def _rewrite_rust_braced_use(
     try:
         lang = Language(tree_sitter_rust.language())
         parser = Parser(lang)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate: any tree-sitter version/API hiccup means "unavailable", caller falls back to the regex path
         return None
 
     # Parse just the single stripped line so byte offsets are local.
@@ -1714,8 +1712,7 @@ def _extract_span(
     # moved symbol happens to be the file's first one. The source file's
     # own write-back (via _atomic_write on `remaining`) restores its BOM
     # unconditionally, independent of which symbol was removed.
-    if original.startswith("﻿"):
-        original = original[1:]
+    original = original.removeprefix("﻿")
     lines = original.splitlines(keepends=True)
     total = len(lines)
 
@@ -1868,8 +1865,6 @@ def move_to_file(
             f"{from_ext} -> {to_ext}"
         )
     family = from_family or ""
-
-    language = detect_language(from_path)
 
     # --- Conflict check: symbol already defined in destination -----------
     dst_lines_total = len(

@@ -10,14 +10,17 @@ file just as happily as on a correct one.
 Verbs covered: create, duplicate, edit --replace, edit --after, batch-edit,
 multi-edit, delete, move, rename, rename-all, move-to-file, undo.
 
-Two behaviours found while writing this matrix are deliberately NOT fixed
-here (see the report): `edit --after` leaks bare LF bytes into a pure-CRLF
-file (captured below as a strict xfail reproducer), and `batch-edit` /
-`multi-edit` construct a model backend unconditionally -- even for pure
-exact-replace edits -- which requires `mlx` to be importable. The second is
-the same cause behind this repo's known 4-failure baseline
-(TestCLIBatchEdit / TestCLIMultiEdit in test_cli.py), so this file skips
-those two verbs' tests instead of failing when `mlx` is absent.
+History note (prose only -- the tests' intent is unchanged): two defects found
+while writing this matrix were first captured here as strict xfails/failures
+and have since been fixed in their own remediation steps. `edit --after`
+leaking bare LF bytes into a pure-CRLF file (B20) was unpinned in Step 12;
+`batch-edit` / `multi-edit` dropping CR bytes on CRLF files (B19/B41) was
+fixed in Step 14 via the central EOL normalizer unit-tested in
+TestCentralEolNormalizer below. The batch-edit/multi-edit tests still carry
+their skipif: those verbs construct a model backend unconditionally -- even
+for pure exact-replace edits -- which requires `mlx` to be importable (the
+same cause behind TestCLIBatchEdit / TestCLIMultiEdit in test_cli.py), so
+they skip rather than fail when `mlx` is absent.
 """
 
 from __future__ import annotations
@@ -31,6 +34,9 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from fastedit.inference.chunked_merge import _normalize_merged_eol
+from fastedit.split_join import detect_line_ending
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MLX_AVAILABLE = importlib.util.find_spec("mlx") is not None
@@ -46,6 +52,7 @@ def run_cli(*args: str, cwd: Path = PROJECT_ROOT) -> subprocess.CompletedProcess
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 
@@ -63,6 +70,91 @@ NONASCII_SRC = 'def a():\n    return "éè 中文 \U0001F600"\n\n\ndef b():\n   
 NO_EOL_SRC = b"def a():\n    return 1"
 EMPTY_SRC = b""
 UTF16LE_SRC = codecs.BOM_UTF16_LE + "def a():\n    return 1\n".encode("utf-16-le")
+
+
+class TestCentralEolNormalizer:
+    """Unit tests for chunked_merge._normalize_merged_eol (Step 14: B19/B31).
+
+    Every chunked_merge return path (and the batch/multi composition over
+    it, and the CLI's deterministic replace) funnels its merged_code through
+    this ONE helper before the result may be surfaced, so the merged file's
+    line-ending convention and trailing-newline state come from the ORIGINAL
+    file -- never from a hardcoded "\\n" at a splice site (B31) and never
+    from whatever ending the produced span happened to carry (B19).
+
+    Contract under test:
+
+    * an original with ONE line-ending convention (CRLF, lone CR, LF) whose
+      merged output contains produced pieces in another convention comes out
+      in the ORIGINAL's convention everywhere;
+    * an original WITHOUT a trailing newline never gains one;
+    * an original WITH a trailing newline keeps exactly one;
+    * a MIXED-ending original has no single convention to enforce, so its
+      untouched endings are never rewritten (byte-exactness beats guessing)
+      while its trailing-newline state is still enforced.
+    """
+
+    def test_crlf_original_bare_lf_pieces_become_crlf_everywhere(self) -> None:
+        """The B19 batch seam: produced LF-only pieces inside a CRLF file."""
+        original = "def a():\r\n    return 1\r\n\r\n\r\ndef b():\r\n    return 2\r\n"
+        merged = "def a():\n    return 10\n\r\n\r\ndef b():\r\n    return 2\r\n"
+        assert _normalize_merged_eol(merged, original) == (
+            "def a():\r\n    return 10\r\n\r\n\r\ndef b():\r\n    return 2\r\n"
+        )
+
+    def test_lone_cr_original_bare_lf_pieces_become_cr_everywhere(self) -> None:
+        """Lone-CR handling: detect_line_ending returns a lone CR and the funnel obeys it."""
+        original = MIN_CR_SRC.decode()
+        assert detect_line_ending(original) == "\r"
+        merged = "def a():\n    return 9\n"
+        out = _normalize_merged_eol(merged, original)
+        assert out == "def a():\r    return 9\r"
+        assert "\n" not in out
+
+    def test_lf_original_crlf_pieces_become_lf_everywhere(self) -> None:
+        """MIRROR of the CRLF check: a CRLF-produced piece never salts an LF file."""
+        original = "def a():\n    return 1\n"
+        merged = "def a():\r\n    return 9\r\n"
+        assert _normalize_merged_eol(merged, original) == "def a():\n    return 9\n"
+
+    def test_original_without_trailing_newline_never_gains_one(self) -> None:
+        """B31: neither an LF nor a CRLF terminator may be appended at EOF."""
+        original = "def x(): return 1"
+        assert _normalize_merged_eol("def x(): return 2\n", original) == "def x(): return 2"
+        assert _normalize_merged_eol("def x(): return 2\r\n", original) == "def x(): return 2"
+
+    def test_original_with_trailing_newline_keeps_exactly_one(self) -> None:
+        """A produced span that lost the file's terminator at EOF gets exactly one back."""
+        original = "def a():\r\n    return 1\r\n"
+        merged = "def a():\n    return 10"
+        assert _normalize_merged_eol(merged, original) == "def a():\r\n    return 10\r\n"
+
+    def test_mixed_original_untouched_endings_are_never_rewritten(self) -> None:
+        """A mixed-ending original has no single convention: rewriting its
+        untouched CRLF/CR bytes to the dominant one would corrupt bytes the
+        edit never touched, so only the trailing-newline state is enforced."""
+        original = MIXED_SRC.decode()
+        merged = "def a():\r\n    return 1\n\ndef b():\n    return 99\n"
+        assert _normalize_merged_eol(merged, original) == merged
+
+    def test_mixed_original_still_enforces_the_trailing_newline_state(self) -> None:
+        """Even for a mixed original, B31 holds: no terminator is appended to
+        a file whose original had none (the produced piece's own is stripped)."""
+        original = "def a():\r\n    return 1\n\ndef b():\r    return 2"
+        merged = "def a():\r\n    return 1\n\ndef b():\n    return 99\n"
+        assert _normalize_merged_eol(merged, original) == (
+            "def a():\r\n    return 1\n\ndef b():\n    return 99"
+        )
+
+    def test_normalizer_is_a_no_op_when_merged_equals_the_original(self) -> None:
+        """Rejection paths hand back the original verbatim: the funnel must
+        be an exact no-op there, for every fixture shape in this matrix."""
+        for original in (
+            LF_SRC, CRLF_SRC, CR_SRC, MIN_CR_SRC, MIXED_SRC,
+            BOM_LF_SRC, NONASCII_SRC, NO_EOL_SRC, EMPTY_SRC,
+        ):
+            text = original.decode("utf-8", errors="replace")
+            assert _normalize_merged_eol(text, text) == text
 
 
 class TestEncodingMatrixEditReplace:
@@ -152,12 +244,21 @@ class TestEncodingMatrixEditReplace:
         assert after[: len(prefix)] == prefix
 
     def test_no_trailing_newline_file_replace_result_is_exact(self, tmp_path: Path) -> None:
-        """Replacing the sole symbol of a no-trailing-newline file: the exact resulting bytes are pinned."""
+        """Replacing the sole symbol of a no-trailing-newline file: the exact resulting bytes are pinned.
+
+        EXPECTATION UPDATED (Step 14, B31): this test previously pinned the
+        old destructive behaviour where the replaced file GAINED a trailing
+        newline (b"def a():\\n    return 9\\n") that was in neither the
+        original file nor the snippet's own text. That byte was the forced
+        "\\n" the deterministic splice appended -- B31. The trailing-newline
+        state now comes from the ORIGINAL via the central normalizer, so the
+        no-trailing-newline file stays without one.
+        """
         target = tmp_path / "f.py"
         target.write_bytes(NO_EOL_SRC)
         run_cli("edit", str(target), "--replace", "a", "--snippet", "def a():\n    return 9")
         after = target.read_bytes()
-        assert after == b"def a():\n    return 9\n"
+        assert after == b"def a():\n    return 9"
 
     def test_empty_file_replace_refuses_cleanly_and_leaves_file_untouched(self, tmp_path: Path) -> None:
         """An empty file has no symbols: --replace must fail fast and leave 0 bytes untouched."""
@@ -242,22 +343,15 @@ class TestEncodingMatrixEditAfter:
         assert result.returncode != 0
         assert target.read_bytes() == b""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "KNOWN DEFECT: edit --after leaks bare LF bytes into a pure-CRLF file. "
-            "Repro: CRLF_SRC + `edit --after a --snippet 'def m():\\n    return 5\\n'` "
-            "yields b'def a():\\r\\n    return 1\\r\\n\\ndef m():\\n    return 5\\n\\r\\n\\r\\ndef b():"
-            "\\r\\n    return 2\\r\\n' -- 3 bare LF bytes (one used as the pre-insertion separator, "
-            "two inside the unnormalized snippet) where a correctly-CRLF-preserving insert has 0. "
-            "cmd_edit's --after path never reaches _try_deterministic_replace (that helper name is "
-            "--replace only) so it never calls normalize_line_endings, unlike --replace which does. "
-            "Do not fix here per the coordinator's instruction to report, not fix, real defects "
-            "found while writing this matrix."
-        ),
-    )
     def test_crlf_file_after_insert_should_stay_all_crlf_but_does_not(self, tmp_path: Path) -> None:
-        """DEFECT REPRODUCER (strict xfail): --after on a CRLF file should introduce zero bare LF bytes."""
+        """--after on a CRLF file must introduce zero bare LF bytes.
+
+        Was a strict-xfail defect reproducer (B20: the after= splice hardcoded
+        "\\n" separators and never normalized the snippet). Unpinned in Step 12:
+        the after= fast path now derives its separators and the inserted piece's
+        terminators from the original's line-ending convention, so this is a
+        permanent regression test.
+        """
         target = tmp_path / "f.py"
         target.write_bytes(CRLF_SRC)
         run_cli("edit", str(target), "--after", "a", "--snippet", "def m():\n    return 5\n")

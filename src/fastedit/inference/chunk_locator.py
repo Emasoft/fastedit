@@ -6,7 +6,14 @@ minimal chunk(s) that need to be sent to the model.
 
 from __future__ import annotations
 
-from .ast_utils import ASTNode, ChunkRegion, _resolve_symbol, get_ast_map
+from ..split_join import normalize_bare_cr_for_ast
+from .ast_utils import (
+    ASTNode,
+    ChunkRegion,
+    _resolve_symbol,
+    get_ast_map_from_source,
+)
+from .markers import is_marker_line
 from .snippet_analysis import (
     _extract_snippet_names,
     _find_import_region,
@@ -17,6 +24,16 @@ from .snippet_analysis import (
 )
 
 _MAX_BLOCK_LINES = 100  # Narrow functions larger than this to sub-blocks
+
+# B27: minimum sliding-window content score for trusting a narrow. The old
+# 0.2 accepted windows where four of five lines were NOT in the original —
+# the window locked onto spurious stripped-line matches and was then cut
+# ±padding RAW lines around it, handing the model a mid-block fragment to
+# "repair". 0.6 means the snippet's leading window lines must mostly exist,
+# contiguously, in the node before the narrow is trusted. Tunable: lower it
+# and sloppy snippets narrow again (mid-block cuts return); raise it and
+# large-node edits fall through to the model path more often.
+_MIN_NARROW_SCORE = 0.6
 
 # tree-sitter node types that represent block structures
 _BLOCK_TYPES = {
@@ -60,8 +77,19 @@ def locate_chunks(
     original_lines = original_code.splitlines()
     total_lines = len(original_lines)
 
-    # Get AST map from the original file
-    ast_nodes = get_ast_map(file_path, total_lines)
+    # B26: parse the IN-MEMORY `original_code`, not the disk-cached tldr map.
+    # get_ast_map consults the tldr daemon, whose salsa cache can hold
+    # pre-write line numbers for a file that was just rewritten — chunks
+    # spliced from stale coordinates land in the wrong region. The fast
+    # paths in chunked_merge already parse `original_code` in-memory via
+    # get_ast_map_from_source; locate_chunks must agree with them. A bare CR
+    # is swapped for LF by a same-length, same-position substitution first
+    # (tree-sitter counts rows by scanning for "\n"), keeping every returned
+    # line number valid against original_lines — the same protection
+    # get_ast_map's LF-normalized temp-file path used to provide.
+    ast_nodes = get_ast_map_from_source(
+        normalize_bare_cr_for_ast(original_code), file_path,
+    )
 
     if not ast_nodes:
         # No AST available — use the whole file
@@ -199,7 +227,7 @@ def _find_enclosing_block(
     try:
         from ..data_gen.ast_analyzer import parse_code
         tree = parse_code(source, language)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate: parse of arbitrary source (unknown language/malformed) means "no enclosing block", never propagates
         return None
 
     # Collect ALL enclosing blocks, pick the best-sized one
@@ -229,9 +257,9 @@ def _find_enclosing_block(
 
     # Prefer blocks that are 30-100 lines. If none in that range,
     # pick the smallest block that's >= 20 lines.
-    _MIN_BLOCK = 20  # noqa: N806
-    _IDEAL_MIN = 30  # noqa: N806
-    _IDEAL_MAX = 100  # noqa: N806
+    _MIN_BLOCK = 20
+    _IDEAL_MIN = 30
+    _IDEAL_MAX = 100
 
     ideal = [c for c in candidates if _IDEAL_MIN <= (c[1] - c[0]) <= _IDEAL_MAX]
     if ideal:
@@ -256,9 +284,25 @@ def _narrow_large_node(
 ) -> tuple[int, int]:
     """Narrow a large function to the sub-block relevant to the snippet.
 
-    Uses tree-sitter AST to find the enclosing block (for/if/while/try)
-    around the snippet's target lines. Falls back to line matching if
-    AST analysis isn't available.
+    Returns ``(start_line, end_line)`` (1-indexed, inclusive), always
+    constrained to the node's own span: either the sub-block the snippet
+    clearly targets, or the FULL node range when the narrow cannot be
+    trusted (callers treat the full range as "send the whole node").
+
+    B27 contract (Step 17): the narrow is trusted only when the snippet's
+    non-marker lines match a contiguous window of the node with score
+    ≥ ``_MIN_NARROW_SCORE`` AND tree-sitter can name the enclosing block
+    around that window. The cut boundaries are then that block's AST node
+    edges — never a ±``padding`` raw-line window, which cut mid-block and
+    handed the model a broken fragment to "repair". Without a confident
+    window match, without ``original_code``/``language`` to parse, or
+    without an enclosing block, the narrow is REJECTED and the full node
+    range is returned.
+
+    ``padding`` is retained for API compatibility and is now a no-op:
+    raw line-count padding was exactly the mid-block cut this function no
+    longer performs (same deprecation pattern as ``deterministic_edit``'s
+    ``max_drop_gap``).
     """
     node_size = node.line_end - node.line_start + 1
     if node_size <= max_lines:
@@ -268,10 +312,11 @@ def _narrow_large_node(
     node_lines = original_lines[node.line_start - 1:node.line_end]
     # Filter out ellipsis markers — they don't represent real code and
     # would tank the match score when most snippet lines are markers.
-    _MARKER_PHRASES = ("... existing code ...", "// ...", "# ...")  # noqa: N806
+    # Uses the shared LINE-ANCHORED predicate (single source of truth,
+    # B15): a marker phrase embedded mid-line is real code, not a marker.
     snippet_lines = [
         line.rstrip() for line in snippet.splitlines()
-        if line.strip() and not any(m in line for m in _MARKER_PHRASES)
+        if line.strip() and not is_marker_line(line)
     ]
 
     if not snippet_lines:
@@ -293,27 +338,32 @@ def _narrow_large_node(
             best_score = score
             best_offset = offset
 
-    if best_score < 0.2:
+    if best_score < _MIN_NARROW_SCORE:
+        # B27: a window the snippet barely overlaps is not evidence for
+        # ANY location — no confident narrow, keep the whole node.
         return (node.line_start, node.line_end)
 
     target_line = node.line_start + best_offset
 
-    # Step 2: Use tree-sitter to find the enclosing block
-    if original_code and language:
-        block = _find_enclosing_block(
-            original_code, language, target_line,
-            node.line_start, node.line_end,
-        )
-        if block:
-            # Use the block boundaries with padding
-            block_start = max(node.line_start, block[0] - padding)
-            block_end = min(node.line_end, block[1] + padding)
-            return (block_start, block_end)
+    # Step 2: cut at the enclosing block's AST node edges (B27). Without
+    # something parsed there is no node edge to cut on — a raw-line window
+    # here is precisely the mid-block cut B27 removes.
+    if not (original_code and language):
+        return (node.line_start, node.line_end)
 
-    # Fallback: tight window with padding
-    match_end = min(target_line + len(snippet_lines) + padding, node.line_end)
-    block_start = max(node.line_start, target_line - padding)
-    return (block_start, match_end)
+    block = _find_enclosing_block(
+        original_code, language, target_line,
+        node.line_start, node.line_end,
+    )
+    if not block:
+        # The matched window sits outside any for/if/while/try block; no
+        # AST edge bounds a smaller cut, so keep the whole node.
+        return (node.line_start, node.line_end)
+
+    return (
+        max(node.line_start, block[0]),
+        min(node.line_end, block[1]),
+    )
 
 
 def _find_enclosing_parent(

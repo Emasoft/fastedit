@@ -20,6 +20,7 @@ Edit types tested (from real MCP usage patterns):
 from __future__ import annotations
 
 import pytest
+
 from fastedit.inference.text_match import deterministic_edit
 
 
@@ -33,23 +34,30 @@ def _normalize(code: str) -> str:
 # this table updated deliberately -- see the two assertion branches below.
 HANDLED_DETERMINISTICALLY = {
     "python_add_validation_line": True,
-    "python_change_condition": True,
+    # UPDATED (preserve-by-default, Step 2): the cases flipped to False
+    # below are REWRITES — a snippet line shares only its assignment LHS
+    # or leading token with a preserved line, or omits gap content between
+    # restated anchors. Under preserve-by-default the deterministic editor
+    # declines those (no duplicates, no unjustified deletions) and the
+    # model path resolves them. See `_has_rewrite_conflict` and the
+    # omission decline in ``text_match.deterministic_edit``.
+    "python_change_condition": False,
     "python_add_try_except": False,
     "python_add_guard": True,
     "python_modify_return": False,
     "python_multiline_insert": True,
-    "python_replace_block": True,
+    "python_replace_block": False,
     "python_add_logging": True,
     "js_add_param_and_modify": True,
     "ts_add_type_guard": True,
     "rust_add_error_handling": False,
     "go_add_context_param": False,
-    "python_change_middle": True,
+    "python_change_middle": False,
     "python_add_caching": True,
-    "js_simple_change": True,
-    "python_modify_class_method": True,
+    "js_simple_change": False,
+    "python_modify_class_method": False,
     "python_marker_at_start": True,
-    "ts_replace_implementation": True,
+    "ts_replace_implementation": False,
     "python_two_markers": True,
     "ruby_add_rescue": True,
 }
@@ -746,7 +754,7 @@ class TestDeterministicProduction:
         if tried:
             print(f"  Accuracy when tried: {passed}/{tried} = {passed/tried*100:.1f}%")
 
-        print(f"\n--- Details ---")
+        print("\n--- Details ---")
         for name, status in details:
             marker = {"PASS": "+", "FAIL": "X", "SKIP": "-"}[status]
             print(f"  [{marker}] {name}")

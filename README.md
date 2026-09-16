@@ -314,6 +314,7 @@ Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#,
 | `FASTEDIT_LLM_API_BASE` | `http://127.0.0.1:8000/v1` | LLM server URL (any OpenAI-compatible) |
 | `FASTEDIT_LLM_MODEL` | `fastedit` | Model name to send in API requests |
 | `FASTEDIT_LLM_API_KEY` | `not-needed` | API key (if server requires one) |
+| `FASTEDIT_BACKUP_DIR` | `~/.fastedit/backups` | Directory for undo/diff backups; must be an absolute path (a leading `~` is expanded). `fastedit undo` and `diff` only see backups stored in this directory. |
 
 ## License
 

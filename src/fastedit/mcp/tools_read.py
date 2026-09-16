@@ -37,7 +37,7 @@ def fast_read(file_path: str) -> str:
     try:
         result = subprocess.run(
             ["tldr", "structure", file_path, "--format", "compact"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             return f"Error: tldr structure failed for {file_path}: {result.stderr.strip()}"
@@ -124,7 +124,7 @@ def fast_search(
         try:
             result = subprocess.run(
                 ["tldr", "references", query, path, "--format", "text", "--limit", str(top_k)],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, check=False,
             )
             if result.returncode != 0:
                 return f"Error: tldr references failed: {result.stderr.strip()}"
@@ -141,7 +141,7 @@ def fast_search(
         cmd.extend(["--hybrid", regex_filter])
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15,
+            cmd, capture_output=True, text=True, timeout=15, check=False,
         )
         if result.returncode != 0:
             return f"Error: tldr search failed: {result.stderr.strip()}"
@@ -171,7 +171,7 @@ def _compact_search(text: str) -> str:
             else:
                 continue
         stripped = line.strip()
-        if stripped.startswith("Called by:") or stripped.startswith("Calls:"):
+        if stripped.startswith(("Called by:", "Calls:")):
             continue
         out.append(line)
     return "\n".join(out).strip()

@@ -450,7 +450,14 @@ public class Cache {
 def test_batch_edit_mixed_preserve_siblings(tmp_path):
     """First edit: `replace=Store` with preserve_siblings=True — narrow edit
     to Store's field + ctor, preserving get/set. Second edit: plain
-    `replace=Cache` full replacement (no preserve_siblings needed)."""
+    `replace=Cache` full replacement (no preserve_siblings needed).
+
+    UPDATED (preserve-by-default, Step 2): the Cache snippet carries the
+    documented keep-marker. Without it, the LHS-only field rewrite
+    (``private int size = 100;`` vs the preserved ``private int size =
+    10;``) is an ambiguous rewrite that deterministic_edit declines
+    (item 6); with the marker the mid-section key replacement (v0.2.3
+    contract) applies it with zero model tokens."""
     file_path = tmp_path / "Multi.java"
     file_path.write_text(BATCH_ORIGINAL)
 
@@ -460,7 +467,12 @@ def test_batch_edit_mixed_preserve_siblings(tmp_path):
         preserve_siblings=True,
     )
     edit2 = BatchEdit(
-        snippet="public class Cache {\n    private int size = 100;\n}\n",
+        snippet=(
+            "public class Cache {\n"
+            "    private int size = 100;\n"
+            "    // ... existing code ...\n"
+            "}\n"
+        ),
         replace="Cache",
     )
 

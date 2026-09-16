@@ -17,6 +17,7 @@ from .ast_utils import (
     _qualified_symbol_names,
     _resolve_symbol,
     get_ast_map,
+    get_ast_map_from_source,
 )
 
 
@@ -50,11 +51,18 @@ def delete_symbol(
     Raises:
         ValueError: If the symbol is not found in the file's AST.
     """
-    from .ast_utils import get_ast_map_from_source
+    # io_utils/split_join are deliberately function-body imports (kept out
+    # of the module import surface); get_ast_map_from_source itself needs no
+    # local import -- it is already imported at module level above.
+    from ..io_utils import read_source
     from ..split_join import normalize_bare_cr_for_ast
 
     path = Path(file_path)
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21: strict decode -- an undecodable byte must never become U+FFFD in
+    # the spliced output. UnsupportedEncodingError (a ValueError) propagates
+    # to the caller's existing refusal handling. The codec is the caller's
+    # write concern: the writer re-reads/holds the encoding for _atomic_write.
+    original_code, _ = read_source(path)
     original_lines = original_code.splitlines(keepends=True)
     total_lines = len(original_lines)
 
@@ -118,7 +126,8 @@ def move_symbol(
 ) -> MoveResult:
     """Move a function, method, or class to after another symbol.
 
-    Pure deterministic operation -- no model inference. Uses tldr to find
+    Pure deterministic operation -- no model inference. Uses the in-memory
+    tree-sitter map (get_ast_map_from_source, same as delete_symbol) to find
     the exact line ranges and splices the code. Handles decorators, trailing
     blank lines, and proper spacing.
 
@@ -134,17 +143,23 @@ def move_symbol(
     Raises:
         ValueError: If either symbol is not found, or they are the same.
     """
-    from ..split_join import detect_line_ending
+    from ..io_utils import read_source
+    from ..split_join import detect_line_ending, normalize_bare_cr_for_ast
 
     if symbol == after:
         raise ValueError(f"Cannot move '{symbol}' after itself.")
 
     path = Path(file_path)
-    original_code = path.read_bytes().decode("utf-8", errors="replace")
+    # B21: strict decode -- see delete_symbol. For a UTF-8-BOM file the
+    # utf-8-sig codec strips the BOM here; the writer restores it at the
+    # true start of the file via the codec/BOM policy in _atomic_write.
+    original_code, _ = read_source(path)
     # A UTF-8 BOM is a file-level marker, not part of line 1's content.
     # Strip it before splitting into lines so it can never ride along as
     # embedded text on whichever symbol happens to occupy line 1 -- _atomic_write
     # restores it at the true start of the file once the move is written.
+    # (No-op on the normal read_source path -- utf-8-sig already stripped
+    # it -- but kept for text that still carries a leading U+FEFF.)
     had_bom = original_code.startswith("﻿")
     if had_bom:
         original_code = original_code[1:]
@@ -152,7 +167,20 @@ def move_symbol(
     total_lines = len(original_lines)
     line_ending = detect_line_ending(original_code)
 
-    ast_nodes = get_ast_map(file_path, total_lines)
+    # B35: in-memory AST — the same authoritative source delete_symbol uses.
+    # The disk-based get_ast_map consults the tldr daemon, whose cache can
+    # hold pre-write line numbers for a file that was just rewritten; a move
+    # spliced from stale coordinates corrupts both the moved span and its
+    # neighbours. A bare CR is swapped for LF by a same-length, same-position
+    # substitution first (tree-sitter counts rows by scanning for "\n"), so
+    # the returned line numbers stay valid against original_lines.
+    ast_nodes = get_ast_map_from_source(
+        normalize_bare_cr_for_ast(original_code), file_path,
+    )
+    if not ast_nodes:
+        # Unsupported extension / missing grammar — fall back to the tldr
+        # path as delete_symbol does.
+        ast_nodes = get_ast_map(file_path, total_lines)
 
     # Find both nodes (supports 'Class.method' qualification)
     source_node = _resolve_symbol(symbol, ast_nodes)
@@ -248,10 +276,13 @@ def batch_chunked_merge(
         padding: Lines of context padding around edit regions.
 
     Returns:
-        ChunkedMergeResult with all edits applied.
+        ChunkedMergeResult with all edits applied. ``chunks_rejected``
+        accumulates every per-edit hallucination rejection so batch
+        callers (MCP fast_batch_edit/fast_multi_edit, CLI) can apply the
+        same fail-loud gates a single fast_edit applies.
     """
     # Import here to avoid circular import
-    from .chunked_merge import chunked_merge
+    from .chunked_merge import _normalize_merged_eol, chunked_merge
 
     if not edits:
         return ChunkedMergeResult(
@@ -261,11 +292,13 @@ def batch_chunked_merge(
             chunk_regions=[],
             model_tokens=0,
             latency_ms=0.0,
+            chunks_rejected=0,
         )
 
     current_code = original_code
     total_tokens = 0
     total_latency = 0.0
+    total_rejected = 0
     all_regions: list[tuple[int, int]] = []
 
     # Temp file for AST analysis between edits
@@ -292,6 +325,7 @@ def batch_chunked_merge(
             current_code = result.merged_code
             total_tokens += result.model_tokens
             total_latency += result.latency_ms
+            total_rejected += result.chunks_rejected
             all_regions.extend(result.chunk_regions)
 
             # Update temp file for next edit's AST analysis
@@ -299,6 +333,16 @@ def batch_chunked_merge(
                 Path(tmp_path).write_text(current_code, encoding="utf-8")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+    # Step 14 (B41): single choke point for every batch caller (CLI
+    # batch-edit/multi-edit and MCP fast_batch_edit/fast_multi_edit all
+    # compose chunked_merge through here). Each per-edit result is already
+    # funneled inside chunked_merge against ITS input; this final funnel
+    # guarantees the assembled output is EOL- and trailing-newline-consistent
+    # with the ORIGINAL file the batch started from — bare-LF pieces a
+    # merge dropped can no longer survive to the write path. Idempotent on
+    # an already-consistent result.
+    current_code = _normalize_merged_eol(current_code, original_code)
 
     parse_valid = True
     if language:
@@ -312,4 +356,5 @@ def batch_chunked_merge(
         chunk_regions=all_regions,
         model_tokens=total_tokens,
         latency_ms=total_latency,
+        chunks_rejected=total_rejected,
     )

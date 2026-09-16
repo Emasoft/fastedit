@@ -9,8 +9,8 @@ that must be detected as binary regardless of extension.
 from __future__ import annotations
 
 import plistlib
-import zlib
 import zipfile
+import zlib
 from io import BytesIO
 from pathlib import Path
 
@@ -92,7 +92,7 @@ def test_empty_file_is_text() -> None:
 @pytest.mark.parametrize(
     "bom,payload",
     [
-        (b"\xef\xbb\xbf", "hello utf-8-sig\n".encode("utf-8")),
+        (b"\xef\xbb\xbf", b"hello utf-8-sig\n"),
         (b"\xff\xfe", "hello utf-16-le\n".encode("utf-16-le")),
         (b"\xfe\xff", "hello utf-16-be\n".encode("utf-16-be")),
         (b"\xff\xfe\x00\x00", "hello utf-32-le\n".encode("utf-32-le")),

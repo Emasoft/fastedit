@@ -6,15 +6,12 @@ with thorough edge-case coverage.
 
 from __future__ import annotations
 
-import pytest
-
 from fastedit.inference.indent import (
-    _escape_tags,
-    _unescape_tags,
     _align_snippet_indent,
+    _escape_tags,
     _realign_output,
+    _unescape_tags,
 )
-
 
 # ---------------------------------------------------------------------------
 # Constants (mirrors the module's internal sentinel strings)
@@ -201,13 +198,54 @@ class TestAlignSnippetIndent:
         assert result_lines[2] == ""
 
     def test_tab_based_indent_chunk(self):
-        """Tab indent in chunk should be converted via expandtabs(4)."""
+        """Tab indent in chunk: the shift must be applied in TABS, not spaces.
+
+        B7: the delta was computed via expandtabs(4) but applied as
+        ``" " * delta``, salting spaces into a tab-indented file. The delta
+        must be applied in the file's own indent character.
+        """
         snippet = "def foo():\n    return 1\n"
         chunk = "\tdef bar():\n\t\treturn 2\n"
         result = _align_snippet_indent(snippet, chunk)
         lines = result.splitlines()
-        # Tab expands to 4 spaces, so delta = 4 - 0 = 4
-        assert lines[0] == "    def foo():"
+        # chunk base is 1 tab (4 columns), snippet base is 0 → delta = 4
+        # columns → applied as ONE TAB, never as 4 spaces.
+        assert lines[0] == "\tdef foo():"
+        assert "    def" not in result
+
+    def test_tab_file_shifts_with_tabs_not_spaces(self):
+        """B7: a tab-indented chunk shifts the whole snippet in tabs — no
+        tab/space mixing anywhere in the output."""
+        snippet = "def foo():\n\treturn 1\n"
+        chunk = "\tdef bar():\n\t\treturn 2\n"
+        result = _align_snippet_indent(snippet, chunk)
+        assert result == "\tdef foo():\n\t\treturn 1\n"
+        assert "    " not in result, (
+            f"space padding injected into a tab-indented shift:\n{result!r}"
+        )
+
+    def test_multiline_string_interior_lines_not_shifted(self):
+        """B7: lines inside a multi-line string are USER DATA — shifting them
+        rewrites the stored string. Only code lines move."""
+        snippet = (
+            "def run():\n"
+            "    script = \"\"\"\n"
+            "        echo keep-me\n"
+            "    \"\"\"\n"
+            "    return script\n"
+        )
+        chunk = "    class C:\n        pass\n"
+        result = _align_snippet_indent(snippet, chunk)
+        assert result == (
+            "    def run():\n"
+            "        script = \"\"\"\n"
+            "        echo keep-me\n"
+            "    \"\"\"\n"
+            "        return script\n"
+        ), (
+            "string content moved under a uniform indent shift:\n"
+            f"{result!r}"
+        )
 
     def test_tab_based_indent_snippet(self):
         """Tab indent in snippet, space indent in chunk."""
@@ -433,6 +471,51 @@ class TestRealignOutput:
         assert lines[1] == "        a = 1"
         assert lines[2] == ""
         assert lines[3] == "        return a"
+
+    def test_multiline_string_output_fixes_first_line_only(self):
+        """B30: when the output contains a multi-line string, a uniform shift
+        would move string-interior lines (user data). Only the first
+        non-blank line may be fixed; every string-interior line stays put."""
+        chunk = "    def render(self):\n        a = 1\n"
+        output = (
+            "def render(self):\n"
+            "    a = 1\n"
+            "    s = \"\"\"\n"
+            "keep me\n"
+            "    \"\"\"\n"
+        )
+        result = _realign_output(output, chunk)
+        lines = result.splitlines()
+        assert lines[0] == "    def render(self):", result
+        assert lines[1] == "    a = 1", (
+            f"body was uniform-shifted despite string content:\n{result!r}"
+        )
+        assert lines[2] == "    s = \"\"\""
+        assert lines[3] == "keep me", (
+            f"string interior line moved:\n{result!r}"
+        )
+        assert lines[4] == "    \"\"\""
+
+    def test_string_interior_with_matching_body_still_first_line_only(self):
+        """Control: when the body indent already matches, only the first line
+        is fixed and interiors were never touched — must stay that way with
+        strings present."""
+        chunk = "    def render(self):\n        a = 1\n"
+        output = (
+            "def render(self):\n"
+            "        a = 1\n"
+            "        s = \"\"\"\n"
+            "keep me\n"
+            "        \"\"\"\n"
+        )
+        result = _realign_output(output, chunk)
+        assert result == (
+            "    def render(self):\n"
+            "        a = 1\n"
+            "        s = \"\"\"\n"
+            "keep me\n"
+            "        \"\"\"\n"
+        ), result
 
     def test_output_indent_exceeds_chunk_uniform_shift(self):
         """Output at 8-space, chunk at 0-space, body also wrong -> uniform shift."""

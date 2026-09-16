@@ -34,13 +34,8 @@ from pathlib import Path
 
 import pytest
 
-from fastedit.inference.caller_safety import (
-    check_cross_file_callers,
-    signature_changed,
-)
 from fastedit.inference.move_to_file import move_to_file
 from fastedit.inference.rename import do_cross_file_rename, do_rename_ast
-
 
 TLDR_AVAILABLE = shutil.which("tldr") is not None
 
@@ -295,8 +290,8 @@ def test_prop_kind_filter_monotonic(tmp_path: Path):
     plan_no_filter = do_cross_file_rename(root, "Foo", "Bar")
     plan_class = do_cross_file_rename(root, "Foo", "Bar", kind_filter="class")
 
-    files_no_filter = {p.name for p in plan_no_filter.keys()}
-    files_class = {p.name for p in plan_class.keys()}
+    files_no_filter = {p.name for p in plan_no_filter}
+    files_class = {p.name for p in plan_class}
 
     # Monotonicity: every file in plan_class must appear in plan_no_filter.
     assert files_class.issubset(files_no_filter), (

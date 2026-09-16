@@ -87,6 +87,84 @@ def normalize_line_endings(text: str, target: str) -> str:
     canonical = text.replace("\r\n", "\n").replace("\r", "\n")
     return canonical if target == "\n" else canonical.replace("\n", target)
 
+def mask_string_spans(text: str, mask: str = "\x00") -> str:
+    """A SAME-LENGTH copy of *text* with every character inside a string
+    literal replaced by *mask* (NUL by default). Line terminators are never
+    masked, so line counts, line numbers, and offsets are identical between
+    *text* and the returned copy — callers can run line-oriented logic on
+    the masked copy and index/slice the original safely.
+
+    Shared by the marker normalizer (never rewrite a marker-looking line
+    that lives inside an embedded template/script — B18) and the indent
+    arithmetic (never shift a line whose text is string content — B7/B30).
+
+    HEURISTIC, deliberately language-agnostic. ``normalize_markers`` and the
+    indent helpers run on raw snippets/chunks with no language parameter and
+    must stay pure string transforms, so a tree-sitter parse is not
+    available here (and comment masking is out of scope entirely: comment
+    syntax varies too much to guess safely). This scanner covers the
+    delimiter families of the mainstream languages fastedit edits:
+
+      * triple-quoted: ``\"\"\" ... \"\"\"`` and ``''' ... '''`` (multi-line);
+      * single-line quoted: ``" ... "`` and ``' ... '`` with backslash
+        escapes — an unterminated one ends at the line break, matching the
+        C/Python/JS/Go rule that such strings cannot span lines;
+      * backtick: ``` ... ``` (JS template literals, Go raw strings) —
+        multi-line capable.
+
+    A backslash consumes the following character everywhere (string escapes,
+    escaped quotes/newlines — and, outside strings, C line continuations,
+    where consuming the pair is harmless). The delimiter characters
+    themselves stay unmasked, so a line whose FIRST character is masked
+    begins inside a string and its leading whitespace is string content.
+
+    Over-masking (a stray unpaired delimiter) only makes the transform more
+    conservative — content is preserved as-is; it can never corrupt it.
+    """
+
+    def string_end(start: int, delim: str, multi_line: bool) -> int:
+        """Index just past the closing ``delim`` scanning from ``start``."""
+        i = start
+        while i < len(text):
+            c = text[i]
+            if c == "\\":
+                i += 2  # escaped char (quote, backslash, newline, ...)
+                continue
+            if text.startswith(delim, i):
+                return i + len(delim)
+            if not multi_line and c == "\n":
+                return i  # unterminated single-line string ends at the break
+            if c not in "\r\n":
+                chars[i] = mask
+            i += 1
+        return len(text)  # unterminated multi-line span runs to EOF
+
+    chars = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2  # escaped pair — never a delimiter start
+            continue
+        if text.startswith(('"""', "'''"), i):
+            delim = text[i:i + 3]
+            i = string_end(i + 3, delim, multi_line=True)
+        elif c in "\"'`":
+            i = string_end(i + 1, c, multi_line=c == "`")
+        else:
+            i += 1
+    return "".join(chars)
+
+
+STRING_MASK = "\x00"
+"""The default mask character produced by :func:`mask_string_spans`.
+
+A line whose first character equals this marker BEGINS inside a string
+literal (its leading whitespace is string content, not code indentation).
+"""
+
+
 def normalize_bare_cr_for_ast(text: str) -> str:
     """Replace a lone CR (not part of CRLF) with LF -- same length, same positions.
 

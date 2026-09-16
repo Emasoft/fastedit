@@ -26,13 +26,13 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .backup import (  # noqa: F401 — re-export for existing importers
     BackupStore,
+    ConcurrentModificationError,
     _atomic_write,
 )
 
@@ -43,7 +43,9 @@ class ModelPool:
     """Async-safe pool of MLX engines with lazy loading.
 
     Provides ``async with pool.acquire() as engine:`` for safe concurrent
-    access.  The pool lazily creates engines on first acquire.
+    access.  The pool lazily creates engines on first acquire and hands
+    them out round-robin, so a multi-engine pool actually parallelizes
+    instead of funneling every acquire into engine 0.
     """
 
     def __init__(self, model_path: str, size: int = 1):
@@ -53,6 +55,9 @@ class ModelPool:
         self._semaphore = asyncio.Semaphore(size)
         self._lock = asyncio.Lock()
         self._loaded = False
+        # B40: next engine index for round-robin handout. Monotonically
+        # increasing; wrapped modulo len(self._engines) at read time.
+        self._next_engine = 0
 
     async def _ensure_loaded(self):
         if self._loaded:
@@ -71,7 +76,14 @@ class ModelPool:
     async def acquire(self):
         await self._ensure_loaded()
         await self._semaphore.acquire()
-        engine = self._engines[0]
+        # B40: hand out engines round-robin instead of always engines[0].
+        # Read and advance the index under the existing lock so the handout
+        # is atomic; the lock is held only for the handout, the lease is
+        # still bounded by the semaphore, and lazy creation uses the same
+        # lock so index arithmetic can never race engine creation.
+        async with self._lock:
+            engine = self._engines[self._next_engine % len(self._engines)]
+            self._next_engine += 1
         try:
             yield engine
         finally:
@@ -106,7 +118,8 @@ async def lifespan(server: FastMCP):
         "backend_kind": backend_kind,
         "backend": backend,
         "snapshots": {},
-        # 1-deep undo buffer: persists to ~/.fastedit/backups/
+        # N-deep undo buffer (B38): _MAX_BACKUPS_PER_FILE timestamped backups
+        # per file; persists to ~/.fastedit/backups/
         "backups": BackupStore(),
         # File locks: per-path locks preventing read-modify-write races
         # when multiple sessions edit the same file simultaneously
@@ -209,8 +222,8 @@ mcp = FastMCP(
         "Wildcard imports, Rust nested use-trees / renamed imports, and "
         "system #include <...> are flagged for manual review rather than "
         "half-rewritten. Instant, no model.\n"
-        "- fast_undo: Revert the last edit to a file. One level of "
-        "undo per file. Works for any edit operation (fast_edit, "
+        "- fast_undo: Revert the last edit to a file. Walks back one step "
+        "per call through the last backups kept per file. Works for any edit operation (fast_edit, "
         "fast_delete, fast_move, fast_rename, fast_rename_all, fast_move_to_file). Backups persist to disk — "
         "survives server restarts and cancelled edits. Instant, no model.\n"
         "Keep snippets minimal — only include changed lines plus 1-2 "

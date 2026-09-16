@@ -30,6 +30,7 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         text=True,
         timeout=30,
         env=env,
+        check=False,
     )
 
 

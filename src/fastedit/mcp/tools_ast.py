@@ -257,8 +257,8 @@ async def fast_rename_all(
     if dry_run:
         lines = [
             f"Dry run: would rename '{old_name}' -> '{new_name}' in "
-            f"{len(plan)} file(s), {total_count} replacement(s)"
-            f"{f' (skipping {total_skipped} in strings/comments)' if total_skipped else ''}:",
+            + f"{len(plan)} file(s), {total_count} replacement(s)"
+            + f"{f' (skipping {total_skipped} in strings/comments)' if total_skipped else ''}:",
             "",
         ]
         for path, (_, count, skipped) in sorted(plan.items()):
@@ -283,7 +283,8 @@ async def fast_rename_all(
     description=(
         "Undo the last edit to a file. Restores the file to its state before "
         "the most recent fast_edit, fast_batch_edit, fast_delete, fast_move, "
-        "fast_rename, or fast_rename_all operation. One level of undo per file. Instant, no model."
+        "fast_rename, or fast_rename_all operation. Walks back one step per "
+        "call through the backups kept per file. Instant, no model."
     ),
 )
 async def fast_undo(file_path: str) -> str:
@@ -299,13 +300,22 @@ async def fast_undo(file_path: str) -> str:
     path = Path(file_path)
 
     async with file_locks[file_path]:
-        backup_content = backups.pop(file_path)
+        # B22/B38: backups are raw bytes; pop returns (and removes) the
+        # NEWEST one. The restore below writes them back byte-for-byte
+        # (bytes content skips _atomic_write's str/BOM path).
+        backup_bytes = backups.pop(file_path)
+        # Display-only decode (never written): utf-8 with replacement
+        # characters, so a non-UTF-8 file's diff degrades gracefully.
+        backup_content = backup_bytes.decode("utf-8", errors="replace")
 
-        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        current = (
+            path.read_text(encoding="utf-8", errors="replace")
+            if path.exists() else ""
+        )
 
         # Write backup WITHOUT passing backups — undo itself must not create
         # a backup-of-backup (no undo-of-undo).
-        _atomic_write(path, backup_content)
+        _atomic_write(path, backup_bytes)
 
         diff = difflib.unified_diff(
             current.splitlines(keepends=True),
@@ -362,18 +372,17 @@ async def fast_move_to_file(
 
     # Hold locks on BOTH files for the duration of the move so a
     # concurrent edit doesn't interleave with our two-file write.
-    async with file_locks[from_file]:
-        async with file_locks[to_file]:
-            try:
-                plan = move_to_file(
-                    symbol=symbol,
-                    from_file=str(from_path),
-                    to_file=str(to_path),
-                    after=after,
-                    project_root=project_root,
-                    dry_run=dry_run,
-                )
-            except ValueError as e:
-                return f"Error: {e}"
+    async with file_locks[from_file], file_locks[to_file]:
+        try:
+            plan = move_to_file(
+                symbol=symbol,
+                from_file=str(from_path),
+                to_file=str(to_path),
+                after=after,
+                project_root=project_root,
+                dry_run=dry_run,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
 
     return plan.message

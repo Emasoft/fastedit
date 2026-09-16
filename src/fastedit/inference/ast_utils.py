@@ -457,7 +457,7 @@ def _enrich_parents_from_extract(nodes: list[ASTNode], file_path: str) -> None:
     try:
         result = subprocess.run(
             ["tldr", "extract", file_path, "--format", "json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             return
@@ -487,7 +487,7 @@ def _get_ast_via_structure(file_path: str) -> list[ASTNode]:
     try:
         result = subprocess.run(
             ["tldr", "structure", file_path, "--format", "compact"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             return []
@@ -518,7 +518,7 @@ def _get_ast_via_extract(file_path: str, total_lines: int = 0) -> list[ASTNode]:
     try:
         result = subprocess.run(
             ["tldr", "extract", file_path, "--format", "json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         if result.returncode != 0:
             return []
@@ -557,9 +557,22 @@ def _get_ast_via_extract(file_path: str, total_lines: int = 0) -> list[ASTNode]:
         except OSError:
             total_lines = raw[-1][2] + 50  # rough estimate
 
+    # B36: the old `next_entry.line_start - 1` rule truncated a class to the
+    # line above its first method (the method is nested INSIDE the class, but
+    # the rule clamped to it anyway) and let a method's end swallow following
+    # lines tldr extract never reported (module constants, comments, the next
+    # symbol's header). Use real end positions from the in-memory tree-sitter
+    # map where the grammar is available; entries it cannot match fall back
+    # to an order-aware clamp: an entry ends just before the next entry that
+    # is NOT nested inside it, so a class spans its body and a method cannot
+    # cross a sibling's header.
+    true_ends = _extract_true_end_lines(file_path, raw)
+
     nodes = []
     for i, (name, kind, line_start, sig, parent) in enumerate(raw):
-        line_end = raw[i + 1][2] - 1 if i + 1 < len(raw) else total_lines
+        line_end = true_ends.get((name, parent, line_start))
+        if line_end is None:
+            line_end = _clamped_extract_end(i, raw, total_lines)
         nodes.append(ASTNode(
             name=name, kind=kind,
             line_start=line_start, line_end=line_end,
@@ -568,25 +581,226 @@ def _get_ast_via_extract(file_path: str, total_lines: int = 0) -> list[ASTNode]:
     return nodes
 
 
-def _resolve_symbol(name: str, ast_nodes: list[ASTNode]) -> ASTNode | None:
-    """Find an AST node by name, supporting 'Class.method' qualification.
+def _extract_true_end_lines(
+    file_path: str,
+    raw: list[tuple[str, str, int, str, str | None]],
+) -> dict[tuple[str, str | None, int], int]:
+    """Map ``(name, parent, line_start)`` to the tree-sitter ``line_end``.
 
-    If `name` contains a dot (e.g. 'MyClass.__init__'), uses the node.parent
-    field (populated from tldr extract hierarchy) to find the correct method.
-
-    If `name` is a simple identifier, returns the first match (existing behavior).
+    tldr extract only reports start lines. Reading the file and parsing it
+    in-memory yields exact end positions for every entry the grammar covers;
+    the result is keyed so each extract entry can adopt its own node's end.
+    Returns an empty dict when the file cannot be read or the language has
+    no tree-sitter grammar — callers then fall back to the order-aware
+    clamp. Line numbers stay valid against the original file either way:
+    a bare CR is replaced with LF by a same-length, same-position
+    substitution before parsing.
     """
-    if "." in name:
-        class_name, method_name = name.split(".", 1)
-        for node in ast_nodes:
-            if node.name == method_name and node.parent == class_name:
-                return node
+    from pathlib import Path
+
+    from ..split_join import normalize_bare_cr_for_ast
+
+    try:
+        source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return {}
+
+    reference = get_ast_map_from_source(normalize_bare_cr_for_ast(source), file_path)
+    if not reference:
+        return {}
+
+    ends: dict[tuple[str, str | None, int], int] = {}
+    for node in reference:
+        ends.setdefault((node.name, node.parent, node.line_start), node.line_end)
+    return ends
+
+
+def _clamped_extract_end(
+    index: int,
+    raw: list[tuple[str, str, int, str, str | None]],
+    total_lines: int,
+) -> int:
+    """Order-aware end line for extract entry ``index`` (B36 fallback).
+
+    The entry ends immediately before the next entry that is NOT nested
+    inside it — its own methods and inner definitions are skipped, so a
+    class spans its body instead of stopping at its first member. When every
+    following entry is nested inside it, the entry extends to EOF.
+    """
+    for j in range(index + 1, len(raw)):
+        if not _extract_entry_nested_in(j, index, raw):
+            return raw[j][2] - 1
+    return total_lines
+
+
+def _extract_entry_nested_in(
+    entry_idx: int,
+    ancestor_idx: int,
+    raw: list[tuple[str, str, int, str, str | None]],
+) -> bool:
+    """True when ``raw[entry_idx]`` is (per its parent chain) inside
+    ``raw[ancestor_idx]``.
+
+    Walks the parent-name chain upward, at each step choosing the closest
+    preceding entry with that name — the best available evidence when only
+    start lines and immediate parent names are known. The ``seen`` set guards
+    against parent-name cycles.
+    """
+    child = raw[entry_idx]
+    ancestor = raw[ancestor_idx]
+    if entry_idx == ancestor_idx or child[2] <= ancestor[2]:
+        return False
+    parent_name = child[4]
+    cursor_line = child[2]
+    seen: set[str] = set()
+    while parent_name and parent_name not in seen:
+        seen.add(parent_name)
+        if parent_name == ancestor[0]:
+            return True
+        step = None
+        for mid in raw:
+            if (mid[0] == parent_name and mid[2] < cursor_line
+                    and (step is None or mid[2] > step[2])):
+                step = mid
+        if step is None:
+            return False
+        parent_name = step[4]
+        cursor_line = step[2]
+    return False
+
+
+def _contains_span(outer: ASTNode, inner: ASTNode) -> bool:
+    """True when ``outer``'s line span strictly encloses ``inner``'s.
+
+    Equal spans do not count as containment: two entries covering the same
+    lines are duplicates of one symbol, not ancestor and descendant.
+    """
+    if (outer.line_start, outer.line_end) == (inner.line_start, inner.line_end):
+        return False
+    return outer.line_start <= inner.line_start and outer.line_end >= inner.line_end
+
+
+def _qualified_name(node: ASTNode, ast_nodes: list[ASTNode]) -> str:
+    """Full dotted path to ``node`` (e.g. ``Outer.Inner.save``).
+
+    Walks the ``parent`` chain outward, verifying each step by line
+    containment so two same-named ancestors in different scopes cannot be
+    confused. Falls back to the raw parent name when the enclosing node is
+    not present in the map (tldr occasionally lists methods without their
+    class). Each step moves to a strictly larger span, so the walk cannot
+    cycle.
+    """
+    labels = [node.name]
+    current = node
+    while current.parent:
+        container = next(
+            (n for n in ast_nodes
+             if n is not current
+             and n.name == current.parent
+             and _contains_span(n, current)),
+            None,
+        )
+        if container is None:
+            labels.append(current.parent)
+            break
+        labels.append(container.name)
+        current = container
+    return ".".join(reversed(labels))
+
+
+def _has_ancestor_chain(
+    node: ASTNode,
+    parts: list[str],
+    ast_nodes: list[ASTNode],
+) -> bool:
+    """True when ``node``'s ancestry matches ``parts`` (outermost first).
+
+    The immediate parent must equal the innermost segment (the ``parent``
+    field, populated by both the tldr extract hierarchy and the in-memory
+    tree-sitter walker). Every outer segment is verified by walking to the
+    enclosing node — line containment disambiguates same-named ancestors.
+    """
+    if not parts:
+        return True
+    inner_name = parts[-1]
+    if node.parent != inner_name:
+        return False
+    containers = [
+        n for n in ast_nodes
+        if n is not node
+        and n.name == inner_name
+        and _contains_span(n, node)
+    ]
+    if not containers:
+        # The parent name matches but no enclosing node is present in the
+        # map — accept on the name evidence available; outer segments cannot
+        # be verified and are treated as satisfied.
+        return True
+    return any(_has_ancestor_chain(c, parts[:-1], ast_nodes) for c in containers)
+
+
+def _resolve_symbol(name: str, ast_nodes: list[ASTNode]) -> ASTNode | None:
+    """Find an AST node by name, supporting dotted qualification.
+
+    Grammar:
+      - bare identifier: ``save``
+      - dotted path, any depth: ``Class.method``, ``Class.Inner.method``
+
+    A dotted path matches the node whose name is the last segment and whose
+    ancestry matches the remaining segments (see
+    :func:`_has_ancestor_chain`). A bare name that matches more than one
+    DISTINCT node — two classes each defining ``save`` — raises ValueError
+    listing every match's qualified name (B25): first-match-wins silently
+    edited the wrong symbol. A dotted path that still matches several nodes
+    (e.g. two same-named nested classes) is ambiguous too.
+
+    A match fully contained inside another match (a constructor sharing its
+    class's name) is not a competitor: the outermost match wins and the
+    member stays reachable via its qualified path.
+
+    Returns None when nothing matches — callers keep their existing
+    not-found refusal behaviour.
+    """
+    parts = name.split(".")
+    leaf = parts[-1]
+
+    # Collapse map entries describing the SAME symbol twice (same name,
+    # parent, and span) so duplicated maps cannot manufacture a false
+    # ambiguity. Distinct spans mean distinct symbols — e.g. two overloaded
+    # method signatures stay distinct and ambiguous.
+    unique: dict[tuple[str | None, int, int], ASTNode] = {}
+    for node in ast_nodes:
+        if node.name == leaf:
+            unique.setdefault((node.parent, node.line_start, node.line_end), node)
+    matches = list(unique.values())
+
+    if len(parts) > 1:
+        matches = [
+            n for n in matches
+            if _has_ancestor_chain(n, parts[:-1], ast_nodes)
+        ]
+
+    # A match fully contained inside another match is a MEMBER of it — a
+    # Java/Kotlin constructor sharing its class's name, a nested class with
+    # the same name. For the bare name the outermost match is the target the
+    # caller means (legacy first-match behaviour agreed: the class header
+    # sorts first); the member stays reachable via its qualified path
+    # (``Store.Store``). Only genuinely competing matches — siblings or
+    # unrelated definitions — are ambiguous (B25).
+    matches = [
+        n for n in matches
+        if not any(other is not n and _contains_span(other, n) for other in matches)
+    ]
+
+    if not matches:
         return None
-    else:
-        for node in ast_nodes:
-            if node.name == name:
-                return node
-        return None
+    if len(matches) > 1:
+        qualified = sorted({_qualified_name(n, ast_nodes) for n in matches})
+        raise ValueError(
+            f"Symbol '{name}' is ambiguous: {len(matches)} definitions "
+            f"match. Qualify it as one of: {', '.join(qualified)}"
+        )
+    return matches[0]
 
 
 def _qualified_symbol_names(ast_nodes: list[ASTNode]) -> list[str]:

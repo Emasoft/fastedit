@@ -6,7 +6,9 @@ without any MCP dependency.
 
 from __future__ import annotations
 
+import contextlib
 import re
+from pathlib import Path
 
 # Tree-sitter node types that represent literal text (not code).
 # Matches in these ranges are skipped during rename to avoid
@@ -67,12 +69,11 @@ def do_rename(
     # Build skip zones from tree-sitter (strings, comments, docstrings)
     skip_ranges: list[tuple[int, int]] = []
     if language:
-        try:
+        # Deliberate: any tree-sitter failure falls back to unfiltered regex.
+        with contextlib.suppress(Exception):
             from ..data_gen.ast_analyzer import parse_code
             tree = parse_code(original, language)
             _collect_skip_ranges(tree.root_node, skip_ranges)
-        except Exception:
-            pass  # Fall back to unfiltered regex
 
     # Replace only matches outside skip zones
     original_bytes = original.encode("utf-8")
@@ -159,7 +160,7 @@ def _ref_passes_filter(ref: dict) -> bool:
 
 
 def _iter_code_files(
-    root: "Path",
+    root: Path,
     supported_exts: set[str],
     ignore_dirs: set[str],
 ):
@@ -223,7 +224,7 @@ def _extract_json_object(text: str) -> str:
 
 
 def _run_tldr_references(
-    old_name: str, root: "Path", scope: str = "workspace",
+    old_name: str, root: Path, scope: str = "workspace",
 ) -> dict:
     """Invoke `tldr references` and return the parsed JSON payload.
 

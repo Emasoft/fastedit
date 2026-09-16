@@ -16,7 +16,7 @@ FIXTURE_NAME = "mod." + "py"
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        FASTEDIT + args, cwd=cwd, capture_output=True, text=True, timeout=30
+        FASTEDIT + args, cwd=cwd, capture_output=True, text=True, timeout=30, check=False
     )
 
 

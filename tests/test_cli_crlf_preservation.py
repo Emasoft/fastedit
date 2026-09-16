@@ -24,6 +24,7 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         text=True,
         timeout=30,
         env=env,
+        check=False,
     )
 
 
@@ -78,8 +79,13 @@ class TestCLIEditPreservesLineEndings:
         assert result.returncode == 0, result.stderr
 
         after = target.read_bytes()
-        assert after.count(b"\r") == original.count(b"\r"), (
-            f"CR count changed: before={original.count(b'\\r')} after={after.count(b'\\r')}: {after!r}"
+        # Counts hoisted out of the f-string: backslashes inside f-string
+        # expressions are a Python 3.12+ syntax (PEP 701) and fail to parse
+        # under the 3.11 target. Pass/fail semantics are unchanged.
+        before_crs = original.count(b"\r")
+        after_crs = after.count(b"\r")
+        assert after_crs == before_crs, (
+            f"CR count changed: before={before_crs} after={after_crs}: {after!r}"
         )
         assert after.count(b"\n") == 0, "a bare LF leaked into a CR-only file: " + repr(after)
         assert after == b"def a():\r    return 2\r"
@@ -148,7 +154,7 @@ class TestCLIEditPreservesLineEndings:
 
     def test_non_ascii_content_survives_a_replace_edit_byte_exact(self, tmp_path: Path) -> None:
         """Non-ASCII UTF-8 content outside the replaced span is untouched byte-for-byte."""
-        original = "def greet():\r\n    return \"café ☃ 日本語\"\r\n\r\ndef f():\r\n    return 1\r\n".encode("utf-8")
+        original = "def greet():\r\n    return \"café ☃ 日本語\"\r\n\r\ndef f():\r\n    return 1\r\n".encode()
         target = tmp_path / "m.py"
         target.write_bytes(original)
 
@@ -159,7 +165,7 @@ class TestCLIEditPreservesLineEndings:
         assert result.returncode == 0, result.stderr
 
         after = target.read_bytes()
-        assert "café ☃ 日本語".encode("utf-8") in after
+        assert "café ☃ 日本語".encode() in after
         assert b"\r\n" in after
         assert b"return 2" in after
 

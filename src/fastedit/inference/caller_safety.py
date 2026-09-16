@@ -160,7 +160,7 @@ def format_refusal_message(
     files = {r.get("file") for r in refs if r.get("file")}
     lines = [
         f"Refused: '{symbol}' has {len(refs)} reference(s) "
-        f"in {len(files)} other file(s):",
+        + f"in {len(files)} other file(s):",
     ]
     shown = refs[:10]
     for r in shown:
@@ -276,10 +276,7 @@ def _extract_declaration_block(text: str, symbol: str) -> str | None:
                 brace += 1
             elif ch == "}":
                 brace = max(0, brace - 1)
-            elif ch == ":" and paren == 0 and bracket == 0 and brace == 0:
-                collected.append(line[: j + 1])
-                return "\n".join(collected)
-            elif ch == ";" and paren == 0 and bracket == 0 and brace == 0:
+            elif (ch == ":" or ch == ";") and paren == 0 and bracket == 0 and brace == 0:
                 collected.append(line[: j + 1])
                 return "\n".join(collected)
         if stopped_mid_line:
@@ -439,10 +436,7 @@ def _extract_signature_from_source(
                 brace += 1
             elif ch == "}":
                 brace = max(0, brace - 1)
-            elif ch == ":" and paren == 0 and bracket == 0 and brace == 0:
-                collected.append(line[: i + 1])
-                return "".join(collected).strip()
-            elif ch == ";" and paren == 0 and bracket == 0 and brace == 0:
+            elif (ch == ":" or ch == ";") and paren == 0 and bracket == 0 and brace == 0:
                 collected.append(line[: i + 1])
                 return "".join(collected).strip()
         collected.append(line)

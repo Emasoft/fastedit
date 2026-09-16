@@ -28,7 +28,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -79,12 +78,10 @@ def large_py(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def backup_dir(tmp_path: Path, monkeypatch):
-    """Redirect BackupStore to a temp directory to avoid polluting ~/.fastedit."""
-    bd = tmp_path / "backups"
-    bd.mkdir()
+def backup_dir(tmp_path: Path, monkeypatch) -> Path:
+    """Isolates HOME for CLI subprocesses; backups go to the session directory set by tests/conftest.py."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    return bd
+    return Path(os.environ["FASTEDIT_BACKUP_DIR"])
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +105,7 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         text=True,
         timeout=30,
         env=env,
+        check=False,
     )
 
 
@@ -237,6 +235,55 @@ class TestCLIEdit:
         restored = small_py.read_text()
         assert restored == original
 
+    def test_edit_replace_rust_full_function_snippet_lands_parse_valid(
+        self, tmp_path: Path,
+    ):
+        """A brace-language full-function replace must land parse-valid (exit 0).
+
+        Step 21 smoke regression: the text-match splice for a rust snippet like
+        ``pub fn add(...) -> i32 { a.wrapping_add(b) }`` anchored on the
+        signature + closing brace and kept the OLD body line next to the new
+        one — a content-faithful but parse-invalid merge that the parse gate
+        could only refuse (exit 1, edit never landed). The text-match branch
+        now declines its own parse-invalid output (the same standard the
+        direct-swap branch already applies) and chunked_merge's qualified
+        direct-swap produces the whole-symbol replacement instead.
+        """
+        from fastedit.data_gen.ast_analyzer import validate_parse
+
+        original = (
+            "pub fn add(a: i32, b: i32) -> i32 {\n"
+            "    a + b\n"
+            "}\n"
+            "\n"
+            "pub fn mul(a: i32, b: i32) -> i32 {\n"
+            "    a * b\n"
+            "}\n"
+        )
+        target = tmp_path / "math.rs"
+        target.write_text(original)
+
+        snippet = (
+            "pub fn add(a: i32, b: i32) -> i32 {\n"
+            "    a.wrapping_add(b)\n"
+            "}\n"
+        )
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--replace", "add",
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "Applied edit to" in result.stdout
+
+        merged = target.read_text()
+        assert "a.wrapping_add(b)" in merged, merged
+        # The old body line must NOT survive next to the new one.
+        assert "a + b" not in merged, merged
+        # Sibling function untouched.
+        assert "a * b" in merged
+        assert validate_parse(merged, "rust") is True, merged
+
     def test_edit_accepts_backend_flags(self):
         """--backend, --model-path, --api-base, --api-model should be accepted."""
         result = run_cli("edit", "--help")
@@ -296,7 +343,6 @@ class TestCLIDelete:
 
     def test_delete_creates_backup(self, small_py: Path, backup_dir):
         """Delete should create a backup before removing the symbol."""
-        original = small_py.read_text()
         del_result = run_cli("delete", str(small_py), "farewell")
         assert del_result.returncode == 0, f"Delete failed: {del_result.stderr}"
         # Undo should restore
@@ -423,7 +469,6 @@ class TestCLIRename:
 
     def test_rename_creates_backup(self, small_py: Path, backup_dir):
         """Rename should create a backup before modifying."""
-        original = small_py.read_text()
         rename_result = run_cli("rename", str(small_py), "greet", "welcome")
         assert rename_result.returncode == 0, f"Rename failed: {rename_result.stderr}"
         result = run_cli("undo", str(small_py))
@@ -600,7 +645,6 @@ class TestCLIUndo:
 
     def test_undo_reverts_delete(self, small_py: Path, backup_dir):
         """Undo should revert a delete operation."""
-        original = small_py.read_text()
         run_cli("delete", str(small_py), "farewell")
         deleted = small_py.read_text()
         assert "def farewell" not in deleted
@@ -973,7 +1017,6 @@ class TestEditUndoRoundTrip:
     def test_sequential_edits_only_undo_last(self, small_py: Path, backup_dir):
         """Multiple edits: undo should only revert the most recent one."""
         run_cli("rename", str(small_py), "greet", "welcome")
-        after_rename = small_py.read_text()
         run_cli("rename", str(small_py), "farewell", "goodbye")
         # Undo should only revert the second rename
         run_cli("undo", str(small_py))

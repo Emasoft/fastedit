@@ -40,6 +40,7 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         text=True,
         env=env,
         timeout=60,
+        check=False,
     )
 
 
@@ -225,17 +226,18 @@ class TestEmptyBodySymbols:
 
 
 class TestOneLineFileNoTrailingNewline:
-    @pytest.mark.xfail(
-        strict=True,
-        reason="REAL DEFECT (reported, not fixed): edit --replace unconditionally "
-        "appends a trailing newline even when the original file had none. "
-        "Repro: write_bytes(b'def x(): return 1') [17 bytes, no trailing LF], "
-        "then `edit --replace x --snippet 'def x(): return 2'` yields "
-        "b'def x(): return 2\\n' (18 bytes) -- a byte that was never in the "
-        "file, and never in the snippet's own text either.",
-    )
     def test_replace_symbol_in_one_line_file_without_trailing_newline(self, tmp_path: Path) -> None:
-        """A one-line file with no trailing newline must not gain one as a side effect of editing."""
+        """A one-line file with no trailing newline must not gain one as a side effect of editing.
+
+        Was a strict-xfail defect reproducer (B31: the deterministic replace
+        splice unconditionally appended a trailing newline even when the
+        original file had none -- a byte that was never in the file and never
+        in the snippet's own text). Unpinned in Step 14: the edit path now
+        funnels its merged output through the central EOL/trailing-newline
+        normalizer (chunked_merge._normalize_merged_eol), which derives the
+        file's trailing-newline state from the ORIGINAL, so this is a
+        permanent regression test.
+        """
         f = tmp_path / "m.py"
         f.write_bytes(b"def x(): return 1")
         result = run_cli("edit", str(f), "--replace", "x", "--snippet", "def x(): return 2")
@@ -437,11 +439,11 @@ class TestUnicodeIdentifiers:
     def test_rename_a_unicode_identifier_where_python_allows_it(self, tmp_path: Path) -> None:
         """Python allows non-ASCII identifiers; rename must handle one byte-exactly."""
         f = tmp_path / "m.py"
-        original = "def café():\n    x = 1\n    return x\n".encode("utf-8")
+        original = "def café():\n    x = 1\n    return x\n".encode()
         f.write_bytes(original)
         result = run_cli("rename", str(f), "café", "kaffe")
         assert result.returncode == 0, result.stderr
-        assert f.read_bytes() == "def kaffe():\n    x = 1\n    return x\n".encode("utf-8")
+        assert f.read_bytes() == b"def kaffe():\n    x = 1\n    return x\n"
 
 
 class TestIndentationPreservedExactly:
@@ -539,15 +541,13 @@ class TestFailureAndRefusalPaths:
         assert result.returncode == 0, result.stderr
         assert target.read_bytes() == b"x = 1\n"
 
-    @pytest.mark.skipif(
-        not HAS_MLX,
-        reason="a snippet the deterministic merger can't match falls through to the mlx "
-        "backend, which is not installed in this environment (matches the suite's "
-        "known mlx-dependent skips) -- see the DEFECTS note in the worker report "
-        "about the uncaught traceback this currently produces instead of a clean refusal",
-    )
     def test_edit_with_a_syntactically_invalid_snippet_refuses_cleanly(self, tmp_path: Path) -> None:
-        """A snippet that isn't valid Python must be refused with a clear message, not an uncaught traceback."""
+        """A snippet that isn't valid Python must be refused with a clear message, not an uncaught traceback.
+
+        No mlx skip: the refusal is a parse gate on the snippet itself and fires
+        before any merge backend is constructed, so the guard holds in every
+        environment.
+        """
         f = tmp_path / "m.py"
         original = b"def f():\n    return 1\n"
         f.write_bytes(original)
@@ -762,9 +762,8 @@ class TestMultiEditAndBatchEdit:
         real.write_bytes(original)
         missing = tmp_path / "missing.py"
         file_edits = (
-            '[{"file_path": "%s", "edits": [{"replace": "f", "snippet": "def f():\\n    return 2\\n"}]},'
-            ' {"file_path": "%s", "edits": [{"replace": "f", "snippet": "def f():\\n    return 2\\n"}]}]'
-            % (str(real), str(missing))
+            f'[{{"file_path": "{real}", "edits": [{{"replace": "f", "snippet": "def f():\\n    return 2\\n"}}]}},'
+            f' {{"file_path": "{missing}", "edits": [{{"replace": "f", "snippet": "def f():\\n    return 2\\n"}}]}}]'
         )
         result = run_cli("multi-edit", "--file-edits", file_edits)
         assert result.returncode != 0

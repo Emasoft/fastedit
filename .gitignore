@@ -22,3 +22,6 @@ tests_dev/
 downloads_dev/
 libs_dev/
 builds_dev/
+
+# Step 21 smoke-test scratch space (script + throwaway project + backups).
+_dev_smoke/

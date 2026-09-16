@@ -19,8 +19,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from fastedit.inference.text_match import snippet_has_keep_marker
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -38,26 +36,23 @@ def run_cli(*args: str, input_text: str | None = None):
         text=True,
         timeout=30,
         env=env,
+        check=False,
     )
 
-@pytest.mark.xfail(
-    reason="KNOWN, MEASURED code-loss shape -- see TRDD-CMRMA2YG. Tracked, not fixed.",
-    strict=True,
-)
-def test_rust_lifetime_paired_with_a_later_apostrophe_hides_the_marker() -> None:
-    """KNOWN HOLE: a lifetime pairing with an apostrophe AFTER the marker hides it.
+def test_rust_lifetime_paired_with_a_later_apostrophe_is_detected() -> None:
+    """A lifetime pairing with an apostrophe AFTER the marker must NOT hide it.
 
-    `let s: &'static str;  // <marker> don't` -- the apostrophe in `'static` finds
-    a partner in `don't`, which sits AFTER the marker, so the scanner enters
-    string mode and never sees the `//`. The marker is missed, the partial
-    snippet is spliced, and code is lost silently at exit 0.
+    `let s: &'static str;  // <marker> don't` -- the apostrophe in `'static`
+    pairs with the one in `don't`, which sits AFTER the marker. A scanner
+    that accepted that pairing entered string mode and never saw the `//`,
+    so the marker was missed, the partial snippet was spliced, and code was
+    lost silently at exit 0 (TRDD-CMRMA2YG, B42b).
 
-    This is xfail(strict) ON PURPOSE rather than a card note. Four successive
-    predicates were written today and each fix opened a new hole, so a fifth
-    written by the same author was judged worse than a tracked defect. A card is
-    invisible to the suite; this is not. strict=True means the day someone makes
-    the predicate catch this, the test fails as XPASS and forces them to notice
-    they closed it -- so the hole cannot be quietly fixed OR quietly forgotten.
+    Fixed: an apostrophe opens a string only when its partner appears
+    BEFORE any comment opener on the line. A pairing that SPANS a comment
+    opener is lexical noise -- a Rust lifetime accidentally paired with
+    English prose -- not a string, so the `//` is reached and the marker
+    detected. (Un-pinned from xfail(strict) when the hole was closed.)
     """
     slash = "// " + "... existing code ..."
     a = chr(39)

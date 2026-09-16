@@ -1,13 +1,14 @@
 """Tests for the AST analyzer across multiple languages."""
 
 import pytest
+
 from fastedit.data_gen.ast_analyzer import (
     analyze_file,
+    count_ast_nodes,
     detect_language,
-    validate_parse,
     get_node_at_lines,
     parse_code,
-    count_ast_nodes,
+    validate_parse,
 )
 
 # -- Language detection --

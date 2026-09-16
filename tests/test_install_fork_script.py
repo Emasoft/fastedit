@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import shlex
 import stat
 import subprocess
 from pathlib import Path
-
-import shlex
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "install-fork.sh"
 
@@ -15,6 +14,7 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
 
@@ -77,7 +77,7 @@ class TestUvVersionFloor:
         env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ["PATH"])
         return subprocess.run(
             ["bash", str(SCRIPT), "--dry-run"],
-            capture_output=True, text=True, env=env, timeout=60,
+            capture_output=True, text=True, env=env, timeout=60, check=False,
         )
 
     def test_old_uv_warns_about_silently_dropped_extras(self, tmp_path: Path) -> None:

@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Annotated
+
+from pydantic import Field
 
 from ..data_gen.ast_analyzer import detect_language
 from ..inference.chunked_merge import BatchEdit, batch_chunked_merge, chunked_merge
+from ..io_utils import UnsupportedEncodingError, read_source
 from ..update_check import get_update_notice_async
-from .server import _atomic_write, mcp
+from .server import ConcurrentModificationError, _atomic_write, mcp
 
 # Once-per-server-session flag — attaches the update banner to the first
 # successful edit response so the host LLM can relay it to the human.
@@ -28,12 +32,74 @@ async def _maybe_append_update_notice(message: str) -> str:
             return message
         try:
             notice = await get_update_notice_async()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- deliberate: docstring "Silent on any failure" -- an update-check hiccup must never perturb the tool response
             notice = None
         _UPDATE_NOTICE_SHOWN = True
         if notice:
             return f"{message}\n\n{notice}"
     return message
+
+
+# ---------------------------------------------------------------------------
+# Step 18 (B34): shared per-file write gates.
+#
+# fast_edit, fast_batch_edit and fast_multi_edit must enforce the SAME
+# signals in the SAME order: the fail-loud hallucination refusal first
+# (never overridable), then the parse gate (force=True opt-in). Sharing the
+# helpers keeps the message shapes identical across the three tools — the
+# single-edit refusals below are quoted verbatim by the batch tools.
+# ---------------------------------------------------------------------------
+
+
+def _all_chunks_rejected(result) -> bool:
+    """True when every chunk the merge used was rejected as a hallucination.
+
+    The ``> 0`` guard matters: a zero-model batch (pure ``after=`` /
+    ``preserve_siblings=`` splices report ``chunks_used == 0``) must not
+    read as "everything rejected" via ``0 >= 0``.
+    """
+    rejected = getattr(result, "chunks_rejected", 0)
+    return rejected > 0 and rejected >= result.chunks_used
+
+
+def _rejection_refusal(result, metrics: str) -> str:
+    """Fail-loud refusal for an all-chunks-rejected merge. Never
+    force-overridable: a hallucinated merge has no safe interpretation."""
+    return (
+        f"Error: edit rejected — model hallucinated on {result.chunks_rejected} chunk(s). "
+        f"File unchanged. The function may be too large ({result.chunks_used} chunk(s)) "
+        f"for the 1.7B model. Try a smaller edit or split the function. {metrics}"
+    )
+
+
+def _partial_rejection_warning(result, metrics: str) -> str:
+    """Write-with-warning response for a partially rejected merge."""
+    return (
+        f"Warning: {result.chunks_rejected}/{result.chunks_used} chunk(s) rejected "
+        f"due to hallucination. Partial edit applied. {metrics}"
+    )
+
+
+def _parse_refusal(file_path: str, language: str, metrics: str) -> str:
+    """Fail-loud refusal for a parse-invalid merge (the CLI's
+    ``_refuse_if_edit_broke_parse`` voice). ``force=True`` is the explicit
+    opt-in escape hatch."""
+    return (
+        f"Error: merged output for {file_path} has parse errors in {language}; "
+        f"refusing to write. The file is unchanged. Break the edit into smaller "
+        f"edits, or pass force=True to write anyway. {metrics}"
+    )
+
+
+def _concurrent_modification_error() -> str:
+    """B37: uniform clean response when a write was refused because the file
+    changed on disk between the tool's read and its write (the read-time
+    stat no longer matches at write time). Nothing was written; the file on
+    disk is exactly as the external writer left it."""
+    return (
+        "Error: file changed on disk since it was read; "
+        "re-read and retry — file unchanged."
+    )
 
 
 @mcp.tool(
@@ -63,7 +129,12 @@ async def _maybe_append_update_notice(message: str) -> str:
         "\n"
         "When replace=<name> changes the target function's signature, the response "
         "includes a caller-impact note summarising how many call sites reference it — "
-        "informational only, does not block the edit."
+        "informational only, does not block the edit.\n"
+        "\n"
+        "PARSE SAFETY: if the merged output fails a parse check, the edit is refused, "
+        "nothing is written, and the response suggests smaller edits. Pass force=True "
+        "to override that refusal and write anyway — use only when you intend it. "
+        "force never overrides a hallucination rejection (all chunks rejected)."
     ),
 )
 async def fast_edit(
@@ -72,8 +143,20 @@ async def fast_edit(
     after: str = "",
     replace: str = "",
     preserve_siblings: bool = False,
+    force: Annotated[bool, Field(
+        description=(
+            "write even when the merged output fails a parse check; "
+            "use only when you intend it"
+        ),
+    )] = False,
 ) -> str:
-    """Apply an edit snippet to a file using the local FastEdit model."""
+    """Apply an edit snippet to a file using the local FastEdit model.
+
+    Refuses to write when the merged output fails the parse check (mirrors
+    the CLI's ``_refuse_if_edit_broke_parse``); ``force=True`` restores the
+    old write-anyway-with-warning escape hatch. The chunks-rejected
+    hallucination refusal is never overridable.
+    """
     ctx = mcp.get_context()
     lc = ctx.request_context.lifespan_context
     backend_kind: str = lc["backend_kind"]
@@ -95,7 +178,15 @@ async def fast_edit(
     )
 
     async with file_locks[file_path]:
-        original_code = path.read_text(encoding="utf-8", errors="replace")
+        # B21: strict-decode read -- an undecodable byte must never become
+        # U+FFFD and get written back as EF BF BD. UTF-16/binary files are
+        # refused here, before the merge (and before tree-sitter). B37: the
+        # stat of that same open rides along so the write below can refuse
+        # when the file changed on disk in the read-to-write window.
+        try:
+            original_code, encoding, read_stat = read_source(path, return_stat=True)
+        except UnsupportedEncodingError as e:
+            return f"Error: {e}"
         snapshots[file_path] = original_code
         language = detect_language(path)
         if language is None:
@@ -167,28 +258,49 @@ async def fast_edit(
             metrics += f", {chunks_info}"
 
         # If all chunks were rejected due to hallucination, don't write garbage
-        if getattr(result, 'chunks_rejected', 0) > 0 and result.chunks_rejected >= result.chunks_used:
-            return (
-                f"Error: edit rejected — model hallucinated on {result.chunks_rejected} chunk(s). "
-                f"File unchanged. The function may be too large ({result.chunks_used} chunk(s)) "
-                f"for the 1.7B model. Try a smaller edit or split the function. {metrics}"
-            )
+        if _all_chunks_rejected(result):
+            return _rejection_refusal(result, metrics)
 
-        if getattr(result, 'chunks_rejected', 0) > 0:
-            _atomic_write(path, result.merged_code, backups=backups)
-            return (
-                f"Warning: {result.chunks_rejected}/{result.chunks_used} chunk(s) rejected "
-                f"due to hallucination. Partial edit applied. {metrics}"
-            )
+        if getattr(result, "chunks_rejected", 0) > 0:
+            try:
+                _atomic_write(
+                    path, result.merged_code, backups=backups, encoding=encoding,
+                    expected_stat=read_stat,
+                )
+            except ConcurrentModificationError:
+                return _concurrent_modification_error()
+            return _partial_rejection_warning(result, metrics)
+
+        # B10: parity with the CLI's _refuse_if_edit_broke_parse — THIS edit
+        # producing a parse-invalid merge must not be persisted with a mere
+        # warning. Refuse without writing; force=True is the explicit opt-in
+        # escape hatch that restores the old write-with-warning behavior.
+        if language and not result.parse_valid and not force:
+            return _parse_refusal(file_path, language, metrics)
 
         if language and not result.parse_valid:
-            _atomic_write(path, result.merged_code, backups=backups)
+            try:
+                _atomic_write(
+                    path, result.merged_code, backups=backups, encoding=encoding,
+                    expected_stat=read_stat,
+                )
+            except ConcurrentModificationError:
+                return _concurrent_modification_error()
             return (
                 f"Warning: merged output has parse errors in {language}. "
                 f"Wrote to {file_path} anyway. {metrics}"
             )
 
-        _atomic_write(path, result.merged_code, backups=backups)
+        # B23: write with the codec the file was read with, so untouched
+        # bytes (a latin-1 é, a BOM) round-trip exactly. B37: the read-time
+        # stat guards against clobbering an external write.
+        try:
+            _atomic_write(
+                path, result.merged_code, backups=backups, encoding=encoding,
+                expected_stat=read_stat,
+            )
+        except ConcurrentModificationError:
+            return _concurrent_modification_error()
 
         # VAL-M3-001: pre-flight impact note. When replace=<name> and
         # the signature line actually changed, surface the cross-file
@@ -214,7 +326,7 @@ async def fast_edit(
                 )
                 if note:
                     impact_suffix = "\n" + note
-            except Exception:
+            except Exception:  # noqa: BLE001 -- deliberate: the edit has already landed successfully; we swallow any exception so an infra hiccup (tldr/AST) cannot fail the success response
                 impact_suffix = ""
 
         return await _maybe_append_update_notice(
@@ -231,11 +343,31 @@ async def fast_edit(
         "\n"
         "Each edit follows the same minimal-snippet patterns as fast_edit: see its "
         "description for USE CASES + MARKERS. Short markers #... / //... / … are accepted; "
-        "replace= auto-preserves the target's signature (do not repeat it in the snippet)."
+        "replace= auto-preserves the target's signature (do not repeat it in the snippet).\n"
+        "\n"
+        "PARSE SAFETY: if the merged output fails a parse check, nothing is written "
+        "and the response explains why. Pass force=True to override that refusal and "
+        "write anyway — use only when you intend it. force never overrides a "
+        "hallucination rejection (all chunks rejected): a fully-rejected merge is "
+        "always refused and the file is left unchanged."
     ),
 )
-async def fast_batch_edit(file_path: str, edits: str) -> str:
-    """Apply multiple sequential edits to a file in one call."""
+async def fast_batch_edit(
+    file_path: str,
+    edits: str,
+    force: Annotated[bool, Field(
+        description=(
+            "write even when the merged output fails a parse check; "
+            "use only when you intend it"
+        ),
+    )] = False,
+) -> str:
+    """Apply multiple sequential edits to a file in one call.
+
+    Step 18 (B34): mirrors fast_edit's write gates — a merge whose chunks
+    were all rejected is refused (never overridable) and a parse-invalid
+    merge is refused unless ``force=True``.
+    """
     ctx = mcp.get_context()
     lc = ctx.request_context.lifespan_context
     backend_kind: str = lc["backend_kind"]
@@ -268,7 +400,12 @@ async def fast_batch_edit(file_path: str, edits: str) -> str:
         ))
 
     async with file_locks[file_path]:
-        original_code = path.read_text(encoding="utf-8", errors="replace")
+        # B21: strict-decode read; UTF-16/binary refused before the merge.
+        # B37: the read-time stat rides along to the write below.
+        try:
+            original_code, encoding, read_stat = read_source(path, return_stat=True)
+        except UnsupportedEncodingError as e:
+            return f"Error: {e}"
         snapshots[file_path] = original_code
         language = detect_language(path)
         if language is None:
@@ -314,14 +451,45 @@ async def fast_batch_edit(file_path: str, edits: str) -> str:
             f"{len(batch)} edit(s)"
         )
 
+        # Step 18 (B34): same gate order as fast_edit — the fail-loud
+        # hallucination refusal first (never force-overridable), then the
+        # parse gate (force=True opt-in).
+        if _all_chunks_rejected(result):
+            return _rejection_refusal(result, metrics)
+
+        if getattr(result, "chunks_rejected", 0) > 0:
+            try:
+                _atomic_write(
+                    path, result.merged_code, backups=backups, encoding=encoding,
+                    expected_stat=read_stat,
+                )
+            except ConcurrentModificationError:
+                return _concurrent_modification_error()
+            return _partial_rejection_warning(result, metrics)
+
+        if language and not result.parse_valid and not force:
+            return _parse_refusal(file_path, language, metrics)
+
         if language and not result.parse_valid:
-            _atomic_write(path, result.merged_code, backups=backups)
+            try:
+                _atomic_write(
+                    path, result.merged_code, backups=backups, encoding=encoding,
+                    expected_stat=read_stat,
+                )
+            except ConcurrentModificationError:
+                return _concurrent_modification_error()
             return (
                 f"Warning: parse errors after {len(batch)} edits to {file_path}. "
                 f"Wrote to {file_path} anyway. {metrics}"
             )
 
-        _atomic_write(path, result.merged_code, backups=backups)
+        try:
+            _atomic_write(
+                path, result.merged_code, backups=backups, encoding=encoding,
+                expected_stat=read_stat,
+            )
+        except ConcurrentModificationError:
+            return _concurrent_modification_error()
         return await _maybe_append_update_notice(
             f"Applied {len(batch)} edits to {file_path}. {metrics}"
         )
@@ -331,11 +499,31 @@ async def fast_batch_edit(file_path: str, edits: str) -> str:
     description=(
         "Apply edits across multiple files in one call. `file_edits` is a JSON list "
         "of objects with `file_path` and `edits` (same format as fast_batch_edit). "
-        "Files are processed sequentially so cross-file dependencies work correctly."
+        "Files are processed sequentially so cross-file dependencies work correctly.\n"
+        "\n"
+        "PARSE SAFETY: each file's write follows the same gates as fast_edit — a "
+        "merge whose chunks were all rejected as hallucinations is never written "
+        "(not even with force=True), and a parse-invalid merge is not written "
+        "unless force=True. Refused files are left unchanged while the remaining "
+        "targets still process; the per-file statuses in the response tell you "
+        "exactly what was written and what was refused."
     ),
 )
-async def fast_multi_edit(file_edits: str) -> str:
-    """Apply sequential edits across multiple files in one call."""
+async def fast_multi_edit(
+    file_edits: str,
+    force: Annotated[bool, Field(
+        description=(
+            "write even when the merged output fails a parse check; "
+            "use only when you intend it"
+        ),
+    )] = False,
+) -> str:
+    """Apply sequential edits across multiple files in one call.
+
+    Step 18 (B34): per-target write gates mirror fast_edit — a rejected or
+    parse-invalid target is left untouched (the remaining targets still
+    write) and the summary distinguishes ok / rejected / parse-errors.
+    """
     ctx = mcp.get_context()
     lc = ctx.request_context.lifespan_context
     backend_kind: str = lc["backend_kind"]
@@ -353,6 +541,8 @@ async def fast_multi_edit(file_edits: str) -> str:
         return "Error: file_edits must be a non-empty JSON list"
 
     results: list[str] = []
+    written_files = 0
+    refused_files = 0
     total_tokens = 0
     total_latency = 0.0
     total_edits = 0
@@ -382,7 +572,12 @@ async def fast_multi_edit(file_edits: str) -> str:
 
         # Lock each file individually as we process it sequentially
         async with file_locks[fp]:
-            original_code = path.read_text(encoding="utf-8", errors="replace")
+            # B21: strict-decode read; UTF-16/binary refused before the merge.
+            # B37: the read-time stat rides along to this file's write below.
+            try:
+                original_code, encoding, read_stat = read_source(path, return_stat=True)
+            except UnsupportedEncodingError as e:
+                return f"Error on {fp}: {e}"
             snapshots[fp] = original_code
             language = detect_language(path)
             if language is None:
@@ -416,20 +611,81 @@ async def fast_multi_edit(file_edits: str) -> str:
             except ValueError as e:
                 return f"Error on {fp}: {e}"
 
-            _atomic_write(path, result.merged_code, backups=backups)
+            # Step 18 (B34): per-target write gates, mirroring fast_edit's
+            # order — the fail-loud hallucination refusal first (never
+            # force-overridable), then the parse gate (force=True opt-in).
+            # A refused target is left untouched; the remaining targets
+            # still process (partial-batch semantics — the pre-existing
+            # whole-call aborts for hard errors above are unchanged).
+            if _all_chunks_rejected(result):
+                results.append(
+                    f"{fp}: {len(batch)} edit(s), rejected — model hallucinated on "
+                    f"{result.chunks_rejected} chunk(s). File unchanged. "
+                    f"Try a smaller edit or split the function."
+                )
+                refused_files += 1
+            elif language and not result.parse_valid and not force:
+                results.append(
+                    f"{fp}: {len(batch)} edit(s), parse_errors — merged output has "
+                    f"parse errors in {language}; refusing to write. File unchanged. "
+                    f"Break the edit into smaller edits, or pass force=True to write "
+                    f"anyway."
+                )
+                refused_files += 1
+            else:
+                try:
+                    _atomic_write(
+                        path, result.merged_code, backups=backups,
+                        encoding=encoding, expected_stat=read_stat,
+                    )
+                except ConcurrentModificationError:
+                    # B37: this target changed on disk since it was read —
+                    # it is refused like any other gated target while the
+                    # remaining targets still write.
+                    results.append(
+                        f"{fp}: file changed on disk since it was read; "
+                        f"re-read and retry — file unchanged."
+                    )
+                    refused_files += 1
+                else:
+                    written_files += 1
+                    total_edits += len(batch)
+                    rejected = getattr(result, "chunks_rejected", 0)
+                    if rejected > 0:
+                        results.append(
+                            f"{fp}: {len(batch)} edit(s), ok (warning: {rejected}/"
+                            f"{result.chunks_used} chunk(s) rejected due to hallucination "
+                            f"— partial edit applied)"
+                        )
+                    elif language and not result.parse_valid:
+                        results.append(
+                            f"{fp}: {len(batch)} edit(s), parse_errors — written with "
+                            f"force=True despite parse errors in {language}."
+                        )
+                    else:
+                        results.append(f"{fp}: {len(batch)} edit(s), ok")
+            # The merge ran either way — its cost stays in the totals.
             total_tokens += result.model_tokens
             total_latency += result.latency_ms
-            total_edits += len(batch)
-
-            status = "ok" if result.parse_valid else "parse_errors"
-            results.append(f"{fp}: {len(batch)} edit(s), {status}")
 
     tok_per_sec = (
         total_tokens / (total_latency / 1000)
         if total_latency > 0 else 0
     )
+    # Step 18 (B34): the all-clean header keeps its exact existing shape;
+    # with refusals the counts narrow to what was actually written and the
+    # not-written files are called out instead of silently vanishing.
+    if refused_files:
+        header = (
+            f"Applied {total_edits} edit(s) across {written_files} of "
+            f"{len(file_edits_list)} file(s); {refused_files} file(s) not written. "
+        )
+    else:
+        header = (
+            f"Applied {total_edits} edit(s) across {len(file_edits_list)} file(s). "
+        )
     summary = (
-        f"Applied {total_edits} edit(s) across {len(file_edits_list)} file(s). "
+        f"{header}"
         f"latency: {total_latency:.0f}ms, {tok_per_sec:.0f} tok/s, "
         f"{total_tokens} tokens"
     )
