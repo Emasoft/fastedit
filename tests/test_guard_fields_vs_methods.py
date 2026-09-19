@@ -225,14 +225,23 @@ class Cache {
 
 
 def test_typescript_field_only_does_not_fire_guard(tmp_path):
-    """UPDATED (preserve-by-default, Step 2): same contract as the Java
-    sibling — the extras guard still must not fire for a field-only
-    snippet; the LHS-only field rewrite itself now declines to the model
-    (item 6, ambiguous rewrite) instead of silently replacing the gap."""
+    """UPDATED (B3): the invariant under test — the extras guard must NOT
+    fire for a field-only snippet — is unchanged and still holds, and the
+    model is never called.
+
+    B3 fixed the direct-swap gate's snippet parser to consult fastedit's
+    own in-memory resolver first (the authoritative map, B26 rationale)
+    instead of the tldr daemon, whose TypeScript extractor reported nothing
+    for this snippet. The parse now sees exactly one top-level definition
+    named ``Cache`` (the grammar does not surface class properties as
+    symbols), so a COMPLETE class re-definition deterministically swaps via
+    the direct-swap path — the same contract the Rust sibling above pins.
+    Nothing is silently deleted: the snippet restates every member of the
+    original class."""
     file_path = tmp_path / "cache.ts"
     file_path.write_text(TS_ORIGINAL)
     _model_returns_original.called = False
-    chunked_merge(
+    result = chunked_merge(
         original_code=TS_ORIGINAL,
         snippet=TS_FIELD_ONLY_SNIPPET,
         file_path=str(file_path),
@@ -240,10 +249,13 @@ def test_typescript_field_only_does_not_fire_guard(tmp_path):
         language="typescript",
         replace="Cache",
     )
-    assert _model_returns_original.called, (
-        "field-only rewrite must decline deterministically and reach the "
-        "model without ever raising the extras-guard ValueError"
+    assert not _model_returns_original.called, (
+        "a complete field-only class re-definition must land on the "
+        "deterministic direct-swap path without raising the extras-guard "
+        "ValueError"
     )
+    assert result.model_tokens == 0
+    assert result.merged_code == TS_FIELD_ONLY_SNIPPET
 
 
 def test_typescript_methods_fires_guard(tmp_path):

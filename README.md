@@ -61,6 +61,15 @@ The system tries deterministic text-matching first. It classifies each snippet l
 
 When deterministic matching can't resolve the edit (indent structure changes, full rewrites, <2 matching lines), the 1.7B model takes over. It only ever sees a ~35-line function — never the whole file — so it's fast and accurate.
 
+## Validation & retries
+
+Every merge output is validated before anything is written:
+
+- **Relative parse check (edit-not-correct)** — the merged file's tree-sitter diagnostics are compared against the *original's*, never against an absolute "must parse clean" ideal. A pre-existing syntax error elsewhere in the file is a preserved trait, not something to fix: an edit next to it still lands, byte-exact defect included. What is refused is an edit that *introduces* new breakage — in a clean file or a broken one. FastEdit validates and edits; it never silently corrects your source.
+- **Content faithfulness** — untouched lines must survive byte-exact: dropped, invented, reordered or selectively re-indented lines, and leaked `...` markers, all fail the merge.
+
+A rejected attempt is retried with its failure reason appended to the prompt (retry-until-valid), up to `FASTEDIT_MAX_RETRIES` attempts (default 8). On exhaustion the edit is refused loudly and the file is left unchanged — no partial or guessed output is ever written. When retries were consumed, the result message reports it in the metrics segment: `Applied edit to app.py. latency: 900ms, 44 tok/s, 40 tokens, 2 validation retries`.
+
 ## Install
 
 **Prerequisite:** [tldr](https://github.com/parcadei/tldr-code) must be on PATH (used for AST analysis).
@@ -305,6 +314,21 @@ Per-language model accuracy (156-example benchmark):
 
 Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#, PHP
 
+## Testing
+
+The suite runs in three runtime tiers (pytest markers; heavy tiers are deselected from the default run so `uv run pytest -q` stays hermetic):
+
+```bash
+uv run pytest -q                                            # default tier: hermetic unit/integration suite (~2 min, never loads the model)
+uv run pytest -m llm                                        # llm tier: adds real-model tests (needs the mlx extra + `fastedit pull`)
+FASTEDIT_RUN_STRESS=1 uv run pytest -m "llm and stress" -q  # stress tier: adds the 100MB real-LLM stress suites (~1-2 h)
+```
+
+- The default tier never loads the model and never touches the network.
+- The `llm` tier drives the real trained 1.7B model end-to-end — there is no fake LLM anywhere on the LLM path.
+- Stress cases (100MB files: code seams, CJK×CRLF, deep nesting, txt/md) additionally require `FASTEDIT_RUN_STRESS=1`; without it they skip loudly, even under `-m llm`.
+- The suite sets `FASTEDIT_BACKUP_DIR` itself, so test runs never write into `~/.fastedit/backups`.
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -315,6 +339,8 @@ Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#,
 | `FASTEDIT_LLM_MODEL` | `fastedit` | Model name to send in API requests |
 | `FASTEDIT_LLM_API_KEY` | `not-needed` | API key (if server requires one) |
 | `FASTEDIT_BACKUP_DIR` | `~/.fastedit/backups` | Directory for undo/diff backups; must be an absolute path (a leading `~` is expanded). `fastedit undo` and `diff` only see backups stored in this directory. |
+| `FASTEDIT_MAX_RETRIES` | `8` | Validation-retry budget per merge site for the retry-until-valid loop (see "Validation & retries" above). Malformed or negative values fail loudly. |
+| `FASTEDIT_RUN_STRESS` | unset | Set to `1` to enable the 100MB stress tests (see "Testing" above). |
 
 ## License
 

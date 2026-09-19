@@ -292,6 +292,314 @@ def test_narrow_without_enclosing_block_rejected():
     )
 
 
+def _deep_two_block_source() -> tuple[list[str], int, int]:
+    """A >100-line function with two sibling for-blocks sharing ONE opener.
+
+    The C3 deep-nesting corpus shape: block openers are byte-identical
+    (`for _outer in range(2):`), inner openers and body statements differ
+    per block. Returns (lines, block_b_start, block_b_end) 1-indexed.
+    """
+    lines = ["def big():", '    """docstring"""']
+    lines.append("    for _outer in range(2):")  # block A opener
+    lines.append("        if value_a > 1:")
+    lines += ["            acc_a_i1 = 1", "            acc_a_i2 = 2"]
+    lines += [f"        acc_a_{k:02d} = {k}" for k in range(1, 61)]
+    block_b_start = len(lines) + 1
+    lines.append("    for _outer in range(2):")  # block B opener — SAME text
+    lines.append("        if value_a > 2:")
+    lines += ["            acc_b_i1 = 1", "            acc_b_i2 = 2"]
+    lines += [f"        acc_b_{k:02d} = {k}" for k in range(1, 61)]
+    lines.append("    return total")
+    return lines, block_b_start, block_b_start + 63
+
+
+def test_narrow_anchors_on_first_matched_line_not_window_start():
+    """C3: a leading unmatched snippet line must not slide the cut into the
+    WRONG sub-block of a large node.
+
+    The snippet's first line is the function's signature — it matches the
+    node only at offset 0 — while the snippet's real context matches the
+    SECOND for-block. The best-scoring window therefore starts one line
+    ABOVE that block (the signature slot matches nothing there). Anchoring
+    the enclosing-block lookup on the window's first line cut block ONE
+    (the bystander block the snippet never mentioned); anchoring on the
+    FIRST MATCHED line cuts block TWO — the block the snippet edits.
+    """
+    lines, b_start, b_end = _deep_two_block_source()
+    node = ASTNode(
+        name="big", kind="function",
+        line_start=1, line_end=len(lines), signature="def big():",
+    )
+    snippet_lines = [
+        "def big():",  # the auto-prepended signature (matches only line 1)
+        "    for _outer in range(2):",  # block B opener — duplicate text
+        "        if value_a > 2:",
+        "            acc_b_i1 = 1",
+        "            acc_b_i2 = 2",
+        "        acc_b_01 = 1",
+        "        acc_b_02 = 2",
+        "        acc_b_03 = 3",
+        "    with audit_lock:",  # the declared new guard
+        "        # ... existing code ...",  # marker — excluded from matching
+    ]
+    snippet = "\n".join(snippet_lines) + "\n"
+
+    result = _narrow_large_node(
+        node, snippet, lines,
+        original_code="\n".join(lines) + "\n", language="python",
+    )
+
+    assert result == (b_start, b_end), (
+        f"narrow cut {result}; the snippet edits block TWO at lines "
+        f"{b_start}-{b_end} — a cut anchored on the window's unmatched "
+        f"first line lands on block ONE (lines 3-66) and hands the model "
+        f"the wrong sub-block"
+    )
+
+
+# ===========================================================================
+# C3 — narrowed replace must not prepend the target's signature
+# ===========================================================================
+
+
+def _deep_two_block_python_file() -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """A file whose >100-line function carries two sibling for-blocks.
+
+    Returns (source, block_a_span, block_b_span) 1-indexed inclusive.
+    """
+    lines, b_start, b_end = _deep_two_block_source()
+    return "\n".join(lines) + "\n", (3, b_start - 1), (b_start, b_end)
+
+
+def test_narrowed_replace_snippet_carries_no_prepended_signature():
+    """C3: ``replace=`` on a >100-line symbol narrows the chunk to a
+    sub-block — the auto-prepended signature would declare a line that is
+    OUTSIDE the chunk the model sees, so the model echoes it into its merge
+    and the validator rejects every attempt (the narrowed edit could never
+    converge). When the narrow will engage, the signature must NOT be
+    prepended, and a faithful sub-block merge must land on the first
+    attempt through the (scripted) model path.
+    """
+    from types import SimpleNamespace
+
+    from fastedit.inference.chunked_merge import chunked_merge
+
+    source, _block_a, block_b = _deep_two_block_python_file()
+    b_start, b_end = block_b
+    lines = source.splitlines(keepends=True)
+    block_lines = lines[b_start - 1: b_end]
+    # The block-targeted snippet: the block's opener + first context lines,
+    # the new guard, and a preservation marker. NO function signature.
+    snippet = (
+        "    for _outer in range(2):\n"
+        "        if value_a > 2:\n"
+        "            acc_b_i1 = 1\n"
+        "        acc_b_01 = 1\n"
+        "        with audit_lock:\n"
+        "            # ... existing code ...\n"
+    )
+    # A faithful merge of the BLOCK chunk: every original line survives,
+    # the body after the last declared context anchor moves one level
+    # deeper inside the guard (uniform group shift).
+    kept = block_lines[:5]
+    wrapped = block_lines[5:]
+    merged_chunk = (
+        "".join(kept)
+        + "        with audit_lock:\n"
+        + "".join("    " + line for line in wrapped)
+    )
+    expected_file = "".join(lines[: b_start - 1]) + merged_chunk + "".join(
+        lines[b_end:],
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    def merge_fn(chunk, snippet_text, language):
+        calls.append((chunk, snippet_text))
+        return SimpleNamespace(
+            merged_code=merged_chunk, parse_valid=True, tokens_generated=9,
+            latency_ms=1.0, truncated=False,
+        )
+
+    result = chunked_merge(
+        original_code=source,
+        snippet=snippet,
+        file_path="narrow_probe.py",
+        merge_fn=merge_fn,
+        language="python",
+        replace="big",
+    )
+    assert calls, "the model path never ran"
+    chunk, sent_snippet = calls[0]
+    assert "def big():" not in sent_snippet, (
+        "the snippet handed to the model carries the auto-prepended "
+        "signature — outside the narrowed chunk it declares a line the "
+        "merge must not contain, so a narrowed edit can never converge"
+    )
+    assert chunk.startswith("    for _outer in range(2):"), (
+        "the chunk must be the narrowed sub-block, not the whole symbol"
+    )
+    assert result.chunks_rejected == 0 and result.retries == 0
+    assert result.chunk_regions == [block_b], result.chunk_regions
+    assert result.merged_code == expected_file
+
+
+# ===========================================================================
+# C3 — the deep-recipe corpus narrows to the manifest-recorded FIRST block
+# ===========================================================================
+
+
+# The deep-narrow probe line per language: the ellipsis phrase rides inside a
+# STRING, which drives ``_snippet_has_ellipsis`` (the narrow trigger) while
+# the exact-match ``is_marker_line`` still classifies the line as CONTENT.
+# (The stress suite's full op shape — including go's measured gofmt guard —
+# lives in tests/test_stress_100mb_seams.py's ``_NARROW_TAIL``; the locator
+# behavior under test here only depends on the block context + the probe.)
+_DEEP_NARROW_PROBE = {
+    "python": '        seam_probe = "... existing code ..."\n',
+    "go": '\tseamProbe := "... existing code ..."\n',
+    "typescript": '  const seamProbe = "... existing code ...";\n',
+}
+
+
+@pytest.mark.parametrize("language", ["python", "go", "typescript"])
+def test_deep_recipe_corpus_narrows_to_recorded_first_block(language):
+    """C3: on a deep-recipe corpus the ``replace=`` narrow must cut the
+    manifest-recorded FIRST block of the targeted symbol.
+
+    The deep corpus's sibling blocks are byte-identical (the B24 tie that
+    keeps the deterministic editor off the edit) and the snippet's ellipsis
+    phrase hides inside a string literal, so the narrow must engage on the
+    phrase (``_snippet_has_ellipsis``), resolve its best-scoring window to
+    the FIRST block (strictly-greater score keeps the first offset), and cut
+    at that block's AST edges — the same ``result.chunk_regions`` assertion
+    the 100MB seams stress makes, pinned here hermetically (no model).
+    """
+    import corpus
+
+    from fastedit.inference.chunk_locator import _narrow_will_engage
+    from fastedit.inference.markers import is_marker_line
+
+    source = corpus.generate_big_source(language, 200_000, recipe="deep")
+    manifest = source.manifest
+    deep = next(sym for sym in manifest.symbols if sym.blocks)
+    blk = deep.blocks[0]
+    lines = source.splitlines(keepends=True)
+    probe = _DEEP_NARROW_PROBE[language]
+    snippet = (
+        "".join(ln.rstrip("\r\n") + "\n" for ln in
+                lines[blk.start_line - 1: blk.end_line])
+        + probe
+    )
+
+    # The two load-bearing classifications of the probe line.
+    assert "... existing code ..." in snippet
+    assert _narrow_will_engage(snippet, deep.line_count), (
+        f"{language}: the string-embedded ellipsis phrase must drive the "
+        f"narrow on a {deep.line_count}-line symbol"
+    )
+    assert not is_marker_line(probe.rstrip("\n")), (
+        f"{language}: the probe line must stay CONTENT (a declared new "
+        f"line), not a preservation marker"
+    )
+
+    chunks = locate_chunks(
+        snippet, str(source), f"deep_narrow_probe.{manifest.ext}",
+        language=language, replace=deep.name,
+    )
+
+    assert len(chunks) == 1, (
+        f"{language}: expected one narrowed region, got "
+        f"{[(c.start_line, c.end_line) for c in chunks]}"
+    )
+    assert (chunks[0].start_line, chunks[0].end_line) == (
+        blk.start_line, blk.end_line,
+    ), (
+        f"{language}: the narrow must cut the manifest-recorded FIRST block "
+        f"{(blk.start_line, blk.end_line)} of '{deep.name}' "
+        f"({deep.start_line}-{deep.end_line}, {len(deep.blocks)} recorded "
+        f"blocks), got {(chunks[0].start_line, chunks[0].end_line)}"
+    )
+
+
+# ===========================================================================
+# C3 — the realign repair must not re-indent the snippet's declared new lines
+# ===========================================================================
+
+
+def test_chunk_repair_leaves_declared_new_lines_untouched():
+    """C3 seams stress: the chunk loop's indent repair protects declared lines.
+
+    Measured model failure (go, narrowed 100MB chunk): the model echoed the
+    chunk body one level shallow while echoing the snippet's declared new
+    tail VERBATIM; the repair's uniform shift then restored the body and
+    silently pushed the whole declared tail one level deeper — the new guard
+    landed inside the enclosing block (a silent semantic change) and the
+    content-level validator ratified it. The repair must restore the model's
+    copy of the CHUNK while leaving the model's verbatim echo of the
+    declared new lines alone, so the merge lands byte-exact on the declared
+    op spec.
+    """
+    from types import SimpleNamespace
+
+    from fastedit.inference.chunked_merge import chunked_merge
+
+    # A >100-line function of two IDENTICAL sibling blocks (the B24 tie that
+    # declines the deterministic editor) whose first block narrows the chunk.
+    lines = ["def big():", '    """docstring"""']
+    for _block in range(2):
+        lines.append("    for _outer in range(2):")
+        lines.append("        if value_a > 1:")
+        lines += ["            acc_i1 = 1", "            acc_i2 = 2"]
+        lines += [f"        acc_{k:02d} = {k}" for k in range(1, 55)]
+    lines.append("    return total")
+    source = "\n".join(lines) + "\n"
+    block_a_start, block_a_end = 3, 3 + 57  # 58-line first for-block
+    chunk = "\n".join(lines[block_a_start - 1: block_a_end]) + "\n"
+
+    # The aligned snippet: the first block's context plus one declared new
+    # line (the string-embedded ellipsis drives the narrow).
+    declared = '    seam_probe = "... existing code ..."\n'
+    snippet = "".join(ln + "\n" for ln in lines[block_a_start - 1: block_a_end]) + declared
+    # The measured model failure: the chunk echo one level shallow (first
+    # line at column 0), the declared new line verbatim.
+    model_output = "\n".join(
+        ln.removeprefix("    ") for ln in chunk.splitlines()
+    ) + "\n" + declared
+    expected = (
+        "\n".join(lines[:block_a_end]) + "\n" + declared
+        + "\n".join(lines[block_a_end:]) + "\n"
+    )
+
+    seen_chunks: list[str] = []
+
+    def merge_fn(code, snippet_text, language):
+        seen_chunks.append(code)
+        return SimpleNamespace(
+            merged_code=model_output, parse_valid=True, tokens_generated=7,
+            latency_ms=1.0, truncated=False,
+        )
+
+    result = chunked_merge(
+        original_code=source,
+        snippet=snippet,
+        file_path="repair_probe.py",
+        merge_fn=merge_fn,
+        language="python",
+        replace="big",
+    )
+    assert seen_chunks == [chunk], (
+        "the model must see exactly the narrowed first block"
+    )
+    assert result.chunks_rejected == 0 and result.retries == 0, (
+        "the repaired merge must pass the battery"
+    )
+    assert result.merged_code == expected, (
+        f"the repair re-indented the declared new line (or failed to restore "
+        f"the chunk body):\n{result.merged_code!r}"
+    )
+
+
 # ===========================================================================
 # B28 — _find_insertion_region rarest-context anchoring
 # ===========================================================================

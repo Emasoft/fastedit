@@ -70,7 +70,11 @@ def delete_symbol(
     # LF-normalized copy so a lone CR (invisible to tree-sitter's row
     # counting) does not collapse the whole file into one line; the
     # returned line numbers stay valid against original_lines either way.
-    ast_nodes = get_ast_map_from_source(normalize_bare_cr_for_ast(original_code), file_path)
+    # B3: the caller's `language` rides along as an explicit hint so
+    # extension-unwired languages (all-grammars extras) still resolve.
+    ast_nodes = get_ast_map_from_source(
+        normalize_bare_cr_for_ast(original_code), file_path, language,
+    )
     if not ast_nodes:
         ast_nodes = get_ast_map(file_path, total_lines)
 
@@ -173,9 +177,10 @@ def move_symbol(
     # spliced from stale coordinates corrupts both the moved span and its
     # neighbours. A bare CR is swapped for LF by a same-length, same-position
     # substitution first (tree-sitter counts rows by scanning for "\n"), so
-    # the returned line numbers stay valid against original_lines.
+    # the returned line numbers stay valid against original_lines. B3: the
+    # caller's `language` rides along as an explicit hint.
     ast_nodes = get_ast_map_from_source(
-        normalize_bare_cr_for_ast(original_code), file_path,
+        normalize_bare_cr_for_ast(original_code), file_path, language,
     )
     if not ast_nodes:
         # Unsupported extension / missing grammar — fall back to the tldr
@@ -299,6 +304,7 @@ def batch_chunked_merge(
     total_tokens = 0
     total_latency = 0.0
     total_rejected = 0
+    total_retries = 0
     all_regions: list[tuple[int, int]] = []
 
     # Temp file for AST analysis between edits
@@ -326,6 +332,7 @@ def batch_chunked_merge(
             total_tokens += result.model_tokens
             total_latency += result.latency_ms
             total_rejected += result.chunks_rejected
+            total_retries += result.retries
             all_regions.extend(result.chunk_regions)
 
             # Update temp file for next edit's AST analysis
@@ -357,4 +364,5 @@ def batch_chunked_merge(
         model_tokens=total_tokens,
         latency_ms=total_latency,
         chunks_rejected=total_rejected,
+        retries=total_retries,
     )

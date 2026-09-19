@@ -183,7 +183,11 @@ def _align_snippet_indent(snippet: str, chunk_text: str) -> str:
     return "".join(result_lines)
 
 
-def _realign_output(model_output: str, original_chunk: str) -> str:
+def _realign_output(
+    model_output: str,
+    original_chunk: str,
+    protected_lines: tuple[str, ...] | list[str] = (),
+) -> str:
     """Re-align model output indentation to match the original chunk.
 
     Unlike _align_snippet_indent (which shifts all lines uniformly), this
@@ -200,6 +204,19 @@ def _realign_output(model_output: str, original_chunk: str) -> str:
        that rewrites the string or reverts the model's indent change.
     5. Otherwise, fall back to uniform shift via _align_snippet_indent
        (which itself never moves string content).
+
+    ``protected_lines`` (C3 seams stress) lists the snippet's declared NEW
+    lines in RAW form (indent included, order-sensitive — consumed by a
+    cursor). These are bytes the aligned snippet told the model to insert,
+    so a model echo of them already carries the right indent; the uniform
+    shift computed from the model's drifted COPY of the chunk must never be
+    applied to them (measured defect: the go model emitted the chunk body
+    one level shallow while echoing the declared tail verbatim, and the
+    blanket shift pushed the whole declared tail one level deeper — the
+    validator's content-level view cannot see indent, so the corrupted
+    merge was ratified and written). Lines that do not continue the
+    declared sequence are repaired exactly as before, so a genuinely
+    drifted declared line still gets the legacy repair.
     """
     def _first_line_indent(text: str) -> tuple[int, int]:
         """Return (indent_columns, line_index) of first non-blank line."""
@@ -238,8 +255,32 @@ def _realign_output(model_output: str, original_chunk: str) -> str:
         # of range for an EMPTY output, which has nothing to fix either.)
         return model_output
 
+    if protected_lines:
+        # Order-sensitive cursor over the declared new lines: an output
+        # line is protected only while it continues the declared sequence
+        # verbatim (EOL-insensitive — the funnel owns endings), so a chunk
+        # line with the same bytes (a lone `}`) is still repaired, and a
+        # genuinely drifted declared line falls back to the legacy repair
+        # instead of being left corrupt.
+        pending = [
+            line.rstrip("\r\n") if line.endswith(("\r", "\n")) else line
+            for line in protected_lines
+        ]
+
+        def _is_protected(line: str) -> bool:
+            if pending and line.rstrip("\r\n") == pending[0]:
+                pending.pop(0)
+                return True
+            return False
+
+    else:
+        def _is_protected(line: str) -> bool:
+            return False
+
     body_matches = chunk_body_indent >= 0 and chunk_body_indent == output_body_indent
-    if body_matches or _has_string_interior_content(model_output):
+    if (body_matches or _has_string_interior_content(model_output)) and not (
+        _is_protected(output_lines[first_idx])
+    ):
         # Only the first non-blank line needs fixing — in the chunk's own
         # indent style (B7), and never a uniform shift over string
         # content (B30).
@@ -249,5 +290,14 @@ def _realign_output(model_output: str, original_chunk: str) -> str:
         )
         return "".join(result)
 
-    # Body indent also wrong — uniform shift
-    return _align_snippet_indent(model_output, original_chunk)
+    # Body indent also wrong — uniform shift, never touching the declared
+    # new lines the model echoed verbatim (blank and string-interior lines
+    # pass through untouched, as in _align_snippet_indent).
+    indent_char = _indent_char_of(original_chunk)
+    result_lines = []
+    for line, is_interior in zip(output_lines, interior):
+        if line.strip() and not is_interior and not _is_protected(line):
+            result_lines.append(_apply_indent_delta(line, delta, indent_char))
+        else:
+            result_lines.append(line)
+    return "".join(result_lines)

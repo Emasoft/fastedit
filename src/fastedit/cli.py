@@ -248,12 +248,30 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         _qualified_symbol_names,
         _resolve_symbol,
         get_ast_map,
+        get_ast_map_from_source,
     )
     from .inference.text_match import deterministic_edit, snippet_has_keep_marker
-    from .split_join import detect_line_ending, normalize_line_endings
+    from .split_join import (
+        detect_line_ending,
+        normalize_bare_cr_for_ast,
+        normalize_line_endings,
+    )
 
     total_lines = len(original_lines)
-    ast_nodes = get_ast_map(str(path), total_lines)
+    # B3: parse the IN-MEMORY original first. get_ast_map consults the tldr
+    # daemon, whose cache can hold pre-write line numbers for a file that
+    # was just rewritten (B26 rationale) and which knows none of the B2/B3
+    # data formats (html/json/yaml/...) — a replace= on those would refuse
+    # "Symbol not found" even though the symbol map is available. The
+    # same-length CR→LF substitution keeps the returned line numbers valid
+    # against original_lines (the same protection delete_symbol uses). The
+    # caller's detected `language` rides along as an explicit hint for
+    # extension-unwired languages.
+    ast_nodes = get_ast_map_from_source(
+        normalize_bare_cr_for_ast(original_code), str(path), language,
+    )
+    if not ast_nodes:
+        ast_nodes = get_ast_map(str(path), total_lines)
     target_node = _resolve_symbol(replace_sym, ast_nodes or [])
     if target_node is None:
         available = _qualified_symbol_names(ast_nodes or [])
@@ -427,7 +445,7 @@ def cmd_edit(args):
         _find_project_root,
         compute_signature_impact_note,
     )
-    from .inference.chunked_merge import chunked_merge
+    from .inference.chunked_merge import _validation_retries_metric, chunked_merge
     from .io_utils import UnsupportedEncodingError, read_source
     from .mcp.backup import (
         BackupStore,
@@ -568,6 +586,10 @@ def cmd_edit(args):
     )
     if result.chunks_used > 1:
         metrics += f", {result.chunks_used} chunk(s)"
+    # Step A3: validation-retry count in the metrics segment (empty string
+    # when none were consumed — shape stays stable). The retry budget itself
+    # is resolved inside chunked_merge (FASTEDIT_MAX_RETRIES env or default).
+    metrics += _validation_retries_metric(getattr(result, "retries", 0))
     if getattr(result, "chunks_rejected", 0):
         print(
             f"Warning: {result.chunks_rejected}/{result.chunks_used} chunk(s) rejected. "
@@ -584,7 +606,11 @@ def cmd_batch_edit(args):
     import json as json_mod
 
     from .data_gen.ast_analyzer import detect_language
-    from .inference.chunked_merge import BatchEdit, batch_chunked_merge
+    from .inference.chunked_merge import (
+        BatchEdit,
+        _validation_retries_metric,
+        batch_chunked_merge,
+    )
     from .io_utils import UnsupportedEncodingError, read_source
     from .mcp.backup import (
         BackupStore,
@@ -647,6 +673,7 @@ def cmd_batch_edit(args):
     print(
         f"Applied {len(batch)} edits to {args.file}. "
         f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
+        f"{_validation_retries_metric(getattr(result, 'retries', 0))}"
     )
 
 
@@ -657,7 +684,11 @@ def cmd_multi_edit(args):
     import os
 
     from .data_gen.ast_analyzer import detect_language
-    from .inference.chunked_merge import BatchEdit, batch_chunked_merge
+    from .inference.chunked_merge import (
+        BatchEdit,
+        _validation_retries_metric,
+        batch_chunked_merge,
+    )
     from .io_utils import read_source
     from .mcp.backup import (
         BackupStore,
@@ -819,6 +850,7 @@ def cmd_multi_edit(args):
         print(
             f"Applied {edit_count} edits to {path}. "
             f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
+            f"{_validation_retries_metric(getattr(result, 'retries', 0))}"
         )
 
 

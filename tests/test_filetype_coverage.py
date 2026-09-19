@@ -260,31 +260,44 @@ def test_delete_ast_language(lang: str, tmp_path: Path) -> None:
 NONPARSEABLE_FILES: dict[str, str] = {
     "csv": "a,b,c\n1,2,3\n",
     "tsv": "a\tb\tc\n1\t2\t3\n",
-    "json": '{"a": 1, "b": [1, 2, 3]}\n',
+    # B2 triage: json/md/html/xml/toml/yaml/yml/css/sql moved to
+    # B2_NOW_PARSEABLE_FILES below — Step B2 shipped verified grammars for
+    # them (hard dependencies), so they are no longer "non-parseable" text.
     "jsonl": '{"a": 1}\n{"a": 2}\n',
-    "md": "# Title\n\nSome text.\n",
     "mdx": "# Title\n\n<Component />\n",
-    "html": "<html><body><p>hi</p></body></html>\n",
     "xhtml": '<?xml version="1.0"?>\n<html xmlns="http://www.w3.org/1999/xhtml"><body/></html>\n',
-    "xml": "<root><item>1</item></root>\n",
-    "toml": '[section]\nkey = "value"\n',
     "ini": "[section]\nkey=value\n",
     "cfg": "[section]\nkey=value\n",
-    "yaml": "a: 1\nb: 2\n",
-    "yml": "a: 1\nb: 2\n",
     "txt": "just plain text\nsecond line\n",
     "log": "2026-09-13 12:00:00 INFO started\n",
-    "sql": "SELECT * FROM foo;\n",
     "r": "x <- 1\nprint(x)\n",
     "tex": "\\documentclass{article}\n\\begin{document}\nhi\n\\end{document}\n",
     "sty": "\\ProvidesPackage{sample}\n",
     "cls": "\\ProvidesClass{sample}\n",
-    "css": "body { color: red; }\n",
     "scss": "$x: 1;\nbody { color: $x; }\n",
     "geojson": '{"type": "FeatureCollection", "features": []}\n',
     "gltf": '{"asset": {"version": "2.0"}}\n',
     "plist": '<?xml version="1.0"?>\n<plist version="1.0"><dict/></plist>\n',
     "vsproj": '<?xml version="1.0"?>\n<VisualStudioProject></VisualStudioProject>\n',
+}
+
+# B2: extensions that USED to be plain "non-parseable" text and now have
+# verified grammars (hard dependencies). Their lifecycle differs from the
+# non-parseable one in exactly one observable way: `create` detects the
+# language and runs the symbol check instead of printing the no-support
+# note. The AST verbs still refuse cleanly (these data formats have no
+# symbol AST maps yet — per-format AST coverage is B3's golden-matrix
+# scope), and the file is never touched.
+B2_NOW_PARSEABLE_FILES: dict[str, str] = {
+    "json": '{"a": 1, "b": [1, 2, 3]}\n',
+    "md": "# Title\n\nSome text.\n",
+    "html": "<html><body><p>hi</p></body></html>\n",
+    "xml": "<root><item>1</item></root>\n",
+    "toml": '[section]\nkey = "value"\n',
+    "yaml": "a: 1\nb: 2\n",
+    "yml": "a: 1\nb: 2\n",
+    "sql": "SELECT * FROM foo;\n",
+    "css": "body { color: red; }\n",
 }
 
 
@@ -298,6 +311,42 @@ def test_nonparseable_type_full_lifecycle(ext: str, tmp_path: Path) -> None:
     assert create_result.returncode == 0, create_result.stderr.decode()
     assert target.read_bytes() == content
     assert NO_LANGUAGE_SUPPORT_NOTE in create_result.stdout
+
+    dup = tmp_path / f"sample_dup.{ext}"
+    dup_result = run_cli("duplicate", str(target), str(dup))
+    assert dup_result.returncode == 0, dup_result.stderr.decode()
+    assert dup.read_bytes() == content
+
+    edit_result = run_cli("edit", str(target), "--replace", "foo", "--snippet", "bar")
+    assert edit_result.returncode != 0
+    assert b"Error" in edit_result.stderr
+
+    rename_result = run_cli("rename", str(target), "foo", "bar")
+    assert rename_result.returncode != 0
+    assert b"Error" in rename_result.stderr
+
+    delete_result = run_cli("delete", str(target), "foo")
+    assert delete_result.returncode != 0
+    assert b"Error" in delete_result.stderr
+
+    assert target.read_bytes() == content
+
+
+@pytest.mark.parametrize("ext", sorted(B2_NOW_PARSEABLE_FILES))
+def test_b2_parseable_type_full_lifecycle(ext: str, tmp_path: Path) -> None:
+    """B2 lifecycle for formats that gained verified grammars: create and
+    duplicate still work byte-exactly, but `create` now DETECTS the
+    language (no no-support note), and the AST verbs still refuse cleanly
+    — no symbol AST maps exist for these data formats yet (B3's per-format
+    golden matrix extends them) — leaving the file untouched."""
+    content = B2_NOW_PARSEABLE_FILES[ext].encode()
+    target = tmp_path / f"sample.{ext}"
+
+    create_result = create_file(target, content)
+    assert create_result.returncode == 0, create_result.stderr.decode()
+    assert target.read_bytes() == content
+    # B2: the language IS detected now — no "no language support" note.
+    assert NO_LANGUAGE_SUPPORT_NOTE not in create_result.stdout
 
     dup = tmp_path / f"sample_dup.{ext}"
     dup_result = run_cli("duplicate", str(target), str(dup))

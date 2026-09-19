@@ -16,6 +16,18 @@ import os
 
 import pytest
 
+# Fixture re-exports: the real-LLM engine fixture LIVES in llm_fixtures.py
+# (implementation plan Phase A) and the MCP full-stack harness fixture lives
+# in test_stress_100mb_llm.py (Step C2, reused by C3's seams suite). Importing
+# them here puts them in conftest's fixture namespace so every llm-tier test
+# can request `real_engine`/`mcp_harness` by name without re-importing them
+# (a per-module import would shadow-collide with the test functions' fixture
+# parameters — ruff F811, and the same collision the C2 module hit).
+from llm_fixtures import real_engine  # noqa: F401 -- fixture discovery re-export
+from test_stress_100mb_llm import (
+    mcp_harness,  # noqa: F401 -- fixture discovery re-export
+)
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _isolated_backup_store(tmp_path_factory):

@@ -532,3 +532,70 @@ class TestRealignOutput:
         output = "pass\n"
         result = _realign_output(output, chunk)
         assert result == "    pass\n"
+
+    # -- C3 seams stress: protected declared new lines ---------------------
+
+    def test_protected_declared_lines_survive_uniform_shift(self):
+        """C3: the uniform shift repairs the chunk copy, never the declared new lines.
+
+        Measured model failure (go, narrowed 100MB chunk): the model echoed
+        the chunk body one level SHALLOW while echoing the snippet's declared
+        new tail VERBATIM. The blanket uniform shift restored the body and
+        silently pushed the whole declared tail one level deeper — the
+        guard landed inside the enclosing block and the validator (a
+        content-level view, blind to indent) ratified the corruption.
+        With the declared lines protected, the same input repairs the body
+        and leaves the declared bytes untouched.
+        """
+        chunk = (
+            "\tfor i := 0; i < 2; i++ {\n"
+            "\t\tif valueA > 1 {\n"
+            "\t\t\tacc += 1\n"
+            "\t\t}\n"
+            "\t\tacc += 2\n"
+            "\t}\n"
+        )
+        declared_tail = [
+            "\tif valueA == 0 {\n",
+            "\t\treturn 0\n",
+            "\t}\n",
+            '\tseamProbe := "... existing code ..."\n',
+        ]
+        # The measured model output: body one level shallow, tail verbatim.
+        output = (
+            "for i := 0; i < 2; i++ {\n"
+            "\tif valueA > 1 {\n"
+            "\t\tacc += 1\n"
+            "\t}\n"
+            "\tacc += 2\n"
+            "}\n"
+            "\n"
+            + "".join(declared_tail)
+        )
+        result = _realign_output(output, chunk, protected_lines=declared_tail)
+        assert result == chunk + "\n" + "".join(declared_tail), result
+
+    def test_protected_cursor_keeps_chunk_closer_repaired(self):
+        """A chunk line with the same bytes as a declared line stays repaired.
+
+        The declared tail's lone `}` must not shield the chunk's own `}`
+        closer from the repair: the cursor is order-sensitive, so the chunk
+        closer (which precedes the declared tail in the output) is shifted
+        while the declared tail's `}` is protected.
+        """
+        chunk = "\tfor i := 0; i < 2; i++ {\n\t\tacc += 2\n\t}\n"
+        declared_tail = ["\t}\n", '\tseamProbe := "..." \n']
+        output = "for i := 0; i < 2; i++ {\n\tacc += 2\n}\n" + "".join(
+            declared_tail,
+        )
+        result = _realign_output(output, chunk, protected_lines=declared_tail)
+        assert result == "\tfor i := 0; i < 2; i++ {\n\t\tacc += 2\n\t}\n" + (
+            "".join(declared_tail)
+        ), result
+
+    def test_without_protected_lines_legacy_behavior_unchanged(self):
+        """No protected lines -> the exact legacy uniform shift."""
+        chunk = "\tfor i := 0; i < 2; i++ {\n\t\tacc += 2\n\t}\n"
+        output = "for i := 0; i < 2; i++ {\n\tacc += 2\n}\n"
+        assert _realign_output(output, chunk) == chunk
+        assert _realign_output(output, chunk, protected_lines=[]) == chunk

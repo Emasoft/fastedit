@@ -10,6 +10,19 @@ from ..inference.chunked_merge import delete_symbol, move_symbol
 from ..inference.rename import do_rename_ast
 from .server import _atomic_write, mcp
 
+_UNDO_DIFF_LINE_BUDGET = 50_000
+"""The embedded undo diff's input budget (lines per side).
+
+``difflib``'s SequenceMatcher is quadratic on repetitive content: the D2
+100MB txt stress measured ~3 hours inside this one diff for a 5-line
+change (two ~1.8M-line template-heavy shift logs), while the revert
+itself is a byte copy. The diff is a display convenience, never a gate —
+the restore below is byte-exact regardless of size — so past the budget
+the response carries an omitted-diff note instead of a full unified diff.
+Small files (the overwhelming case, and every hermetic test) keep their
+full diff.
+"""
+
 
 @mcp.tool(
     description=(
@@ -317,9 +330,21 @@ async def fast_undo(file_path: str) -> str:
         # a backup-of-backup (no undo-of-undo).
         _atomic_write(path, backup_bytes)
 
+        # Display-only diff, capped (see _UNDO_DIFF_LINE_BUDGET): the
+        # restore above is byte-exact at any size; only the embedded diff
+        # is size-gated.
+        current_lines = current.splitlines(keepends=True)
+        backup_lines = backup_content.splitlines(keepends=True)
+        if max(len(current_lines), len(backup_lines)) > _UNDO_DIFF_LINE_BUDGET:
+            return (
+                f"Reverted {file_path} to previous state. "
+                f"(diff omitted: the file exceeds "
+                f"{_UNDO_DIFF_LINE_BUDGET} lines)"
+            )
+
         diff = difflib.unified_diff(
-            current.splitlines(keepends=True),
-            backup_content.splitlines(keepends=True),
+            current_lines,
+            backup_lines,
             fromfile=f"a/{path.name}",
             tofile=f"b/{path.name}",
         )

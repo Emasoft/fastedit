@@ -109,6 +109,103 @@ def _extract_snippet_names(snippet: str, language: str | None = None) -> list[st
 
     return _regex_extract_names(snippet)
 
+
+def _strip_marker_lines(snippet: str) -> str:
+    """The snippet without its preservation-marker lines (Step D4).
+
+    B15: a marker line is a merge DIRECTIVE, never content — every other
+    consumer in the pipeline excludes it from content decisions, and any
+    new-definition judgment must too (in markdown the canonical
+    ``# ... existing code ...`` marker even parses as a heading, so
+    parsing a snippet with its marker lines still inside fabricates a
+    section nobody declared).
+    """
+    return "".join(
+        line for line in snippet.splitlines(keepends=True)
+        if not is_marker_line(line)
+    )
+
+
+def _snippet_definition_names(
+    snippet: str,
+    language: str,
+) -> list[str] | None:
+    """The snippet's own definition names, in the FILE's symbol vocabulary.
+
+    The file's grammar resolves the snippet (B1) and the SAME declarative
+    B3 format spec that names the file's symbols names the snippet's
+    (:func:`get_ast_map_from_source`) — one vocabulary on both sides of
+    every name comparison, in process, no daemon, no temp file. Marker
+    lines are excluded first (:func:`_strip_marker_lines`).
+
+    Returns ``None`` when the file has NO grammar (the B1 resolver's
+    honest answer): the caller keeps the legacy language-blind regex
+    answer, which is all it ever had.
+    """
+    try:
+        from ..data_gen.ast_analyzer import get_language
+
+        get_language(language)  # the resolver's honest "no grammar" answer raises
+    except Exception:  # noqa: BLE001 -- ANY resolution failure IS the "no grammar" answer
+        return None
+    try:
+        from .ast_utils import get_ast_map_from_source
+
+        nodes = get_ast_map_from_source(
+            _strip_marker_lines(snippet),
+            f"snippet{_LANG_EXT.get(language, '.txt')}",
+            language,
+        )
+    except Exception:  # noqa: BLE001 -- a snippet the grammar cannot parse defines nothing
+        return []
+    return [n.name for n in nodes if n.name]
+
+
+def _snippet_defines_new_symbols(
+    snippet: str,
+    language: str | None,
+    existing_names: set[str],
+) -> bool:
+    """True when the snippet defines a symbol the file does not have —
+    judged in the FILE's own symbol vocabulary (Step D4 defect fix).
+
+    The decision this helper replaces compared two DIFFERENT vocabularies:
+    the snippet's names came from the language-blind definition regex
+    (:func:`_regex_extract_names` — def/fn/func/class shapes in ANY
+    syntax) while ``existing_names`` are the file's own B3 format-spec
+    symbols. For a document format whose symbols are NOT code definitions
+    (a markdown file's symbols are its SECTIONS), a code-shaped line
+    inside a fenced code block fabricated a phantom "new definition" —
+    ``def summarize(users):`` inside a ```python fence became a "new
+    function" ``summarize`` — the edit was routed to a tail "insertion
+    region" that does not contain the edit target, and the model was
+    handed the wrong bytes: the battery rejected every attempt (measured
+    9/9 against the real model) or, for a compliant model echo, would
+    have ratified an insertion into the wrong region.
+
+    The fix is the one-vocabulary rule (CLAUDE.md — declarative, no
+    per-format branches): when the file's grammar resolves, the snippet's
+    definitions are read with the file's own format spec
+    (:func:`_snippet_definition_names`); only grammar-less files keep the
+    legacy regex answer (nothing better exists there, and the AST-less
+    branch never reaches the insertion decision anyway).
+
+    Accepted asymmetry, documented: a document-format snippet that
+    genuinely adds a new section/element may now still fall through to
+    the conservative whole-file region, because the legacy temp-file
+    parser behind :func:`_find_insertion_region` only knows code
+    definitions. Missing a tight chunk is safe; inventing a wrong-region
+    one was not.
+    """
+    if language:
+        names = _snippet_definition_names(snippet, language)
+        if names is not None:
+            return any(name not in existing_names for name in names)
+    return any(
+        name not in existing_names for name in _regex_extract_names(snippet)
+    )
+
+
 def _top_level_extras(
     snippet: str, language: str | None, target: str
 ) -> list[str]:
@@ -175,7 +272,27 @@ def _top_level_extras(
 
 
 def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
-    """Try to parse a snippet with tldr structure via a temp file."""
+    """Return the definition names a parser sees in ``snippet``.
+
+    B3: the primary parser is fastedit's own in-memory tree-sitter
+    resolver (:func:`get_ast_map_from_source`) — the same authoritative
+    source every AST map in the pipeline uses (B26 rationale: no daemon,
+    no salsa-cache staleness, no temp file), and the only one that knows
+    the data formats (html/xml/json/yaml/css/toml/sql/dockerfile/...)
+    whose symbols B3 wired. The ``tldr structure`` daemon stays as a
+    fallback for the historical surface in case an in-memory map comes
+    back empty for a language the daemon knows.
+    """
+    names: list[str] = []
+    try:
+        from .ast_utils import get_ast_map_from_source
+        nodes = get_ast_map_from_source(snippet, f"snippet{ext}")
+        names = [n.name for n in nodes if n.name]
+    except Exception:  # noqa: BLE001 -- deliberate: parsing arbitrary snippet text must degrade to the next resolver, never raise
+        names = []
+    if names:
+        return names
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)

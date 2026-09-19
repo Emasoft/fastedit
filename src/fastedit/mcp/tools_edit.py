@@ -10,8 +10,14 @@ from typing import Annotated
 from pydantic import Field
 
 from ..data_gen.ast_analyzer import detect_language
-from ..inference.chunked_merge import BatchEdit, batch_chunked_merge, chunked_merge
+from ..inference.chunked_merge import (
+    BatchEdit,
+    _validation_retries_metric,
+    batch_chunked_merge,
+    chunked_merge,
+)
 from ..io_utils import UnsupportedEncodingError, read_source
+from ..lang_attributes import DocxError, build_docx_bytes, read_docx
 from ..update_check import get_update_notice_async
 from .server import ConcurrentModificationError, _atomic_write, mcp
 
@@ -102,6 +108,40 @@ def _concurrent_modification_error() -> str:
     )
 
 
+def _persist_merge(
+    path: Path,
+    merged_code: str,
+    *,
+    backups,
+    encoding: str,
+    expected_stat,
+) -> str | None:
+    """Write the merge result and return an error string on refusal.
+
+    Step D3: ``.docx`` containers go through the adapter — the merged
+    document XML is rebuilt into the zip (every other entry preserved
+    byte-for-byte) and written as BYTES; every other file writes the str
+    content with the codec the file was read with (B23). Both paths keep
+    the B22 backup and the B37 expected-stat guard. Returns ``None`` on
+    success, else the fail-loud error string (corrupt container).
+    """
+    try:
+        if path.suffix.lower() == ".docx":
+            content: str | bytes = build_docx_bytes(path, merged_code)
+        else:
+            content = merged_code
+    except DocxError as e:
+        return f"Error: {e}"
+    try:
+        _atomic_write(
+            path, content, backups=backups, encoding=encoding,
+            expected_stat=expected_stat,
+        )
+    except ConcurrentModificationError:
+        return _concurrent_modification_error()
+    return None
+
+
 @mcp.tool(
     description=(
         "Apply a code edit via tree-sitter AST + a fast local 1.7B merge model.\n"
@@ -134,7 +174,10 @@ def _concurrent_modification_error() -> str:
         "PARSE SAFETY: if the merged output fails a parse check, the edit is refused, "
         "nothing is written, and the response suggests smaller edits. Pass force=True "
         "to override that refusal and write anyway — use only when you intend it. "
-        "force never overrides a hallucination rejection (all chunks rejected)."
+        "force never overrides a hallucination rejection (all chunks rejected). "
+        "Validation is relative (edit-not-correct): a pre-existing syntax error "
+        "elsewhere in the file is preserved, never auto-fixed, and rejected merge "
+        "attempts retry up to FASTEDIT_MAX_RETRIES times (default 8) before refusing."
     ),
 )
 async def fast_edit(
@@ -183,20 +226,43 @@ async def fast_edit(
         # refused here, before the merge (and before tree-sitter). B37: the
         # stat of that same open rides along so the write below can refuse
         # when the file changed on disk in the read-to-write window.
-        try:
-            original_code, encoding, read_stat = read_source(path, return_stat=True)
-        except UnsupportedEncodingError as e:
-            return f"Error: {e}"
+        #
+        # Step D3: ``.docx`` is the ONE suffix with an adapter read/write
+        # path — a zip container, not text, so ``read_source`` (rightly)
+        # refuses it and ``detect_language`` (rightly) cannot resolve it.
+        # The adapter extracts ``word/document.xml`` (strict UTF-8,
+        # fail-loud on corrupt containers via :class:`DocxError`) and the
+        # pipeline edits/validates it as XML; the write side rebuilds the
+        # container around the merged document preserving every other
+        # entry byte-for-byte (``build_docx_bytes``). This is suffix
+        # registration ONLY for the adapter path — no other behavior
+        # changes for any other suffix.
+        is_docx = path.suffix.lower() == ".docx"
+        read_stat = None
+        encoding = "utf-8"
+        if is_docx:
+            try:
+                original_code, read_stat = read_docx(path, return_stat=True)
+            except DocxError as e:
+                return f"Error: {e}"
+            language = "xml"
+        else:
+            try:
+                original_code, encoding, read_stat = read_source(
+                    path, return_stat=True,
+                )
+            except UnsupportedEncodingError as e:
+                return f"Error: {e}"
+            language = detect_language(path)
         snapshots[file_path] = original_code
-        language = detect_language(path)
-        if language is None:
-            return (
-                f"Error: unsupported file type '{path.suffix}'. "
-                "FastEdit supports: .py .js .jsx .ts .tsx .rs .go .java "
-                ".c .h .cpp .cc .cxx .hpp .hh .rb .swift .kt .kts .cs .php "
-                ".ex .exs. "
-                "Use the Edit tool for this file."
-            )
+        # Step D2: ``language=None`` is a SUPPORTED path, not a refusal —
+        # the AST-less structureless pipeline (D1 trait battery + D2 text
+        # anchor windows) edits any strictly-decoded text file. The
+        # pipeline's own gates are the honest support boundary now (the
+        # >150-line no-anchor whole-file gate fails loud with the file's
+        # symbols; the battery refuses unfaithful merges), so the old
+        # extension allowlist here — which made ``.txt``/``.log`` edits
+        # impossible at the door — is gone.
 
         try:
             if needs_model:
@@ -256,19 +322,21 @@ async def fast_edit(
         )
         if chunks_info:
             metrics += f", {chunks_info}"
+        # Step A3: retries consumed by the validation loop surface in the
+        # metrics segment (empty string when none — shape stays stable).
+        metrics += _validation_retries_metric(getattr(result, "retries", 0))
 
         # If all chunks were rejected due to hallucination, don't write garbage
         if _all_chunks_rejected(result):
             return _rejection_refusal(result, metrics)
 
         if getattr(result, "chunks_rejected", 0) > 0:
-            try:
-                _atomic_write(
-                    path, result.merged_code, backups=backups, encoding=encoding,
-                    expected_stat=read_stat,
-                )
-            except ConcurrentModificationError:
-                return _concurrent_modification_error()
+            error = _persist_merge(
+                path, result.merged_code, backups=backups, encoding=encoding,
+                expected_stat=read_stat,
+            )
+            if error:
+                return error
             return _partial_rejection_warning(result, metrics)
 
         # B10: parity with the CLI's _refuse_if_edit_broke_parse — THIS edit
@@ -279,13 +347,12 @@ async def fast_edit(
             return _parse_refusal(file_path, language, metrics)
 
         if language and not result.parse_valid:
-            try:
-                _atomic_write(
-                    path, result.merged_code, backups=backups, encoding=encoding,
-                    expected_stat=read_stat,
-                )
-            except ConcurrentModificationError:
-                return _concurrent_modification_error()
+            error = _persist_merge(
+                path, result.merged_code, backups=backups, encoding=encoding,
+                expected_stat=read_stat,
+            )
+            if error:
+                return error
             return (
                 f"Warning: merged output has parse errors in {language}. "
                 f"Wrote to {file_path} anyway. {metrics}"
@@ -294,13 +361,12 @@ async def fast_edit(
         # B23: write with the codec the file was read with, so untouched
         # bytes (a latin-1 é, a BOM) round-trip exactly. B37: the read-time
         # stat guards against clobbering an external write.
-        try:
-            _atomic_write(
-                path, result.merged_code, backups=backups, encoding=encoding,
-                expected_stat=read_stat,
-            )
-        except ConcurrentModificationError:
-            return _concurrent_modification_error()
+        error = _persist_merge(
+            path, result.merged_code, backups=backups, encoding=encoding,
+            expected_stat=read_stat,
+        )
+        if error:
+            return error
 
         # VAL-M3-001: pre-flight impact note. When replace=<name> and
         # the signature line actually changed, surface the cross-file
@@ -407,15 +473,10 @@ async def fast_batch_edit(
         except UnsupportedEncodingError as e:
             return f"Error: {e}"
         snapshots[file_path] = original_code
+        # Step D2: ``language=None`` rides into the pipeline (the AST-less
+        # structureless path); the pipeline's own gates govern support —
+        # see the note on the fast_edit gate above.
         language = detect_language(path)
-        if language is None:
-            return (
-                f"Error: unsupported file type '{path.suffix}'. "
-                "FastEdit supports: .py .js .jsx .ts .tsx .rs .go .java "
-                ".c .h .cpp .cc .cxx .hpp .hh .rb .swift .kt .kts .cs .php "
-                ".ex .exs. "
-                "Use the Edit tool for this file."
-            )
 
         try:
             if backend_kind == "mlx":
@@ -450,6 +511,9 @@ async def fast_batch_edit(
             f"{result.chunks_used} chunk(s), "
             f"{len(batch)} edit(s)"
         )
+        # Step A3: validation-retry count in the metrics segment (stable
+        # shape when none were consumed).
+        metrics += _validation_retries_metric(getattr(result, "retries", 0))
 
         # Step 18 (B34): same gate order as fast_edit — the fail-loud
         # hallucination refusal first (never force-overridable), then the
@@ -546,6 +610,7 @@ async def fast_multi_edit(
     total_tokens = 0
     total_latency = 0.0
     total_edits = 0
+    total_retries = 0
 
     for fi, file_entry in enumerate(file_edits_list):
         if not isinstance(file_entry, dict):
@@ -579,15 +644,10 @@ async def fast_multi_edit(
             except UnsupportedEncodingError as e:
                 return f"Error on {fp}: {e}"
             snapshots[fp] = original_code
+            # Step D2: ``language=None`` rides into the pipeline (the
+            # AST-less structureless path); the pipeline's own gates govern
+            # support — see the note on the fast_edit gate above.
             language = detect_language(path)
-            if language is None:
-                return (
-                    f"Error: unsupported file type '{path.suffix}' for {fp}. "
-                    "FastEdit supports: .py .js .jsx .ts .tsx .rs .go .java "
-                    ".c .h .cpp .cc .cxx .hpp .hh .rb .swift .kt .kts .cs .php "
-                    ".ex .exs. "
-                    "Use the Edit tool for this file."
-                )
 
             try:
                 if backend_kind == "mlx":
@@ -667,6 +727,8 @@ async def fast_multi_edit(
             # The merge ran either way — its cost stays in the totals.
             total_tokens += result.model_tokens
             total_latency += result.latency_ms
+            # Step A3: retries aggregate into the summary's metrics segment.
+            total_retries += getattr(result, "retries", 0)
 
     tok_per_sec = (
         total_tokens / (total_latency / 1000)
@@ -688,6 +750,7 @@ async def fast_multi_edit(
         f"{header}"
         f"latency: {total_latency:.0f}ms, {tok_per_sec:.0f} tok/s, "
         f"{total_tokens} tokens"
+        f"{_validation_retries_metric(total_retries)}"
     )
     detail = "\n".join(results)
     return f"{summary}\n{detail}"

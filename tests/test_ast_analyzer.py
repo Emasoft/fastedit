@@ -27,7 +27,12 @@ def test_detect_go():
     assert detect_language("main.go") == "go"
 
 def test_detect_unknown():
-    assert detect_language("README.md") is None
+    # B2 triage: README.md is no longer "unknown" — .md maps to the
+    # markdown grammar (a hard dependency). The plain-text path here is
+    # pinned with an extension that has no tree-sitter wheel on PyPI
+    # (probed in B2): reStructuredText.
+    assert detect_language("README.rst") is None
+    assert detect_language("notes.txt") is None
 
 
 # -- Python analysis --

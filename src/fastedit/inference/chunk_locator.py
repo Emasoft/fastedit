@@ -2,6 +2,14 @@
 
 Given a snippet and original file, uses AST analysis to determine the
 minimal chunk(s) that need to be sent to the model.
+
+Step D2 adds the AST-less branch: when no grammar resolves (``.txt``,
+``.log``, any language the resolver honestly cannot parse), the snippet's
+UNIQUE context lines act as anchors and each anchor yields a chunk window
+sized to the measured model context budget (:data:`_MAX_TEXT_CHUNK_LINES`).
+A structureless file of ANY size becomes editable; with no anchor the
+whole-file chunk (and its fail-loud >150-line gate) is kept — nothing
+declares where the edit goes, so the only safe behavior is to refuse.
 """
 
 from __future__ import annotations
@@ -15,15 +23,271 @@ from .ast_utils import (
 )
 from .markers import is_marker_line
 from .snippet_analysis import (
-    _extract_snippet_names,
     _find_import_region,
     _find_insertion_region,
     _find_matching_nodes,
     _has_import_changes,
     _merge_overlapping_regions,
+    _snippet_defines_new_symbols,
 )
 
 _MAX_BLOCK_LINES = 100  # Narrow functions larger than this to sub-blocks
+
+# ---------------------------------------------------------------------------
+# Step D2: AST-less text anchor chunking
+# ---------------------------------------------------------------------------
+
+_MAX_TEXT_CHUNK_LINES = 40
+"""The per-chunk line budget for AST-less text windows.
+
+Token-budget derivation (NO tokenizer dependency — a MEASURED estimate
+from the real fastedit mlx-8bit model, tests/test_real_llm_text_chunks.py
+and the Step A1 probe): the model has a 40 960-token context and A1
+measured a ~150-line prose chunk at ~1 713 prompt tokens, so context
+headroom is not the binding constraint — the model's GENERATION envelope
+is. Measured: a ~400-line window fills the 16 384-token output cap
+without converging (truncated on every attempt); ~120-line windows apply
+the edit but lossily drop or reinvent untouched lines (content-
+faithfulness rejections on every attempt); the measured converging
+envelope for prose merges is the D1 whole-file shape (tests/
+test_real_llm_text.py: a 37-line natural-prose file merges byte-exact).
+40 lines keeps an entry's paragraph plus its neighbours inside that
+envelope (~460 prompt tokens — ~90x context headroom), while larger
+edits simply get more windows. A tokenizer-dependent budget would add a
+model-loading cost to every locate for no measured benefit; the window's
+bytes are re-checked span-locally by the validation battery anyway.
+
+The budget bounds the CONTEXT around an anchor cluster, not the cluster
+itself: a merged window's own anchor span (the lines between the
+snippet's anchors, which marker-bearing gaps may hide content in) is the
+floor — see :func:`_text_anchor_windows`. Two further measured shape
+constraints surfaced by the real-model probes (documented in
+tests/test_real_llm_text_chunks.py): the window the model re-emits must
+not repeat a line within itself (its edges are therefore trimmed to
+content lines — :func:`_trim_window_to_content` — and the corpus's text
+dialect draws stride-disjoint body sentences), and prose merges converge
+for the marker-free insertion shapes while the marker-bearing replace
+idiom echoes the marker at every window size (a model limitation the
+battery rightly rejects — the tests pin the insertion shapes).
+"""
+
+_TEXT_WINDOW_CONTEXT = (_MAX_TEXT_CHUNK_LINES - 1) // 2
+"""Context lines on each side of a single anchor: 199, so one anchor's
+window is exactly :data:`_MAX_TEXT_CHUNK_LINES` - 1 lines before
+clamping to the file bounds."""
+
+_MIN_TEXT_ANCHOR_LENGTH = 4
+"""Minimum stripped length of a snippet line that may anchor a text
+window — mirrors ``text_match._MIN_ANCHOR_LENGTH`` (the existing
+anchor-quality doctrine) so the two matchers cannot disagree about what
+makes a line too short/common to locate anything."""
+
+_TEXT_ANCHOR_TAG = "<text anchor>"
+"""The ``ChunkRegion.matched_nodes`` sentinel marking a D2 text-anchor
+window. ``chunked_merge`` reads it to treat such regions as WINDOW
+chunks even when a window happens to span the whole file: the snippet's
+anchor declared where the edit goes, which is exactly the information
+the >150-line whole-file gate exists to demand. The tag joins the
+existing declarative region vocabulary (``<whole file>``,
+``<unmatched>``, ``<imports>``)."""
+
+
+def _snippet_has_ellipsis(snippet: str) -> bool:
+    """True when the snippet carries a preservation-marker ellipsis.
+
+    The exact predicate :func:`locate_chunks` uses to decide the
+    ``replace=`` narrow; shared with chunked_merge's auto-prepend guard so
+    the two sites can never disagree about when a narrow will engage.
+    """
+    return "... existing code ..." in snippet or "# ..." in snippet
+
+
+def _text_snippet_anchor_lines(
+    snippet: str,
+    original_lines: list[str],
+) -> list[tuple[int, int]]:
+    """Match the snippet's context lines to UNIQUE original lines.
+
+    Returns ``(snippet_line_index, original_line_number)`` pairs (the line
+    number 1-indexed) for every snippet line that names exactly one
+    original line — the anchors a text window can be built around.
+
+    This is deliberately a SIMPLER exact/normalized matcher than the
+    battery's snippet classifier (``chunked_merge._classify_snippet``),
+    not a second copy of it: the classifier decides context-vs-new for
+    MERGE VALIDATION (forward-scanning, cursor-consuming, indent-aware);
+    the matcher here only answers "which snippet lines pinpoint a
+    location", and it does so with the two properties windowing needs:
+
+      * **uniqueness** — the stripped line occurs exactly once in the
+        original. A line with several occurrences cannot locate a window
+        (which occurrence would the edit target?), and picking one would
+        be the duplicated-paragraph trap (the GIGO corpus keeps
+        pre-existing duplicates; a wrong-occurrence window would hand the
+        model the wrong copy). Uniqueness makes the whole class of
+        wrong-occurrence cuts impossible instead of heuristic.
+      * **forward-scan order** — the anchors' original positions are
+        strictly increasing, the SAME binding rule the battery's
+        classifier uses (``_classify_snippet_raw``'s cursor). An anchor
+        the battery could never bind as context would classify as a NEW
+        line and make every merge of the window unfaithful, so it must
+        not anchor a window either: one binding logic, two consumers.
+
+    Blank lines, marker lines (``is_marker_line`` — the shared B15
+    predicate) and lines shorter than :data:`_MIN_TEXT_ANCHOR_LENGTH` are
+    skipped: they carry no locatable content.
+
+    Cost: one O(lines) pass to index the original (first occurrence +
+    duplicate set), then O(1) per snippet line — linear in the file, no
+    parsing, no grammar.
+    """
+    first_index: dict[str, int] = {}
+    duplicated: set[str] = set()
+    for idx, line in enumerate(original_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in first_index:
+            duplicated.add(stripped)
+        else:
+            first_index[stripped] = idx
+
+    anchors: list[tuple[int, int]] = []
+    cursor = 0
+    for si, raw in enumerate(snippet.splitlines()):
+        stripped = raw.strip()
+        if not stripped or is_marker_line(raw):
+            continue
+        if len(stripped) < _MIN_TEXT_ANCHOR_LENGTH:
+            continue
+        if stripped in duplicated:
+            continue
+        idx = first_index.get(stripped)
+        if idx is None or idx < cursor:
+            continue
+        anchors.append((si, idx + 1))  # 1-indexed original line
+        cursor = idx + 1
+    return anchors
+
+
+def _text_anchor_windows(
+    snippet: str,
+    original_lines: list[str],
+) -> list[tuple[int, int]]:
+    """Window regions around the snippet's unique text anchors (Step D2).
+
+    Each anchor yields ``anchor ± :data:`_TEXT_WINDOW_CONTEXT`` clamped to
+    the file; the windows are then merged with the shared
+    :func:`_merge_overlapping_regions` (multiple anchors referencing
+    several regions become several chunks), and every merged region is
+    re-fitted around ITS anchors' span so the
+    :data:`_MAX_TEXT_CHUNK_LINES` budget bounds the context, not the
+    anchors themselves: a cluster of nearby anchors merges into one
+    window that still covers every anchor it owns (and any marker-hidden
+    gap between them) while trimming the surrounding context to the
+    budget. The cluster's own span is the floor — when the snippet's
+    anchors are farther apart than the budget, the window is that span
+    plus whatever context fits, never a cut through the declared edit.
+
+    Each fitted window's edges are then pulled in onto CONTENT lines
+    (:func:`_trim_window_to_content` — a blank paragraph separator at a
+    window edge is the one line the model measurably trims from its
+    re-emitted chunk, corrupting the seam).
+
+    Returns a list of ``(start_line, end_line)`` 1-indexed inclusive
+    regions, empty when the snippet provides no anchor.
+    """
+    anchors = _text_snippet_anchor_lines(snippet, original_lines)
+    if not anchors:
+        return []
+    total_lines = len(original_lines)
+    windows = [
+        (max(1, anchor - _TEXT_WINDOW_CONTEXT),
+         min(total_lines, anchor + _TEXT_WINDOW_CONTEXT))
+        for _si, anchor in anchors
+    ]
+    merged = _merge_overlapping_regions(windows)
+    fitted: list[tuple[int, int]] = []
+    for start, end in merged:
+        cluster = [a for _si, a in anchors if start <= a <= end]
+        lo, hi = min(cluster), max(cluster)
+        fit_ctx = max(0, (_MAX_TEXT_CHUNK_LINES - (hi - lo + 1)) // 2)
+        fitted.append(_trim_window_to_content(
+            max(1, lo - fit_ctx), min(total_lines, hi + fit_ctx),
+            original_lines,
+        ))
+    return fitted
+
+
+def _trim_window_to_content(
+    start: int,
+    end: int,
+    original_lines: list[str],
+) -> tuple[int, int]:
+    """Pull a fitted window's edges in onto CONTENT lines (Step D2 fix).
+
+    Measured (tests/test_real_llm_text_chunks.py, deterministic greedy
+    probes): when the fitted window's first or last line is a BLANK
+    paragraph separator, the model trims that edge blank from its re-emitted
+    chunk — the battery's content view cannot see blanks and its ±1 layout
+    floor absorbs the drift, so the seam corruption flowed through to the
+    file and broke byte-exactness (a paragraph separator vanished at the
+    window edge on every attempt). A window that STARTS and ENDS on content
+    lines removes the edge the model was trimming; the anchors are content
+    lines, so the trim can never cut one.
+
+    The window can only shrink, and only past blanks at its edges; a fully
+    blank window is impossible (every window contains an anchor).
+    """
+    while start <= end and not original_lines[start - 1].strip():
+        start += 1
+    while end >= start and not original_lines[end - 1].strip():
+        end -= 1
+    return (start, end)
+
+
+def _text_window_snippets(
+    snippet: str,
+    windows: list[tuple[int, int]],
+    original_lines: list[str],
+) -> list[str]:
+    """Scope the snippet to each window (one snippet portion per chunk).
+
+    A multi-anchor snippet must not be handed to every window whole: an
+    anchor living in ANOTHER window is not in this chunk, so the battery's
+    classifier would bind it as a NEW line and demand the model insert a
+    duplicate of it. Each snippet line therefore rides with the window of
+    the nearest PRECEDING anchor (markers, blanks and declared new lines
+    belong to the anchor they follow — the same per-anchor grouping the
+    battery's segment builder uses); lines before the first anchor ride
+    with the first anchor's window (a top-of-file insertion declared
+    before the first anchor is that window's leading segment). Windows
+    keep the region order :func:`_text_anchor_windows` produced.
+    """
+    anchors = _text_snippet_anchor_lines(snippet, original_lines)
+    anchor_window: dict[int, int] = {}
+    for si, anchor in anchors:
+        for w_idx, (start, end) in enumerate(windows):
+            if start <= anchor <= end:
+                anchor_window[si] = w_idx
+                break
+    current = anchor_window.get(anchors[0][0], 0) if anchors else 0
+    portions: list[list[str]] = [[] for _ in windows]
+    for si, raw in enumerate(snippet.splitlines(keepends=True)):
+        if si in anchor_window:
+            current = anchor_window[si]
+        portions[min(current, len(windows) - 1)].append(raw)
+    return ["".join(part) for part in portions]
+
+
+def _narrow_will_engage(snippet: str, node_line_count: int) -> bool:
+    """True when ``locate_chunks`` will narrow this ``replace=`` target.
+
+    Mirrors the locator's condition (node larger than ``_MAX_BLOCK_LINES``
+    plus an ellipsis marker): the chunk the model will see is a SUB-BLOCK
+    of the symbol, not the symbol itself.
+    """
+    return node_line_count > _MAX_BLOCK_LINES and _snippet_has_ellipsis(snippet)
 
 # B27: minimum sliding-window content score for trusting a narrow. The old
 # 0.2 accepted windows where four of five lines were NOT in the original —
@@ -58,7 +322,12 @@ def locate_chunks(
 
     Language-agnostic: uses tldr AST analysis (16 languages) with regex fallback.
     Handles single-site edits, multi-site edits, import changes, and
-    targeted insertion via the ``after`` parameter.
+    targeted insertion via the ``after`` parameter. When NO grammar
+    resolves (Step D2), the snippet's unique context lines anchor window
+    chunks sized to the measured model context budget
+    (:data:`_MAX_TEXT_CHUNK_LINES`) — see :func:`_text_anchor_windows`;
+    with no anchor the whole file is one chunk and the caller's
+    whole-file gate applies.
 
     Args:
         snippet: The edit snippet (with or without markers).
@@ -86,13 +355,29 @@ def locate_chunks(
     # is swapped for LF by a same-length, same-position substitution first
     # (tree-sitter counts rows by scanning for "\n"), keeping every returned
     # line number valid against original_lines — the same protection
-    # get_ast_map's LF-normalized temp-file path used to provide.
+    # get_ast_map's LF-normalized temp-file path used to provide. B3: the
+    # caller's `language` hint rides along for extension-unwired languages.
     ast_nodes = get_ast_map_from_source(
-        normalize_bare_cr_for_ast(original_code), file_path,
+        normalize_bare_cr_for_ast(original_code), file_path, language,
     )
 
     if not ast_nodes:
-        # No AST available — use the whole file
+        # Step D2: no grammar resolved — the file is AST-less (``.txt``,
+        # ``.log``, any unresolvable language). The snippet's UNIQUE
+        # context lines are anchors: each yields a window chunk sized to
+        # the measured model context budget, so a structureless file of
+        # ANY size is editable and the model still sees only a slice.
+        # Multiple anchors produce multiple windows (merged per the
+        # shared ``_merge_overlapping_regions``). With NO anchor nothing
+        # declares where the edit goes — no window can be trusted and
+        # only the whole-file chunk remains, whose >150-line gate
+        # (chunked_merge) keeps failing loud for exactly this case.
+        windows = _text_anchor_windows(snippet, original_lines)
+        if windows:
+            return [
+                ChunkRegion(start, end, [_TEXT_ANCHOR_TAG])
+                for start, end in windows
+            ]
         return [ChunkRegion(1, total_lines, ["<whole file>"])]
 
     # If `replace` is specified, find the named symbol's exact line range
@@ -104,7 +389,7 @@ def locate_chunks(
             # If the function is large and the snippet uses ellipsis markers,
             # narrow to just the edited sub-region within the function.
             node_size = target_node.line_end - target_node.line_start + 1
-            has_ellipsis = "... existing code ..." in snippet or "# ..." in snippet
+            has_ellipsis = _snippet_has_ellipsis(snippet)
             if node_size > _MAX_BLOCK_LINES and has_ellipsis:
                 narrowed = _narrow_large_node(
                     target_node, snippet, original_lines,
@@ -150,10 +435,16 @@ def locate_chunks(
     if _has_import_changes(snippet, original_code, language):
         import_region = _find_import_region(original_code, language, ast_nodes)
 
-    # Check for new code insertion (snippet has definitions not in file)
-    snippet_names = _extract_snippet_names(snippet, language)
-    existing_names = {n.name for n in ast_nodes}
-    has_new_defs = any(n not in existing_names for n in snippet_names)
+    # Check for new code insertion (snippet has definitions not in file).
+    # Step D4 defect fix: the decision is made in the FILE's own symbol
+    # vocabulary (:func:`_snippet_defines_new_symbols`) — the old
+    # language-blind regex names fabricated phantom "new definitions" for
+    # document formats (a def line inside a markdown fenced block) and
+    # routed the edit to a tail insertion region that does not contain
+    # the edit target.
+    has_new_defs = _snippet_defines_new_symbols(
+        snippet, language, {n.name for n in ast_nodes},
+    )
 
     insertion = None
     if has_new_defs:
@@ -303,6 +594,20 @@ def _narrow_large_node(
     raw line-count padding was exactly the mid-block cut this function no
     longer performs (same deprecation pattern as ``deterministic_edit``'s
     ``max_drop_gap``).
+
+    C3 fix (wrong-sub-block cut): the cut anchors on the FIRST MATCHED
+    line of the best-scoring window, not on the window's first line. A
+    snippet whose leading lines match nothing at the window position —
+    concretely: ``replace=`` on a >100-line symbol where the auto-prepended
+    signature (see ``chunked_merge``) occupies the window's first slot, or
+    any snippet with leading declared-new lines — used to slide the window
+    one-or-more lines past its true alignment and then anchor the
+    enclosing-block lookup on a bystander line, cutting the WRONG
+    sub-block of the large node (found by the C3 deep-nesting stress: the
+    model was handed block A while the snippet edited block B, and every
+    attempt was rejected to exhaustion). Anchoring on the first matched
+    line is a no-op for snippets whose first line is a real context match
+    (the whole-symbol wrap shapes).
     """
     node_size = node.line_end - node.line_start + 1
     if node_size <= max_lines:
@@ -322,28 +627,36 @@ def _narrow_large_node(
     if not snippet_lines:
         return (node.line_start, node.line_end)
 
-    # Sliding window to find best match position
+    # Sliding window to find best match position. Besides the window's
+    # score, the FIRST MATCHED line inside the best window is tracked: the
+    # cut must anchor on a line the snippet actually aligns with (C3 fix —
+    # see the docstring's wrong-sub-block-cut note), never on a leading
+    # snippet line that matched nothing.
     best_score = 0.0
     best_offset = 0
+    best_first_match = 0
     window = min(len(snippet_lines), 10)
 
     for offset in range(len(node_lines) - window + 1):
         region = [line.rstrip() for line in node_lines[offset:offset + window]]
-        matches = sum(
-            1 for s, r in zip(snippet_lines[:window], region, strict=False)
-            if s.strip() == r.strip()
-        )
-        score = matches / window
+        hit_flags = [
+            s.strip() == r.strip()
+            for s, r in zip(snippet_lines[:window], region, strict=False)
+        ]
+        score = sum(hit_flags) / window
         if score > best_score:
             best_score = score
             best_offset = offset
+            best_first_match = next(
+                (i for i, hit in enumerate(hit_flags) if hit), 0,
+            )
 
     if best_score < _MIN_NARROW_SCORE:
         # B27: a window the snippet barely overlaps is not evidence for
         # ANY location — no confident narrow, keep the whole node.
         return (node.line_start, node.line_end)
 
-    target_line = node.line_start + best_offset
+    target_line = node.line_start + best_offset + best_first_match
 
     # Step 2: cut at the enclosing block's AST node edges (B27). Without
     # something parsed there is no node edge to cut on — a raw-line window

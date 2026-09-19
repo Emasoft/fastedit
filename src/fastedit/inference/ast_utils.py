@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -40,6 +41,11 @@ class ChunkedMergeResult:
     model_tokens: int
     latency_ms: float
     chunks_rejected: int = 0  # chunks rejected due to hallucination
+    # Step A2: validation-retry attempts consumed by the unified
+    # retry-until-valid loop (merge attempts beyond the first per merge
+    # site — whole-file counts as one site, each chunk as one). 0 for
+    # deterministic paths and first-attempt successes.
+    retries: int = 0
 
 
 @dataclass
@@ -78,7 +84,11 @@ class MoveResult:
     new_lines: tuple[int, int]   # new position after move
 
 
-def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
+def get_ast_map_from_source(
+    source_code: str,
+    file_path: str,
+    language: str | None = None,
+) -> list[ASTNode]:
     """In-memory AST map using tree-sitter directly. No disk read, no daemon.
 
     Unlike :func:`get_ast_map`, which shells out to ``tldr structure`` and
@@ -93,20 +103,38 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
     (Rust ``const``, TS/JS ``const``/``let``, etc — whatever a
     ``replace=`` or ``after=`` edit might legitimately target).
 
+    B3: data/config/markup formats get symbols too, from the declarative
+    per-format spec table ``_FORMAT_SYMBOL_SPECS`` (html elements with an
+    id, XML elements, markdown sections, JSON/YAML keys, CSS rule sets,
+    TOML tables, SQL CREATE objects, Dockerfile stages, bash functions).
+    The per-format semantics are documented on that table.
+
     Args:
         source_code: Full source text to parse. Takes precedence over disk.
         file_path: Used only for extension-based language detection.
+        language: B3 explicit language hint, consulted when the file's
+            suffix does not resolve. The all-grammars extra languages
+            (lua, scala, graphql, ...) are deliberately extension-unwired,
+            so a caller that KNOWS the language (the pipeline threads the
+            caller's ``language=`` through) can still get symbol anchoring
+            — the same "resolve when requested explicitly" contract the
+            grammar resolver honors. Wins over suffix detection when both
+            resolve (the caller's explicit statement is authoritative).
 
     Returns:
         A list of :class:`ASTNode` matching :func:`get_ast_map`'s shape.
         Empty list if the language is unsupported or parsing fails.
     """
     from ..data_gen.ast_analyzer import (
+        canonical_language_name,
         detect_language,
         get_parser,
     )
 
-    language = detect_language(file_path)
+    if language is not None:
+        language = canonical_language_name(language)
+    else:
+        language = detect_language(file_path)
     if language is None:
         return []
 
@@ -118,6 +146,10 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
 
     source_bytes = source_code.encode("utf-8")
     root = tree.root_node
+
+    # Step D2 stress: the split-lines view the trailing-blank trim below
+    # scans (one O(lines) pass, shared by every trimmed symbol span).
+    trim_lines: list[str] | None = None
 
     nodes: list[ASTNode] = []
     seen_keys: set[tuple[int, int, str]] = set()
@@ -139,6 +171,19 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
                 return source_bytes[child.start_byte:child.end_byte].decode(
                     "utf-8", errors="replace",
                 )
+        # B3: C/C++ `function_definition` carries the name inside a
+        # `function_declarator` (the `declarator` field), not as a direct
+        # identifier child — descend into it so C/C++ functions surface in
+        # the map instead of being silently dropped as anonymous.
+        for child in node.children:
+            if child.type == "function_declarator":
+                identifier = _first_descendant_of_type(
+                    child, ("identifier", "field_identifier"),
+                )
+                if identifier is not None:
+                    return source_bytes[
+                        identifier.start_byte:identifier.end_byte
+                    ].decode("utf-8", errors="replace")
         return ""
 
     def _add(name: str, kind: str, start: int, end: int, parent: str | None) -> None:
@@ -154,12 +199,55 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
             signature="", parent=parent,
         ))
 
+    def _line_end(node) -> int:
+        """1-indexed last line of ``node`` (B3 end-point rule).
+
+        tree-sitter's ``end_point`` sits AFTER the last byte. A node whose
+        last byte is a newline — markdown sections, TOML tables and YAML
+        block values swallow the blank line(s) before the next construct —
+        lands its end_point at column 0 of the NEXT row, so the naive
+        ``end_point[0] + 1`` reports one line PAST the node and a delete or
+        insert-after spliced from that span eats (or lands inside) the
+        following block. When the end column is 0 the node's real last line
+        is the row before the end point; otherwise the last byte sits on
+        the end row itself.
+        """
+        end_row, end_col = node.end_point
+        return end_row if end_col == 0 else end_row + 1
+
     func_types = _FUNCTION_LIKE_NODE_TYPES.get(language, set())
     class_types = _CLASS_LIKE_NODE_TYPES.get(language, set())
     const_types = _CONST_LIKE_NODE_TYPES.get(language, set())
+    format_spec = _FORMAT_SYMBOL_SPECS.get(language)
 
     def _walk(node, parent_class: str | None) -> None:
+        nonlocal trim_lines
         nt = node.type
+
+        # B3: data/config/markup formats — one declarative spec per
+        # language (see _FORMAT_SYMBOL_SPECS for the per-format symbol
+        # semantics). A matched node is added under its spec's kind and,
+        # when the spec nests symbols, its children are walked with the
+        # symbol as parent so dotted qualification can disambiguate
+        # repeats.
+        if format_spec is not None and nt in format_spec.node_types:
+            name = format_spec.extract(node, language, source_bytes)
+            start = node.start_point[0] + 1
+            end = _line_end(node)
+            if format_spec.trim_trailing_blank_lines:
+                if trim_lines is None:
+                    trim_lines = source_code.splitlines()
+                while end > start and not trim_lines[end - 1].strip():
+                    end -= 1
+            _add(
+                name,
+                format_spec.kind_by_node.get(nt, format_spec.kind),
+                start, end, parent_class,
+            )
+            if format_spec.recurse:
+                for child in node.children:
+                    _walk(child, name if name else parent_class)
+            return
 
         # Python: decorated_definition wraps the real definition. Use its
         # span (which covers the decorators) and the inner definition's name.
@@ -172,7 +260,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
             if inner is not None:
                 name = _identifier_text(inner)
                 start = node.start_point[0] + 1
-                end = node.end_point[0] + 1
+                end = _line_end(node)
                 if inner.type == "class_definition":
                     _add(name, "class", start, end, parent_class)
                     # Recurse inside the class body looking for methods.
@@ -194,7 +282,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
             if _is_elixir_module_node(node, source_bytes):
                 name = _elixir_definition_name(node, source_bytes)
                 start = node.start_point[0] + 1
-                end = node.end_point[0] + 1
+                end = _line_end(node)
                 _add(name, "class", start, end, parent_class)
                 for child in node.children:
                     _walk(child, name)
@@ -202,7 +290,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
             if _is_elixir_function_node(node, source_bytes):
                 name = _elixir_definition_name(node, source_bytes)
                 start = node.start_point[0] + 1
-                end = node.end_point[0] + 1
+                end = _line_end(node)
                 kind = "method" if parent_class else "function"
                 _add(name, kind, start, end, parent_class)
                 return
@@ -212,7 +300,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
         if nt in class_types:
             name = _identifier_text(node)
             start = node.start_point[0] + 1
-            end = node.end_point[0] + 1
+            end = _line_end(node)
             _add(name, "class", start, end, parent_class)
             # Recurse into this class's body so methods/nested classes
             # get populated with parent=<class name>.
@@ -223,7 +311,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
         if nt in func_types:
             name = _identifier_text(node)
             start = node.start_point[0] + 1
-            end = node.end_point[0] + 1
+            end = _line_end(node)
             kind = "method" if parent_class else "function"
             _add(name, kind, start, end, parent_class)
             # Don't recurse into function bodies looking for more defs
@@ -234,7 +322,7 @@ def get_ast_map_from_source(source_code: str, file_path: str) -> list[ASTNode]:
             name = _const_name(node, language, source_bytes)
             if name:
                 start = node.start_point[0] + 1
-                end = node.end_point[0] + 1
+                end = _line_end(node)
                 _add(name, "constant", start, end, parent_class)
             return
 
@@ -273,9 +361,28 @@ _FUNCTION_LIKE_NODE_TYPES: dict[str, set[str]] = {
     "ruby": {"method", "singleton_method"},
     "swift": {"function_declaration", "initializer_declaration"},
     "kotlin": {"function_declaration"},
-    "c_sharp": {"method_declaration", "constructor_declaration"},
+    "c_sharp": {
+        "method_declaration", "constructor_declaration",
+        # B3: a bare C# method (as the direct-swap snippet parse sees it)
+        # is a top-level local function in this grammar. Real local
+        # functions inside method bodies are never reached — the walker
+        # stops at the enclosing method — so this extra kind only serves
+        # top-level functions and snippet parses, which is exactly what
+        # the direct-swap gate needs.
+        "local_function_statement",
+    },
     "php": {"function_definition", "method_declaration"},
     "elixir": {"call"},
+    # B3: shell functions are the addressable symbols of a bash script
+    # (the `name` field is conventional). Variable assignments are
+    # deliberately not symbols — see _FORMAT_SYMBOL_SPECS notes.
+    "bash": {"function_definition"},
+    # B3: all-grammars extra languages sampled by the golden matrix. The
+    # grammar resolver serves them on every install that has the extra;
+    # these rows give their functions symbol semantics so `after=` /
+    # `replace=` anchor on real definitions.
+    "lua": {"function_declaration", "function_definition"},
+    "scala": {"function_definition"},
 }
 
 # Class-like tree-sitter node types per language.
@@ -305,6 +412,8 @@ _CLASS_LIKE_NODE_TYPES: dict[str, set[str]] = {
         "class_declaration", "interface_declaration", "trait_declaration",
     },
     "elixir": {"call"},
+    # B3: scala objects/classes (all-grammars extra, sampled by goldens).
+    "scala": {"object_definition", "class_definition", "trait_definition"},
 }
 
 # Constant/variable declaration node types — anything a caller might name
@@ -330,6 +439,315 @@ _CONST_LIKE_NODE_TYPES: dict[str, set[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# B3: name extractors for the per-format symbol specs below. Each is a pure
+# structural function (node, source_bytes) -> name, registered in a spec —
+# never selected by an if-chain.
+# ---------------------------------------------------------------------------
+
+def _first_child_of_type(node, types: tuple[str, ...]):
+    """First direct child whose type is in ``types``, or None."""
+    for child in node.children:
+        if child.type in types:
+            return child
+    return None
+
+
+def _first_descendant_of_type(node, types: tuple[str, ...]):
+    """First descendant (depth-first) whose type is in ``types``, or None."""
+    for child in node.children:
+        if child.type in types:
+            return child
+        found = _first_descendant_of_type(child, types)
+        if found is not None:
+            return found
+    return None
+
+
+def _node_text(node, source_bytes: bytes) -> str:
+    if node is None:
+        return ""
+    return source_bytes[node.start_byte:node.end_byte].decode(
+        "utf-8", errors="replace",
+    )
+
+
+def _strip_quote_pair(text: str) -> str:
+    """Remove one wrapping pair of matching single/double quotes."""
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _html_element_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of an HTML symbol element: the value of its ``id`` attribute.
+
+    Both the open tag and a self-closing tag carry attributes. An element
+    without an ``id`` gets no name (its node is simply not a symbol).
+    """
+    for container in node.children:
+        if container.type not in ("start_tag", "self_closing_tag"):
+            continue
+        for attr in container.children:
+            if attr.type != "attribute":
+                continue
+            name_node = _first_child_of_type(attr, ("attribute_name",))
+            if _node_text(name_node, source_bytes) != "id":
+                continue
+            value_node = _first_descendant_of_type(attr, ("attribute_value",))
+            return _node_text(value_node, source_bytes)
+    return ""
+
+
+def _xml_element_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of an XML element: its start tag's ``Name`` token."""
+    stag = _first_child_of_type(node, ("STag",))
+    if stag is None:
+        return ""
+    return _node_text(_first_child_of_type(stag, ("Name",)), source_bytes)
+
+
+def _markdown_section_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a markdown section: its heading text (markers stripped).
+
+    Works for ATX (``## Title``) and setext (``Title`` + underline) shapes:
+    both carry the heading text on their first line.
+    """
+    heading = _first_child_of_type(node, ("atx_heading", "setext_heading"))
+    if heading is None:
+        return ""
+    first_line = _node_text(heading, source_bytes).split("\n", 1)[0]
+    return first_line.lstrip("#").strip()
+
+
+def _json_pair_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a JSON pair: its key, unquoted."""
+    key = node.child_by_field_name("key")
+    return _strip_quote_pair(_node_text(key, source_bytes))
+
+
+def _yaml_key_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a YAML block-mapping pair: its key, unquoted."""
+    key = node.child_by_field_name("key")
+    return _strip_quote_pair(_node_text(key, source_bytes))
+
+
+def _css_rule_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a CSS rule set: its full selector text (``.header, .nav``)."""
+    return _node_text(
+        _first_child_of_type(node, ("selectors",)), source_bytes,
+    )
+
+
+_TOML_KEY_TYPES = ("bare_key", "dotted_key", "quoted_key")
+
+
+def _toml_table_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a TOML table: its (possibly dotted) key text."""
+    key = _first_child_of_type(node, _TOML_KEY_TYPES)
+    return _strip_quote_pair(_node_text(key, source_bytes))
+
+
+def _sql_object_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a SQL CREATE statement's object.
+
+    CREATE INDEX names the index with a direct ``identifier`` (its
+    ``object_reference`` child is the ON target); CREATE TABLE/VIEW name
+    the object through an ``object_reference``. Direct identifier first,
+    object_reference fallback — order does the disambiguation.
+    """
+    direct = _first_child_of_type(node, ("identifier",))
+    if direct is not None:
+        return _node_text(direct, source_bytes)
+    ref = _first_descendant_of_type(node, ("object_reference",))
+    if ref is not None:
+        return _node_text(
+            _first_child_of_type(ref, ("identifier",)), source_bytes,
+        )
+    return ""
+
+
+def _dockerfile_stage_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a Dockerfile build stage: its ``AS`` alias, else its image."""
+    alias = _first_child_of_type(node, ("image_alias",))
+    if alias is not None:
+        return _node_text(alias, source_bytes)
+    return _node_text(
+        _first_child_of_type(node, ("image_spec",)), source_bytes,
+    )
+
+
+def _name_field_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a definition node that uses the conventional ``name`` field.
+
+    Falls back to a direct ``name``-typed child for grammars that leave the
+    field untagged (graphql's ``object_type_definition`` carries a bare
+    ``name`` child).
+    """
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        name_node = _first_child_of_type(node, ("name",))
+    return _node_text(name_node, source_bytes)
+
+
+@dataclass(frozen=True)
+class _FormatSymbolSpec:
+    """Declarative symbol semantics for one data/config/markup format.
+
+    Attributes:
+        node_types: tree-sitter node kinds that ARE addressable symbols.
+        kind: the ASTNode.kind label reported for those symbols.
+        extract: name extractor — ``(node, language, source_bytes) -> str``;
+            an empty name means the node is not a symbol after all.
+        recurse: walk the node's children with the symbol as parent so
+            nested symbols qualify (html/xml sections, json/yaml keys).
+        kind_by_node: per-node-kind kind-label overrides (SQL's
+            table/view/index family).
+        trim_trailing_blank_lines: pull the symbol span's END up onto the
+            last CONTENT line. Grammars whose node byte-range swallows the
+            blank separator before the next construct (markdown's
+            ``section`` extends to the next heading) would otherwise make
+            every replace/delete splice eat that separator — a byte of
+            layout the op never declared (Step D2 stress finding: a
+            section replace at 100MB dropped the blank between sections).
+            The trim is content-preserving: blank lines carry no symbol
+            content, and the following construct's own leading layout is
+            untouched.
+    """
+
+    node_types: tuple[str, ...]
+    kind: str
+    extract: Callable[..., str]
+    recurse: bool = False
+    kind_by_node: dict[str, str] = field(default_factory=dict)
+    trim_trailing_blank_lines: bool = False
+
+
+# ---------------------------------------------------------------------------
+# B3: per-format symbol semantics for data/config/markup languages.
+#
+# The function/class/const tables above describe CODE languages. Data and
+# markup formats anchor their edits on DIFFERENT constructs, so each format
+# declares its own symbol semantics here: which tree-sitter node kinds count
+# as an addressable symbol, what the symbol is named, and whether symbols
+# nest (nested symbols get `parent=<enclosing symbol>` so the dotted
+# qualification in _resolve_symbol can disambiguate repeats).
+#
+# Adding a format = one table row (declarative, no walker branches). The
+# chosen semantics per format:
+#
+#   html       an element carrying an `id` attribute; named by the
+#              attribute VALUE. `id` is HTML's naming mechanism — tag names
+#              repeat and address nothing. Elements without an id are
+#              content (still reachable via content anchors). Symbols nest.
+#   xml        every `element`, named by its tag name. XML has no other
+#              addressable construct; sibling repeats are refused as
+#              ambiguous by _resolve_symbol (fail loud, never first-match).
+#              Symbols nest (parent = enclosing element name).
+#   markdown   `section` (heading + its body), named by the heading text.
+#              Sections nest; a section's span covers its subsections, so
+#              replace=/delete= of a parent section takes them with it —
+#              target leaf sections for member edits.
+#   json       `pair` (key: value), named by the key. Nested objects'
+#              pairs become nested symbols (parent = enclosing key).
+#   yaml       `block_mapping_pair`, named by the key (quotes stripped).
+#              Nested mappings' pairs become nested symbols.
+#   css        `rule_set`, named by its full selector text (`.header`,
+#              `body`, `a:hover`). Rules inside @media blocks are found by
+#              structural descent; @media itself is a container, not a
+#              symbol.
+#   toml       `table`/`table_array_element`, named by the key text
+#              (dotted keys stay dotted, e.g. `tool.pytest`). Top-level
+#              bare pairs are deliberately NOT symbols: the table is the
+#              TOML addressing unit.
+#   sql        CREATE statements that define a schema object
+#              (create_table/view/materialized_view/index), named by the
+#              object name; DML (SELECT/INSERT/UPDATE) is an operation, not
+#              a definition, and is never a symbol.
+#   dockerfile `from_instruction` (a build stage), named by its `AS` alias
+#              when present, else by its image spec. Non-FROM instructions
+#              are steps, not symbols.
+#   graphql    (all-grammars extra, sampled by the goldens) schema type
+#              definitions (object/interface/enum/union/input/scalar),
+#              named by their `name` field.
+#   bash       (in _FUNCTION_LIKE_NODE_TYPES) `function_definition`.
+#              Shell variable assignments are deliberately not symbols.
+# ---------------------------------------------------------------------------
+_FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
+    "html": _FormatSymbolSpec(
+        node_types=("element",),
+        kind="element",
+        extract=_html_element_name,
+        recurse=True,
+    ),
+    "xml": _FormatSymbolSpec(
+        node_types=("element",),
+        kind="element",
+        extract=_xml_element_name,
+        recurse=True,
+    ),
+    "markdown": _FormatSymbolSpec(
+        node_types=("section",),
+        kind="section",
+        extract=_markdown_section_name,
+        recurse=True,
+        trim_trailing_blank_lines=True,
+    ),
+    "json": _FormatSymbolSpec(
+        node_types=("pair",),
+        kind="key",
+        extract=_json_pair_name,
+        recurse=True,
+    ),
+    "yaml": _FormatSymbolSpec(
+        node_types=("block_mapping_pair",),
+        kind="key",
+        extract=_yaml_key_name,
+        recurse=True,
+    ),
+    "css": _FormatSymbolSpec(
+        node_types=("rule_set",),
+        kind="rule",
+        extract=_css_rule_name,
+    ),
+    "toml": _FormatSymbolSpec(
+        node_types=("table", "table_array_element"),
+        kind="table",
+        extract=_toml_table_name,
+    ),
+    "sql": _FormatSymbolSpec(
+        node_types=(
+            "create_table", "create_view", "create_materialized_view",
+            "create_index",
+        ),
+        kind="table",
+        kind_by_node={
+            "create_table": "table",
+            "create_view": "view",
+            "create_materialized_view": "view",
+            "create_index": "index",
+        },
+        extract=_sql_object_name,
+    ),
+    "dockerfile": _FormatSymbolSpec(
+        node_types=("from_instruction",),
+        kind="stage",
+        extract=_dockerfile_stage_name,
+    ),
+    # B3: all-grammars extra, sampled by the golden matrix. Schema type
+    # definitions are the addressable symbols of a GraphQL document.
+    "graphql": _FormatSymbolSpec(
+        node_types=(
+            "object_type_definition", "interface_type_definition",
+            "enum_type_definition", "union_type_definition",
+            "input_object_type_definition", "scalar_type_definition",
+        ),
+        kind="type",
+        extract=_name_field_name,
+    ),
+}
+
+
 def _const_name(node, language: str, source_bytes: bytes) -> str:
     """Extract the declared name from a constant/variable declaration node.
 
@@ -347,24 +765,49 @@ def _const_name(node, language: str, source_bytes: bytes) -> str:
         )
 
     # TS/JS lexical_declaration: variable_declarator -> identifier.
+    # B3: c_sharp field_declaration wraps its declarator one level deeper
+    # (variable_declaration -> variable_declarator -> identifier), so the
+    # declarator scan descends through that wrapper too.
     for child in node.children:
-        if child.type in ("variable_declarator", "init_declarator"):
-            for gc in child.children:
+        declarators = (
+            [child] if child.type in ("variable_declarator", "init_declarator")
+            else (
+                [gc for gc in child.children if gc.type == "variable_declarator"]
+                if child.type == "variable_declaration" else []
+            )
+        )
+        for declarator in declarators:
+            for gc in declarator.children:
                 if gc.type in ("identifier", "property_identifier"):
                     return source_bytes[gc.start_byte:gc.end_byte].decode(
                         "utf-8", errors="replace",
                     )
 
     # Kotlin property_declaration: has a `variable_declaration` child
-    # which contains a `simple_identifier`.
+    # which contains a `simple_identifier` (older grammars) or a bare
+    # `identifier` (current tree-sitter-kotlin).
     if language == "kotlin":
         for child in node.children:
             if child.type == "variable_declaration":
                 for gc in child.children:
-                    if gc.type == "simple_identifier":
+                    if gc.type in ("simple_identifier", "identifier"):
                         return source_bytes[gc.start_byte:gc.end_byte].decode(
                             "utf-8", errors="replace",
                         )
+
+    # PHP const_declaration: `const ELEMENT = 10;` — the name sits in a
+    # `const_element` child (its `name` field is untagged in this grammar,
+    # so match the `name`-typed child node).
+    if language == "php":
+        for child in node.children:
+            if child.type == "const_element":
+                name_node = child.child_by_field_name("name")
+                if name_node is None:
+                    name_node = _first_child_of_type(child, ("name",))
+                if name_node is not None:
+                    return source_bytes[
+                        name_node.start_byte:name_node.end_byte
+                    ].decode("utf-8", errors="replace")
 
     # Go var_declaration / const_declaration: descend through var_spec /
     # const_spec to find the identifier.
@@ -758,9 +1201,38 @@ def _resolve_symbol(name: str, ast_nodes: list[ASTNode]) -> ASTNode | None:
     class's name) is not a competitor: the outermost match wins and the
     member stays reachable via its qualified path.
 
+    B3: a node whose FULL name equals the query resolves first. Data and
+    config formats name their symbols with dots baked in (CSS selectors,
+    TOML dotted keys, Elixir dotted aliases), which the dotted-qualification
+    grammar below would mis-split into ancestor segments; an exact literal
+    name is the most specific reading of the query and wins whenever a
+    single distinct symbol carries it. Multiple distinct literal matches are
+    ambiguous (same B25 refusal as bare duplicates).
+
     Returns None when nothing matches — callers keep their existing
     not-found refusal behaviour.
     """
+    # B3 literal pass: one distinct symbol named exactly `name` is it.
+    literal: dict[tuple[str | None, int, int], ASTNode] = {}
+    for node in ast_nodes:
+        if node.name == name:
+            literal.setdefault((node.parent, node.line_start, node.line_end), node)
+    if literal:
+        literal_matches = [
+            n for n in literal.values()
+            if not any(
+                other is not n and _contains_span(other, n)
+                for other in literal.values()
+            )
+        ]
+        if len(literal_matches) == 1:
+            return literal_matches[0]
+        qualified = sorted({_qualified_name(n, ast_nodes) for n in literal_matches})
+        raise ValueError(
+            f"Symbol '{name}' is ambiguous: {len(literal_matches)} definitions "
+            f"match. Qualify it as one of: {', '.join(qualified)}"
+        )
+
     parts = name.split(".")
     leaf = parts[-1]
 

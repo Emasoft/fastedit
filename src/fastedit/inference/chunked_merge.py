@@ -11,9 +11,18 @@ Works across all 16 languages supported by tldr.
 from __future__ import annotations
 
 import itertools
+import os
 import re
+from collections import Counter
 
+from ..lang_attributes import format_for_path
 from ..split_join import detect_line_ending, normalize_line_endings
+from ..text_heuristics import (
+    TOLERANCE_MODEL_PROSE,
+    TextOp,
+    text_traits,
+    validate_text_output,
+)
 
 # --- Re-export all public types and functions for backward compatibility ---
 # All existing `from .inference.chunked_merge import X` imports continue to work.
@@ -30,9 +39,13 @@ from .ast_utils import (  # noqa: F401
     get_ast_map_from_source,
 )
 from .chunk_locator import (  # noqa: F401
+    _MAX_BLOCK_LINES,
+    _TEXT_ANCHOR_TAG,
     _find_enclosing_block,
     _find_enclosing_parent,
     _narrow_large_node,
+    _narrow_will_engage,
+    _text_window_snippets,
     locate_chunks,
 )
 from .indent import (
@@ -70,6 +83,7 @@ from .symbols import (  # noqa: F401
     move_symbol,
 )
 from .text_match import (  # noqa: F401 -- deterministic_edit re-exported
+    _bracket_balance,
     _indent_width,
     _replacement_key,
     deterministic_edit,
@@ -104,6 +118,15 @@ def _snippet_has_target_signature(snippet: str, target_name: str) -> bool:
     modifiers the shared regex does not enumerate (Java/C#/TS ``public``,
     ``private``, ``final``, etc.). Comment-prefixed lines are skipped to
     avoid false positives.
+
+    B3: a final parenthesized-name check recognizes the brace-style
+    function-definition line shapes no keyword pattern covers — bash's
+    ``run_build() {`` and C/C++'s ``int beta(int y) {``. Without it a
+    snippet that DOES restate such a signature is judged signature-less,
+    the AST prepend doubles the line, and the direct-swap gate then
+    declines the unbalanced splice to the model. The check requires the
+    name's parenthesized parameter list to close the line (optionally
+    followed by ``{``), so a call like ``save(x);`` never matches.
     """
     for line in snippet.splitlines():
         stripped = line.lstrip()
@@ -120,6 +143,48 @@ def _snippet_has_target_signature(snippet: str, target_name: str) -> bool:
             )
             if m and m.group(1) == target_name:
                 return True
+            m = re.search(
+                r"(?:^|\s)([A-Za-z_]\w*)\s*\([^)]*\)\s*(?:\{\s*)?$",
+                line.rstrip(),
+            )
+            if m and m.group(1) == target_name:
+                return True
+    return False
+
+
+def _tokens_declare_insertion_only(
+    tokens: list[tuple[str, int | None, str | None]],
+) -> bool:
+    """True when the snippet's own shape declares a scope-introducing edit.
+
+    A NEW line before the FIRST marker that opens a block (ends with ``:``
+    or ``{``) introduces a scope the preserved body must live inside — the
+    canonical wrap_block, or an add-guard. Such a snippet preserves the
+    WHOLE existing body; it is an INSERTION-ONLY op, so the positional
+    deletion fallback must never justify a dropped original in it. (C2
+    stress defect: a wrap snippet's ``with audit_lock:`` counted as front
+    positional capacity, so the model could drop the target's docstring and
+    the validator ratified the mutation — the wrap then "converged" to a
+    body that had silently lost a line.)
+
+    Judged on the CLASSIFIED tokens (not the raw snippet) so a context
+    anchor that happens to end with a colon — a restated ``def foo():``
+    signature line — never triggers it, and on any new line before the
+    marker rather than only the last (an add-guard's ``if not ready:``
+    precedes its ``return``) — both are insertions; neither licenses
+    deletions.
+    """
+    seen_marker = False
+    for kind, _index, value in tokens:
+        if kind == "marker":
+            seen_marker = True
+        elif (
+            kind == "new"
+            and not seen_marker
+            and value
+            and value.endswith((":", "{"))
+        ):
+            return True
     return False
 
 
@@ -202,6 +267,7 @@ def _check_hallucinations(
 
     return 1.0 if _merge_is_faithful(
         orig, merged, tokens, orig_raw, merged_raw,
+        wrap_insertion_only=_tokens_declare_insertion_only(tokens),
     ) else 0.0
 
 
@@ -294,6 +360,59 @@ def _deterministic_result_is_faithful(
     ) == 1.0
 
 
+def _classify_snippet_raw(
+    snippet: str,
+    orig: list[str],
+) -> list[tuple[str, int | None, str | None]]:
+    """The raw-line form of :func:`_classify_snippet` — one binding logic.
+
+    Identical classification (same marker predicate, same context binding,
+    same closer rule) but every token's value is the snippet's RAW line,
+    indent included. The validator consumes the stripped view; the realign
+    protection (C3 seams stress) needs the raw view to recognize the model's
+    verbatim echo of a declared new line.
+    """
+    tokens: list[tuple[str, int | None, str | None]] = []
+    cursor = 0
+    unclosed_opens = _bracket_balance(snippet) > 0
+    for raw in snippet.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if _is_marker_line(raw):
+            tokens.append(("marker", None, None))
+            continue
+        match_idx = None
+        for i in range(cursor, len(orig)):
+            if orig[i] == s:
+                match_idx = i
+                break
+        if match_idx is not None and not (
+            unclosed_opens and _bracket_balance(raw) < 0
+        ):
+            tokens.append(("context", match_idx, raw))
+            cursor = match_idx + 1
+        else:
+            tokens.append(("new", None, raw))
+    return tokens
+
+
+def _declared_new_raw_lines(snippet: str, original_chunk: str) -> list[str]:
+    """The snippet's declared NEW lines, raw (indent included), in order.
+
+    The C3 realign protection: these are the bytes the aligned snippet told
+    the model to insert, so a model echo of them already carries the right
+    indent and the chunk-repair shift must never touch them. Classified with
+    the SAME binding logic the validator uses (:func:`_classify_snippet_raw`)
+    against the chunk the snippet was aligned to.
+    """
+    return [
+        value
+        for kind, _idx, value in _classify_snippet_raw(snippet, _real_lines(original_chunk))
+        if kind == "new" and value is not None
+    ]
+
+
 def _classify_snippet(
     snippet: str,
     orig: list[str],
@@ -312,27 +431,25 @@ def _classify_snippet(
     output realignment and must not copy those rules blindly. Its job is to
     enforce content, multiplicity, and ordering invariants, not reconstruct
     the editor's single chosen output.
+
+    C2 closer rule (the one place the scan looks beyond line content): when
+    the snippet's lines open more brackets than they close (``_bracket_balance
+    > 0``), the snippet declares a NEW block it never closes — so a snippet
+    line that is a pure closer AND matches an unconsumed original closer is
+    the NEW block's closer, not a restatement of the original's. Binding it
+    as context made the validator steal the anchor for the model's newly
+    emitted closer and orphan the original's own surviving closer, which then
+    read as an invention: EVERY faithful model merge of a brace-language
+    wrap_block (``if x { ... } else { ... }``) was rejected on every retry,
+    forever (found by the C2 100MB stress tier; the wrap could never converge
+    — 9/9 attempts rejected — on any ``{``-body language). With the closer
+    declared as a new line, the original closer survives through the shared
+    survivor LCS exactly as the preserve-by-default contract intends.
     """
-    tokens: list[tuple[str, int | None, str | None]] = []
-    cursor = 0
-    for raw in snippet.splitlines():
-        s = raw.strip()
-        if not s:
-            continue
-        if _is_marker_line(raw):
-            tokens.append(("marker", None, None))
-            continue
-        match_idx = None
-        for i in range(cursor, len(orig)):
-            if orig[i] == s:
-                match_idx = i
-                break
-        if match_idx is not None:
-            tokens.append(("context", match_idx, s))
-            cursor = match_idx + 1
-        else:
-            tokens.append(("new", None, s))
-    return tokens
+    return [
+        (kind, idx, value.strip() if value is not None else None)
+        for kind, idx, value in _classify_snippet_raw(snippet, orig)
+    ]
 
 
 def _merge_is_faithful(
@@ -341,6 +458,7 @@ def _merge_is_faithful(
     tokens: list[tuple[str, int | None, str | None]],
     orig_raw: list[str],
     merged_raw: list[str],
+    wrap_insertion_only: bool = False,
 ) -> bool:
     """Check the merge against the per-segment invariants.
 
@@ -349,6 +467,12 @@ def _merge_is_faithful(
     and the merge into aligned leading, internal and trailing segments,
     each validated by :func:`_segment_is_faithful` together with the raw,
     indent-bearing lines behind its stripped content (B14).
+
+    ``wrap_insertion_only`` (C2): a snippet whose own shape declares a
+    genuine wrap_block (:func:`_snippet_declares_wrap`) is an insertion-only
+    op — the positional deletion fallback is disabled for every segment, so
+    a model merge that "wraps" while dropping an original line is rejected
+    instead of ratified.
 
     Anchors are located in the merge through the GLOBAL survivor alignment
     (:func:`_lcs_pair_map`, the same LCS the per-segment survivor check
@@ -382,11 +506,40 @@ def _merge_is_faithful(
         merged_pos.append(found)
         mcursor = found + 1
 
+    # C3: the anchors are surviving originals TOO, and the segments below
+    # only cover the gaps BETWEEN them — an anchor line's own indent was
+    # never checked, so a model that re-indents the context lines themselves
+    # passed the battery and silently corrupted the file (found by the C3
+    # 100MB seams stress: the model shifted half a block's body one tab
+    # deeper into an undeclared scope and the merge was ratified). An
+    # anchor's indent may deviate from the original only when the snippet
+    # DECLARES a scope-introducing line before it (the wrap-completion
+    # tolerance B14 already encodes for survivors); without a declared
+    # scope, an anchor indent shift is corruption and fails the battery.
+    scope_declared = False
+    anchor_rank = 0
+    for t in tokens:
+        if t[0] == "new":
+            if t[2] and t[2].endswith((":", "{")):
+                scope_declared = True
+        elif t[0] == "context":
+            orig_idx = t[1]
+            merged_idx = merged_pos[anchor_rank]
+            if (
+                not scope_declared
+                and _indent_width(orig_raw[orig_idx])
+                != _indent_width(merged_raw[merged_idx])
+            ):
+                return False
+            scope_declared = False
+            anchor_rank += 1
+
     for (
         orig_seg, merged_seg, seg_tokens, orig_seg_raw, merged_seg_raw,
     ) in _build_segments(orig, merged, tokens, anchors, merged_pos, orig_raw, merged_raw):
         if not _segment_is_faithful(
             orig_seg, merged_seg, seg_tokens, orig_seg_raw, merged_seg_raw,
+            wrap_insertion_only=wrap_insertion_only,
         ):
             return False
     return True
@@ -473,6 +626,7 @@ def _segment_is_faithful(
     seg_tokens: list[tuple[str, int | None, str | None]],
     orig_seg_raw: list[str],
     merged_seg_raw: list[str],
+    wrap_insertion_only: bool = False,
 ) -> bool:
     """Validate one segment against the preserve-by-default invariants.
 
@@ -500,9 +654,10 @@ def _segment_is_faithful(
       * **justified deletion** — every original the merge drops is
         justified (see :func:`_deletions_justified`): a unique shared
         ``_replacement_key`` identity, or — only when the segment actually
-        carries a marker — marker-adjacent positional adjacency for an
-        identity-free line. With no marker, identity-free deletions fail
-        closed.
+        carries a marker AND the snippet is not a declared wrap
+        (``wrap_insertion_only``, C2) — marker-adjacent positional
+        adjacency for an identity-free line. With no marker, or in a
+        declared wrap, identity-free deletions fail closed.
     """
     new_all = [t[2] for t in seg_tokens if t[0] == "new"]
     has_marker = any(t[0] == "marker" for t in seg_tokens)
@@ -553,7 +708,7 @@ def _segment_is_faithful(
         ]
     return _deletions_justified(
         orig_seg, deleted, new_all, new_before, new_after,
-        allow_positional=has_marker,
+        allow_positional=has_marker and not wrap_insertion_only,
     )
 
 
@@ -807,44 +962,537 @@ def _real_lines(s: str) -> list[str]:
     return _raw_content_lines(s)[0]
 
 
-def _whole_file_rejection_reason(
+def _error_line_key(
+    span: tuple[int, int, str],
+    text: str,
+) -> tuple[str, str]:
+    """Defect identity key for one parse-error trait: (kind, its line).
+
+    Tree-sitter error recovery can shift an error span's EXTENT when
+    surrounding context changes, but an INHERITED defect sits on a
+    byte-identical line (the preserve-by-default contract keeps untouched
+    regions byte-exact), so "kind + the line the error starts on" is a
+    stable trait identity between the original and the merged texts even
+    when byte offsets shift with the edit's length delta.
+
+    ``text`` MUST be the ``.source`` of the diagnostics the span came from
+    (see :func:`parse_diagnostics`' normalization contract — spans index
+    that copy, and a bare CR would change where lines break).
+    """
+    start = span[0]
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", start)
+    if line_end == -1:
+        line_end = len(text)
+    return (span[2], text[line_start:line_end])
+
+
+def _format_error_spans(
+    spans: list[tuple[int, int, str]],
+    text: str,
+) -> str:
+    """Human-readable one-line rendering of error traits (retry notes)."""
+    parts: list[str] = []
+    for span in spans[:4]:
+        shown = _error_line_key(span, text)[1]
+        if len(shown) > 60:
+            shown = shown[:57] + "..."
+        parts.append(
+            f"{span[2]} at bytes {span[0]}-{span[1]} on line {shown!r}",
+        )
+    if len(spans) > 4:
+        parts.append(f"... and {len(spans) - 4} more")
+    return "; ".join(parts)
+
+
+def merged_is_acceptable(
+    original_diags,
+    merged_diags,
+    edited_spans: list[tuple[int, int]] | tuple[tuple[int, int], ...] = (),
+) -> tuple[bool, str]:
+    """The RELATIVE parse rule (Step A2, req. 9 — EDIT-NOT-CORRECT).
+
+    Grammar/structure detection exists to IDENTIFY traits of the input and
+    compare them to the output — never to correct the source. Acceptance
+    is therefore trait-based, never an absolute well-formedness ideal:
+
+      * **original parses cleanly** → the merged output must parse cleanly
+        too (unchanged pre-A2 behavior for valid inputs). ``edited_spans``
+        does NOT excuse breakage here: an edit that breaks a previously
+        valid file is a regression wherever it lands (req. 9: when the
+        command explicitly replaces malformed text the output must be
+        well-formed — the mirror case below covers broken originals).
+
+      * **original is broken** → the merged output is acceptable iff every
+        error trait it contains is either (a) an INHERITED trait — matched,
+        as a multiset, against the original's own error traits by
+        (kind, containing line) — or (b) inside one of ``edited_spans``,
+        where the op spec governs. Defect REMOVAL is always acceptable
+        (the edit may target the broken text — req. 9's "replace malformed
+        with well-formed" case); defect ADDITION outside the edited spans
+        is not. The battery (:func:`_merge_rejection_reason`) passes NO
+        edited spans: a replacement region is expected to be well-formed,
+        so a new error inside it is retried like any other.
+
+    Defect-identity caveat, by design: the multiset matching cannot tell
+    "the op fixed the defect" from "the model helpfully fixed it" — both
+    REMOVE a trait. Removing an error trait is therefore never a parse-
+    rule violation; a model that mutates untouched content is caught by
+    the CONTENT faithfulness validator (:func:`_check_hallucinations`),
+    which is the mechanism that enforces EDIT-NOT-CORRECT for untouched
+    lines. Conversely the parse rule uniquely catches CONTENT-CLEAN
+    breakage (declared lines interacting with kept lines into invalid
+    syntax), which the line-level validator cannot see.
+
+    Args:
+        original_diags: :class:`ParseDiagnostics` of the original text.
+        merged_diags: :class:`ParseDiagnostics` of the merged text.
+        edited_spans: ``(start, end)`` byte spans (in the MERGED text's
+            coordinates) whose errors the op spec governs. Empty by
+            default.
+
+    Returns:
+        ``(True, "")`` when acceptable, else ``(False, reason)`` with a
+        human-readable reason for the retry note.
+    """
+    if original_diags.is_valid:
+        if merged_diags.is_valid:
+            return True, ""
+        return False, (
+            f"merged output has {len(merged_diags.errors)} parse error(s) "
+            f"the original does not have: "
+            f"{_format_error_spans(merged_diags.errors, merged_diags.source)}"
+        )
+
+    # Original broken: account for every merged error trait.
+    remaining: Counter[tuple[str, str]] = Counter(
+        _error_line_key(span, original_diags.source)
+        for span in original_diags.errors
+    )
+    unexplained: list[tuple[int, int, str]] = []
+    for span in merged_diags.errors:
+        if any(span[0] < end and start < span[1] for start, end in edited_spans):
+            continue  # inside an edited span — the op spec governs there
+        key = _error_line_key(span, merged_diags.source)
+        if remaining.get(key, 0) > 0:
+            remaining[key] -= 1
+        else:
+            unexplained.append(span)
+    if not unexplained:
+        return True, ""
+    return False, (
+        f"merged output introduces {len(unexplained)} new parse error(s) "
+        f"absent from the original: "
+        f"{_format_error_spans(unexplained, merged_diags.source)}"
+    )
+
+
+_STRUCTURELESS_MISS_CACHE: set[str] = set()
+"""Languages the resolver already answered "no grammar" for (memo).
+
+The resolver caches successful resolutions internally but re-raises on
+every failed probe; the battery runs per attempt, so the negative answer
+is memoized here. Purely a cost memo — the honest answer is unchanged.
+"""
+
+
+def _is_structureless_language(language: str | None) -> bool:
+    """True when the file has NO grammar to parse — the D1 trait gate's scope.
+
+    The resolver's honest answer, never a hardcoded language list
+    (CLAUDE.md): ``language=None`` is structureless by definition (the
+    CLI/MCP detect no language for ``.txt``/``.log``/...), and a named
+    language is structureless exactly when :func:`get_language` cannot
+    resolve it (the all-grammars extra absent, an unknown name). For such
+    files the relative parse gate cannot run — the text-trait branch
+    validates instead of the battery crashing on the unresolved grammar.
+    """
+    if not language:
+        return True
+    if language in _STRUCTURELESS_MISS_CACHE:
+        return True
+    try:
+        from ..data_gen.ast_analyzer import get_language
+
+        get_language(language)
+    except Exception:  # noqa: BLE001 -- ANY resolution failure IS the resolver's honest "no grammar" answer; the battery must degrade to the trait gate, never propagate
+        _STRUCTURELESS_MISS_CACHE.add(language)
+        return True
+    return False
+
+
+def _snippet_justifiable_removals(
+    orig: list[str],
+    orig_raw: list[str],
+    raw_tokens: list[tuple[str, int | None, str | None]],
+) -> list[str]:
+    """The original lines this snippet's shape could justify removing.
+
+    The OP-SIDE mirror of :func:`_deletions_justified` — computed from the
+    snippet alone (never from the merge), so the trait oracle can widen its
+    expected floor by exactly the removal capacity the content validator
+    would grant, and by nothing more:
+
+      * **keyed capacity** — an original whose ``_replacement_key`` is
+        shared by exactly one original and exactly one declared new line
+        of the same segment (the unique-identity replacement rule);
+      * **positional capacity** — in a marker-bearing segment only, the
+        marker-adjacent identity-free originals covered by the declared
+        new lines: the first ``front_cap`` / last ``back_cap`` segment
+        lines, where the caps count the identity-free new lines declared
+        before the first / after the last marker. Disabled for a snippet
+        whose own shape declares an insertion-only wrap
+        (:func:`_tokens_declare_insertion_only`) — the same switch the
+        content validator uses.
+
+    Segments are sliced exactly like :func:`_build_segments` (leading,
+    between consecutive anchors, trailing), so per-segment caps match the
+    validator's per-segment justification. The result deliberately
+    over-approximates in one documented way: a positional-capacity line is
+    taken even when it is itself keyed (the validator would route it
+    through the keyed rule) — this only widens the trait floor, never
+    rejects a faithful merge.
+    """
+    anchors = [t[1] for t in raw_tokens if t[0] == "context"]
+
+    # Group the non-context tokens by the anchor they follow (rank -1 =
+    # before the first anchor) — the same partition _build_segments uses.
+    groups: dict[int, list[tuple[str, int | None, str | None]]] = {}
+    rank = -1
+    for t in raw_tokens:
+        if t[0] == "context":
+            rank += 1
+        else:
+            groups.setdefault(rank, []).append(t)
+
+    # The wrap/insertion-only switch is judged on the CLASSIFIED (stripped)
+    # tokens, exactly like the battery's content validator judges it.
+    wrap_only = _tokens_declare_insertion_only([
+        (kind, idx, value.strip() if value is not None else None)
+        for kind, idx, value in raw_tokens
+    ])
+
+    if not anchors:
+        segments: list[tuple[int, int, int]] = [(-1, 0, len(orig))]
+    else:
+        segments = [(-1, 0, anchors[0])]
+        for k in range(len(anchors) - 1):
+            segments.append((k, anchors[k] + 1, anchors[k + 1]))
+        segments.append((len(anchors) - 1, anchors[-1] + 1, len(orig)))
+
+    removable: set[int] = set()
+    for seg_rank, lo, hi in segments:
+        if lo >= hi:
+            continue
+        seg_tokens = groups.get(seg_rank, [])
+        seg_new = [
+            t[2] for t in seg_tokens if t[0] == "new" and t[2] is not None
+        ]
+
+        # Keyed capacity: unique shared identity within the segment.
+        orig_keys = [_replacement_key(orig[i]) for i in range(lo, hi)]
+        orig_key_count: dict[str, int] = {}
+        for key in orig_keys:
+            if key is not None:
+                orig_key_count[key] = orig_key_count.get(key, 0) + 1
+        new_key_count: dict[str, int] = {}
+        for line in seg_new:
+            key = _replacement_key(line)
+            if key is not None:
+                new_key_count[key] = new_key_count.get(key, 0) + 1
+        for offset, key in enumerate(orig_keys):
+            if (
+                key is not None
+                and orig_key_count[key] == 1
+                and new_key_count.get(key, 0) == 1
+            ):
+                removable.add(lo + offset)
+
+        # Positional capacity: marker-adjacent identity-free originals,
+        # capped by the identity-free new lines declared on each side.
+        has_marker = any(t[0] == "marker" for t in seg_tokens)
+        if has_marker and seg_new and not wrap_only:
+            marker_positions = [
+                i for i, t in enumerate(seg_tokens) if t[0] == "marker"
+            ]
+            first_marker, last_marker = (
+                marker_positions[0], marker_positions[-1],
+            )
+            front_cap = sum(
+                1 for t in seg_tokens[:first_marker]
+                if t[0] == "new"
+                and _replacement_key(t[2] or "") is None
+            )
+            back_cap = sum(
+                1 for t in seg_tokens[last_marker + 1:]
+                if t[0] == "new"
+                and _replacement_key(t[2] or "") is None
+            )
+            n = hi - lo
+            for j in range(min(front_cap, n)):
+                removable.add(lo + j)
+            for j in range(min(back_cap, n)):
+                removable.add(hi - 1 - j)
+    return [orig_raw[i] for i in sorted(removable)]
+
+
+def _derived_text_op(
+    original_code: str,
+    snippet: str,
+) -> tuple[TextOp, int, dict[str, int]]:
+    """Derive the op spec a merge snippet declares, for the D1 trait gate.
+
+    The battery knows the original (chunk or whole file), the merged output
+    and the SNIPPET — the snippet is the op spec, so this helper turns it
+    into a :class:`TextOp` plus the two uncertainty terms the trait
+    comparison needs. Returns ``(op, layout_slack, removable_traits)``:
+
+      * ``op`` — an insertion-shaped op whose payload is the snippet's
+        DECLARED new lines, raw and indent included (the same classification
+        the content validator uses, via :func:`_classify_snippet_raw`). A
+        snippet never names the span it replaces, so ``op.removed`` stays
+        empty; the removal capacity is ``removable_traits`` instead.
+      * ``layout_slack`` — the snippet's own blank-line count. The
+        classifier skips blank lines (they carry no comparable content), so
+        a snippet blank is either echoed as new layout or already present
+        among the preserved originals and nothing can tell which; the trait
+        comparison tolerates exactly that much ``lines``/``blank_lines``
+        drift in both directions.
+      * ``removable_traits`` — per-trait size of the span(s) the snippet's
+        shape could justify removing (see
+        :func:`_snippet_justifiable_removals`).
+
+    GRANULARITY (documented approximation): at the whole-file call site the
+    inputs are the FULL original and the FULL snippet, so the trait
+    arithmetic is exact whole-file arithmetic. At the per-chunk call site
+    it is SPAN-LOCAL: the chunk's traits plus the chunk snippet's declared
+    delta — the untouched rest of the file never passes through the battery
+    there, and is protected mechanically by the byte-exact splice. (Step
+    D2's AST-less chunking inherits exactly this span-local contract.)
+    """
+    orig, orig_raw = _raw_content_lines(original_code)
+    raw_tokens = _classify_snippet_raw(snippet, orig)
+    payload_lines = [
+        value for kind, _idx, value in raw_tokens
+        if kind == "new" and value is not None
+    ]
+    payload = "".join(line + "\n" for line in payload_lines)
+    layout_slack = sum(
+        1 for line in snippet.splitlines() if not line.strip()
+    )
+    removable_lines = _snippet_justifiable_removals(orig, orig_raw, raw_tokens)
+    removable_traits = text_traits(
+        "".join(line + "\n" for line in removable_lines),
+    )
+    kind = "insert" if payload else "none"
+    return TextOp(kind=kind, payload=payload), layout_slack, removable_traits
+
+
+def _derived_attribute_changes(original_code: str, snippet: str, fmt: str | None):
+    """Derive the attribute/structure changes a merge snippet declares (D3).
+
+    The D3 mirror of :func:`_derived_text_op`: the SNIPPET is the op spec,
+    so the declared changes are read from it — every attribute-bearing
+    line the snippet states (context anchor or declared new line alike) is
+    a declared trait that must appear in the output, and the lines the
+    snippet's shape could justify removing
+    (:func:`_snippet_justifiable_removals`) excuse the traits they carry.
+    The snippet classification is the SAME one the content validator uses
+    (:func:`_classify_snippet_raw`), so the two gates can never disagree
+    about which lines the op declares.
+    """
+    from ..lang_attributes import declared_changes_from_text
+
+    orig, orig_raw = _raw_content_lines(original_code)
+    raw_tokens = _classify_snippet_raw(snippet, orig)
+    removable_lines = _snippet_justifiable_removals(orig, orig_raw, raw_tokens)
+    return declared_changes_from_text(
+        snippet,
+        "".join(line + "\n" for line in removable_lines),
+        fmt,
+    )
+
+
+def _attribute_rejection_reason(
+    original_code: str,
+    merged_code: str,
+    snippet: str,
+    fmt: str | None,
+) -> str | None:
+    """The D3 language-attribute/structure gate (req. 7 + 9).
+
+    Runs :func:`lang_attributes.attributes_match_expectation` — every
+    original trait must appear in the output verbatim at the same
+    relative position unless the snippet declares its replacement (then
+    the declared value must land exactly), and no undeclared trait may
+    appear. Used BOTH as the battery gate below (span-local inputs on
+    every attempt) and as the final-assembly exact check (whole-file
+    inputs after all chunks splice) — the only assembly-level exact check
+    a multi-window md/html/xml/docx edit has.
+
+    Inert for formats without a spec row (``fmt=None``): a .txt file that
+    happens to contain ``lang=`` text is not judged.
+    """
+    if fmt is None:
+        return None
+    from ..lang_attributes import attributes_match_expectation
+
+    declared = _derived_attribute_changes(original_code, snippet, fmt)
+    ok, reason = attributes_match_expectation(
+        original_code, merged_code, fmt, declared,
+    )
+    if ok:
+        return None
+    return f"merged output failed the language-attribute/structure check ({reason})"
+
+
+def _merge_rejection_reason(
     original_code: str,
     merged_code: str,
     snippet: str,
     language: str | None,
     result_truncated: bool,
+    *,
+    fmt: str | None = None,
 ) -> str | None:
-    """Decide whether a whole-file merge output is usable (B13/B29, Step 11).
+    """The Step A2 validation battery — one gate order for every loop.
 
-    Returns ``None`` when the output may be returned as the merge, else a
-    human-readable reason string. The whole-file branch hands the ENTIRE
-    file to the model, so its output must pass three gates before it may
-    be returned — in order:
+    Replaces the old fixed-structure gates (whole-file B13/B29 check plus
+    the per-chunk truncation/parse/anchor-score ladder) with ONE battery
+    consumed by the unified retry-until-valid loop. Returns ``None`` when
+    the attempt may be spliced/returned, else a human-readable reason
+    string that the loop feeds back to the model via
+    :func:`_append_corrective_note`. Gate order (each short-circuits):
 
       1. the engine's truncation flag (B12) — a length-capped response is
          a partial file even when its payload looks complete;
-      2. parse validity — required whenever the language is known, exactly
-         like every other return path;
-      3. the shared content validator (:func:`_check_hallucinations`) run
-         over the FULL original vs the FULL merge output with the full
-         snippet — the same preserve-by-default contract the per-chunk
-         path is already held to (a dropped unmentioned line, an
-         invention, a reorder, an unjustified deletion or a leaked
-         preservation marker all fail).
+      2. the RELATIVE parse gate (req. 9) — :func:`merged_is_acceptable`
+         compares the merged diagnostics against the ORIGINAL's: a clean
+         original must stay clean; a broken original may only keep its own
+         defects (a preserved pre-existing error is a trait; a new error
+         anywhere is a regression). Never an absolute well-formedness
+         ideal — fastedit validates, it does not correct;
+      3. the shared content validator (:func:`_check_hallucinations`) —
+         preserve-by-default content traits: dropped unmentioned lines,
+         inventions, reorders, unjustified deletions and marker leaks all
+         fail. This is the gate that catches a model "helpfully fixing"
+         untouched content (req. 9's EDIT-NOT-CORRECT corollary);
+      4. the D1 text-trait gate (req. 6, STRUCTURELESS files only) —
+         :func:`validate_text_output` compares the output's CJK-aware
+         count traits against the original's transformed by the op the
+         snippet declares (:func:`_derived_text_op`). Counts come from
+         INPUT + op, never from a "correct text" ideal: preserved garbage
+         (a duplicated paragraph, an unbalanced quote count) passes and an
+         uncommanded change fails. This is the only gate that sees the
+         content view's blind spot — blank/whitespace-only lines — and
+         the byte volume behind its stripped comparisons;
+      5. the D3 language-attribute/structure gate (req. 7 + 9, formats
+         with a declared spec row only — ``fmt`` is derived from the
+         file's suffix) — :func:`_attribute_rejection_reason` requires
+         every original attribute/structure trait (html ``lang``, xml
+         ``xml:lang``, latex babel, rtf ``\\langNNNN``, md fence info +
+         fence/frontmatter state, docx ``w:lang``) to appear in the
+         output verbatim at the same relative position, unless the
+         snippet declares its replacement (then the declared value must
+         land exactly). MALFORMED traits are traits too (req. 9): a
+         broken fence or malformed frontmatter is preserved as-is, and a
+         model that "helpfully" repairs it without declaring the repair
+         fails here like any other unfaithful merge. The same helper is
+         the ASSEMBLY-level exact check for multi-window edits (the
+         final-assembly block calls it with whole-file inputs).
+
+    EXTENSION POINT (Step A2): later steps bolt additional validators on
+    here — a new validator is one more branch returning a reason string;
+    the retry loops themselves never change. (D1 shipped as gate 4 below;
+    D2's AST-less chunking reuses it span-locally per chunk; D3 shipped
+    as gate 5.)
+
+    ``original_code``/``merged_code`` are span-local inputs: the whole-file
+    path passes the FULL file on both sides (the same values the Step 11
+    whole-file gate used — the D1 trait arithmetic is exact there), the
+    per-chunk path passes the chunk text and the merged chunk (the D1
+    arithmetic is span-local — see :func:`_derived_text_op`).
     """
     if result_truncated:
         return "truncated (model hit the token cap)"
-    if language:
-        from ..data_gen.ast_analyzer import validate_parse
-        if not validate_parse(merged_code, language):
-            return f"merged output does not parse as {language}"
+    structureless = _is_structureless_language(language)
+    if not structureless:
+        from ..data_gen.ast_analyzer import parse_diagnostics
+        ok, reason = merged_is_acceptable(
+            parse_diagnostics(original_code, language),
+            parse_diagnostics(merged_code, language),
+        )
+        if not ok:
+            return f"merged output does not parse as {language} ({reason})"
     if _check_hallucinations(original_code, merged_code, snippet) != 1.0:
         return (
             "merged output failed the content-faithfulness check "
             "(preserve-by-default violation: original lines dropped, "
             "invented, reordered or a marker leaked)"
         )
+    if structureless:
+        # D1 gate (req. 6): no grammar → the parse gate cannot run, so the
+        # text-trait oracle validates instead. The op spec is the snippet
+        # (what the model was told to insert), the tolerance is the
+        # model-prose preset, and the snippet's own blank lines plus the
+        # snippet-justifiable removal capacity carry the op-side
+        # uncertainty into the comparison.
+        op, layout_slack, removable = _derived_text_op(
+            original_code, snippet,
+        )
+        ok, reason = validate_text_output(
+            original_code, op, merged_code,
+            tolerance=TOLERANCE_MODEL_PROSE,
+            layout_slack=layout_slack,
+            removable_traits=removable,
+        )
+        if not ok:
+            return f"merged output failed the text-trait check ({reason})"
+    # D3 gate (req. 7 + 9): language attributes and structure traits, for
+    # formats with a declared spec row (suffix-derived). Inert otherwise.
+    attribute_reason = _attribute_rejection_reason(
+        original_code, merged_code, snippet, fmt,
+    )
+    if attribute_reason is not None:
+        return attribute_reason
     return None
+
+
+# Backward-compatible alias: the battery used to be the whole-file gate
+# only (Step 11). The per-chunk loop now runs the same battery.
+_whole_file_rejection_reason = _merge_rejection_reason
+
+_DEFAULT_MAX_VALIDATION_RETRIES = 8
+"""Retry-until-valid budget (req. 5): bounded, loud failure on exhaustion."""
+
+
+def _max_validation_retries(explicit: int | None = None) -> int:
+    """Resolve the unified validation-retry budget (Step A2).
+
+    Precedence: an explicit ``chunked_merge(max_validation_retries=...)``
+    argument wins; otherwise the ``FASTEDIT_MAX_RETRIES`` environment
+    variable (when set to a non-empty integer) overrides the default of
+    :data:`_DEFAULT_MAX_VALIDATION_RETRIES`. Malformed or negative values
+    fail loudly (repo convention — cf. ``FASTEDIT_POOL_SIZE`` being parsed
+    with a bare ``int()``), never silently fall back.
+    """
+    if explicit is not None:
+        if explicit < 0:
+            raise ValueError(
+                "max_validation_retries must be a non-negative integer, "
+                f"got {explicit}",
+            )
+        return explicit
+    raw = os.environ.get("FASTEDIT_MAX_RETRIES")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_VALIDATION_RETRIES
+    value = int(raw)
+    if value < 0:
+        raise ValueError(
+            "FASTEDIT_MAX_RETRIES must be a non-negative integer, "
+            f"got {raw!r}",
+        )
+    return value
 
 
 def _append_corrective_note(snippet: str, reason: str) -> str:
@@ -867,6 +1515,24 @@ def _append_corrective_note(snippet: str, reason: str) -> str:
         "not drop, reorder, summarize or invent code."
     )
     return f"{snippet}\n\n{note}"
+
+
+def _validation_retries_metric(retries: int) -> str:
+    """Render ``ChunkedMergeResult.retries`` for a result message's metrics
+    segment (Step A3).
+
+    Returns ``", N validation retry"/"retries"`` when *retries* is positive
+    and ``""`` otherwise, so callers append it unconditionally and existing
+    message shapes stay byte-stable whenever no retry was consumed. Lives
+    here because this module owns the retry-until-valid loop and its
+    accounting; the MCP tools and the CLI only surface the count — the
+    budget itself (``FASTEDIT_MAX_RETRIES`` / ``max_validation_retries``)
+    is resolved inside :func:`chunked_merge` and needs no caller plumbing.
+    """
+    if retries <= 0:
+        return ""
+    unit = "retry" if retries == 1 else "retries"
+    return f", {retries} validation {unit}"
 
 
 # ---------------------------------------------------------------------------
@@ -1089,10 +1755,32 @@ def _merge_preserve_siblings(
     # newline state is the original's, not the snippet's.
     merged = _normalize_merged_eol(merged, original_code)
 
+    # Step A3: RELATIVE parse gate (req. 9) — the last of the absolute
+    # ``validate_parse`` gates in this module. The edited span is the
+    # ORIGINAL class span in byte offsets: the splice starts at the same
+    # byte (everything before the class is untouched), so the span is valid
+    # in the merged text's coordinates for the region it covers, and the
+    # class body is the op's governed region — the op spec (snippet shell +
+    # verbatim preserved siblings) is what governs error traits inside it.
+    # Outside that span the relative rule still applies unchanged: a clean
+    # original must stay clean, and an error the splice introduces elsewhere
+    # is a regression. A preserved sibling's pre-existing defect is a trait:
+    # inherited by its (kind, line) identity — the class lands where the
+    # absolute gate used to refuse the identical, faithful splice.
     parse_valid = True
     if language:
-        from ..data_gen.ast_analyzer import validate_parse
-        parse_valid = validate_parse(merged, language)
+        from ..data_gen.ast_analyzer import parse_diagnostics
+        class_span_start = len(
+            "".join(original_lines[:class_start - 1]).encode("utf-8"),
+        )
+        class_span_end = class_span_start + len(
+            "".join(original_lines[class_start - 1:class_end]).encode("utf-8"),
+        )
+        parse_valid, _rel_reason = merged_is_acceptable(
+            parse_diagnostics(original_code, language),
+            parse_diagnostics(merged, language),
+            edited_spans=[(class_span_start, class_span_end)],
+        )
         if not parse_valid:
             _log.warning(
                 "preserve_siblings produced parse-invalid output for "
@@ -1200,7 +1888,19 @@ def _extract_signature_via_ast(
                         in (b"{", b"(", b"[")
                     ):
                         end_byte = first.end_byte
-                return src_bytes[node.start_byte:end_byte].decode(
+                # B3: the AST node starts at its first TOKEN — the line's
+                # leading whitespace is not part of the node. Extend the
+                # span back over that whitespace so the prepended signature
+                # keeps the target's own indentation: a class member is
+                # indented, and without this the direct-swap alignment
+                # compensates by shifting the WHOLE snippet (signature plus
+                # body) by the missing columns, mis-indenting every line.
+                start_byte = node.start_byte
+                line_start = source.rfind("\n", 0, start_byte) + 1
+                prefix = source[line_start:start_byte]
+                if prefix and not prefix.strip():
+                    start_byte = line_start
+                return src_bytes[start_byte:end_byte].decode(
                     "utf-8", errors="replace",
                 )
         for child in node.children:
@@ -1232,6 +1932,7 @@ def chunked_merge(
     after: str | None = None,
     replace: str | None = None,
     preserve_siblings: bool = False,
+    max_validation_retries: int | None = None,
 ) -> ChunkedMergeResult:
     """Merge a snippet into a large file using chunked extraction.
 
@@ -1249,9 +1950,21 @@ def chunked_merge(
             the original class but aren't mentioned in the snippet. Lets you
             edit a subset of a class's members without enumerating the rest.
             Only valid with `replace=`; raises ValueError otherwise.
+        max_validation_retries: Step A2 retry-until-valid budget (req. 5):
+            how many RETRY attempts the unified validation loop may spend
+            per merge site (whole-file or per chunk) after the first. None
+            (default) resolves to ``FASTEDIT_MAX_RETRIES`` when set, else
+            8. Every attempt runs the shared battery
+            (:func:`_merge_rejection_reason`: relative parse + content
+            faithfulness); a rejected attempt retries with its failure
+            reason appended to the prompt; exhaustion rejects the site
+            with the existing bookkeeping. Parse validation is RELATIVE
+            (req. 9): a preserved pre-existing defect is a trait, new
+            breakage is not tolerated.
 
     Returns:
-        ChunkedMergeResult with the fully merged file.
+        ChunkedMergeResult with the fully merged file. ``retries`` counts
+        the validation-retry attempts consumed across all sites.
     """
     # preserve_siblings is only meaningful on a `replace=` edit. Fail
     # early and loudly so callers don't silently no-op.
@@ -1276,6 +1989,12 @@ def chunked_merge(
     # _normalize_merged_eol, so no splice site decides it with a hardcoded
     # "\n".
     line_ending = detect_line_ending(original_code)
+
+    # Step D3: the language-attribute/structure spec format is derived ONCE
+    # from the file's suffix and threaded through every battery call (the
+    # whole-file gate, the per-chunk gates and the final-assembly exact
+    # check). ``None`` for formats without a spec row — the gate is inert.
+    attribute_format = format_for_path(file_path)
 
     if preserve_siblings and replace:
         return _merge_preserve_siblings(
@@ -1331,8 +2050,10 @@ def chunked_merge(
         # Parse the in-memory `original_code` (authoritative) instead of
         # shelling out to `tldr structure`, which consults a daemon cache
         # that can return stale line numbers after a recent write. See
-        # `get_ast_map_from_source` for rationale.
-        ast_nodes = get_ast_map_from_source(original_code, file_path)
+        # `get_ast_map_from_source` for rationale. B3: the caller's
+        # `language` rides along as an explicit hint so extension-unwired
+        # languages (all-grammars extras) still get symbol anchoring.
+        ast_nodes = get_ast_map_from_source(original_code, file_path, language)
         anchor_node = _resolve_symbol(after, ast_nodes or [])
         if anchor_node is None:
             available = _qualified_symbol_names(ast_nodes or [])
@@ -1372,10 +2093,24 @@ def chunked_merge(
         # trailing-newline state is enforced in exactly one place.
         merged = _normalize_merged_eol(merged, original_code)
 
+        # Step A3: RELATIVE parse gate (req. 9) — the last of the absolute
+        # ``validate_parse`` gates in this module. This path INSERTS the
+        # snippet and never touches an original byte, so the relative rule
+        # applies directly with NO excused edited span: an insertion cannot
+        # fix a pre-existing error elsewhere, so every original error trait
+        # survives byte-exact and is inherited as a trait, while a malformed
+        # snippet (or its interaction with the kept lines) shows up as a NEW
+        # trait — a regression the insertion zone must answer for, whether
+        # the file was clean or already broken. Refusal style is unchanged:
+        # the result is returned with parse_valid=False (zero-model, no
+        # retry, no exception) and the MCP/CLI write gates refuse it.
         parse_valid = True
         if language:
-            from ..data_gen.ast_analyzer import validate_parse
-            parse_valid = validate_parse(merged, language)
+            from ..data_gen.ast_analyzer import parse_diagnostics
+            parse_valid, _rel_reason = merged_is_acceptable(
+                parse_diagnostics(original_code, language),
+                parse_diagnostics(merged, language),
+            )
 
         _log.info(
             "Fast-path insert after '%s' (L%d): %d snippet lines, 0 model tokens",
@@ -1416,8 +2151,9 @@ def chunked_merge(
         from .text_match import _bracket_balance, deterministic_edit
 
         # In-memory parse (race-free). See comment above the `after:` fast
-        # path for why we do not consult the tldr daemon here.
-        ast_nodes = get_ast_map_from_source(original_code, file_path)
+        # path for why we do not consult the tldr daemon here. B3: the
+        # caller's `language` rides along as an explicit hint.
+        ast_nodes = get_ast_map_from_source(original_code, file_path, language)
         target_node = _resolve_symbol(replace, ast_nodes or [])
         if target_node:
             func_start = target_node.line_start - 1  # 0-indexed
@@ -1449,9 +2185,21 @@ def chunked_merge(
                 "struct", "enum", "trait", "impl", "module",
                 "object", "protocol",
             }
+            node_size = target_node.line_end - target_node.line_start + 1
             if (
                 target_node.kind in _SIGNATURE_KINDS
                 and func_start < len(original_lines)
+                # C3: when the locator will narrow this target to a
+                # sub-block, the signature is OUTSIDE the chunk the model
+                # will see — prepending it makes the snippet declare a line
+                # the merge must not contain (the model echoes the snippet's
+                # first line into its output, the validator rejects, and a
+                # narrowed edit can never converge — found by the C3 100MB
+                # seams stress on every language). The narrow only engages
+                # on marker-bearing snippets, which the deterministic paths
+                # decline anyway, so skipping the prepend here changes no
+                # deterministic behavior.
+                and not _narrow_will_engage(snippet, node_size)
                 and not _snippet_has_target_signature(snippet, replace)
             ):
                 # Multi-line signatures (def foo(\n    a,\n    b,\n):) require
@@ -1497,25 +2245,36 @@ def chunked_merge(
                 # and enforces the original's trailing state at EOF.
                 merged = _normalize_merged_eol(merged, original_code)
 
+                # Step A2: RELATIVE parse gate (req. 9). The original's own
+                # diagnostics are the baseline: a clean original must stay
+                # clean; a broken original accepts its own preserved
+                # defects (EDIT-NOT-CORRECT — the editor must not decline
+                # an unrelated edit, nor may it silently "repair" the
+                # broken region the snippet never mentioned).
                 parse_valid = True
                 if language:
-                    from ..data_gen.ast_analyzer import validate_parse
-                    parse_valid = validate_parse(merged, language)
+                    from ..data_gen.ast_analyzer import parse_diagnostics
+                    parse_valid, _rel_reason = merged_is_acceptable(
+                        parse_diagnostics(original_code, language),
+                        parse_diagnostics(merged, language),
+                    )
 
                 if not parse_valid:
-                    # The splice is content-faithful (nothing deleted) but
-                    # parse-invalid — e.g. a brace-language full-function
+                    # The splice is content-faithful but the RELATIVE parse
+                    # rule rejects it — e.g. a brace-language full-function
                     # snippet whose new body line cannot coexist with the
-                    # kept original body line. Hold the editor's output to
-                    # the same structural standard it applies to partial
-                    # snippets (see the direct-swap gate below): discard it
-                    # and let the qualified direct-swap — or the validated
-                    # model path — produce a writable merge, instead of
-                    # returning output the tool gates would only refuse.
+                    # kept original body line, or (on an already-broken
+                    # file) a splice introducing NEW error traits. Hold the
+                    # editor's output to the same structural standard it
+                    # applies to partial snippets (see the direct-swap gate
+                    # below): discard it and let the qualified direct-swap
+                    # — or the validated model path — produce a writable
+                    # merge, instead of returning output the tool gates
+                    # would only refuse.
                     _log.warning(
                         "Deterministic text-match for replace='%s' produced "
-                        "a parse-invalid merge; discarding it and falling "
-                        "through to direct-swap/model",
+                        "a relatively parse-invalid merge; discarding it "
+                        "and falling through to direct-swap/model",
                         replace,
                     )
                 else:
@@ -1617,10 +2376,17 @@ def chunked_merge(
                     # splice that leaked CR bytes on the batch/multi paths.
                     merged = _normalize_merged_eol(merged, original_code)
 
+                    # Step A2: RELATIVE parse gate (req. 9) — the same
+                    # trait-based standard as the text-match gate above: a
+                    # preserved pre-existing defect is acceptable, new
+                    # breakage is not.
                     parse_valid = True
                     if language:
-                        from ..data_gen.ast_analyzer import validate_parse
-                        parse_valid = validate_parse(merged, language)
+                        from ..data_gen.ast_analyzer import parse_diagnostics
+                        parse_valid, _rel_reason = merged_is_acceptable(
+                            parse_diagnostics(original_code, language),
+                            parse_diagnostics(merged, language),
+                        )
 
                     _log.info(
                         "Direct-swap for replace='%s' (L%d-L%d): "
@@ -1653,12 +2419,31 @@ def chunked_merge(
         [(c.start_line, c.end_line, c.matched_nodes) for c in chunks],
     )
 
+    # Step D2: text-anchor windows are WINDOW chunks even when a window
+    # happens to span the whole file (small file, or anchors closer than
+    # the window budget). The snippet's anchor declared where the edit
+    # goes — exactly the information the whole-file gate below exists to
+    # demand — so such an edit bypasses that gate and runs through the
+    # per-chunk loop like any other chunked edit. Each window gets its
+    # own snippet portion (``_text_window_snippets``): a multi-anchor
+    # snippet must not hand every window the anchors of the others, or
+    # the span-local battery would bind a foreign anchor as a new line
+    # and demand the model duplicate it.
+    text_window_snippets: list[str] | None = None
+    if chunks and all(_TEXT_ANCHOR_TAG in c.matched_nodes for c in chunks):
+        text_window_snippets = _text_window_snippets(
+            snippet, [(c.start_line, c.end_line) for c in chunks],
+            original_code.splitlines(),
+        )
+    is_text_anchor_edit = text_window_snippets is not None
+
     # Reject whole-file merge on large files — model will truncate
     _MAX_WHOLE_FILE_LINES = 150
     is_whole_file = (
         len(chunks) == 1
         and chunks[0].start_line == 1
         and chunks[0].end_line == total_lines
+        and not is_text_anchor_edit
     )
     if is_whole_file and total_lines > _MAX_WHOLE_FILE_LINES:
         # Build a helpful list of available symbols
@@ -1680,6 +2465,10 @@ def chunked_merge(
             f"{sym_hint}"
         )
 
+    # Step A2: resolve the unified retry-until-valid budget once — both the
+    # whole-file path and the per-chunk loop below consume it.
+    max_retries = _max_validation_retries(max_validation_retries)
+
     # If only one chunk covering the whole file, just do a normal merge
     if is_whole_file:
         # B33: one random nonce per merge attempt — the placeholders sent to
@@ -1688,80 +2477,86 @@ def chunked_merge(
         tag_nonce = _new_tag_nonce()
         safe_code = _escape_tags(original_code, tag_nonce)
         safe_snippet = _escape_tags(snippet, tag_nonce)
-        result = merge_fn(safe_code, safe_snippet, language)
-        merged = _unescape_tags(result.merged_code, tag_nonce)
-        # Step 14 (B19/B31): the model's payload is funnelled through the
-        # central normalizer BEFORE the rejection gates below, so the parse
-        # and content validators see the exact bytes that would be written.
-        merged = _normalize_merged_eol(merged, original_code)
 
-        # Step 11 (B13/B29): the whole-file path hands the ENTIRE file to
-        # the model, so its output is validated before it may be returned:
-        # the truncation flag (B12), parse validity when the language is
-        # known, and the shared content validator over the FULL original
-        # vs the FULL merge output — the same preserve-by-default contract
-        # the per-chunk path is held to. A merge that silently drops an
-        # unmentioned original line, invents code or leaks a marker parses
-        # fine; only the content validator can see it.
-        reason = _whole_file_rejection_reason(
-            original_code, merged, snippet, language,
-            getattr(result, "truncated", False),
-        )
+        # Step A2 unified retry-until-valid loop (req. 5 + req. 9). Replaces
+        # the fixed initial-call + single corrective retry: EVERY attempt
+        # runs the same battery (relative parse + content faithfulness; see
+        # _merge_rejection_reason) and a rejected attempt retries with its
+        # failure reason appended to the prompt. The note is rebuilt from
+        # the ORIGINAL snippet each time (one note, latest reason), and the
+        # gate always validates against the ORIGINAL snippet, so the note
+        # itself can never contaminate the gate.
+        attempt_snippet = safe_snippet
+        result = None
+        merged = None
+        reason: str | None = None
+        attempts = 0
+        whole_tokens = 0
+        whole_latency = 0.0
+        for attempt in range(max_retries + 1):
+            result = merge_fn(safe_code, attempt_snippet, language)
+            attempts += 1
+            whole_tokens += result.tokens_generated
+            whole_latency += result.latency_ms
+            merged = _unescape_tags(result.merged_code, tag_nonce)
+            # Step 14 (B19/B31): the model's payload is funnelled through the
+            # central normalizer BEFORE the battery, so the parse and
+            # content validators see the exact bytes that would be written.
+            merged = _normalize_merged_eol(merged, original_code)
+            # Step 11 (B13/B29) battery: the whole-file path hands the ENTIRE
+            # file to the model, so its output is validated before it may be
+            # returned — truncation flag (B12), RELATIVE parse rule (req. 9),
+            # and the shared content validator over the FULL original vs the
+            # FULL merge output.
+            reason = _merge_rejection_reason(
+                original_code, merged, snippet, language,
+                getattr(result, "truncated", False),
+                fmt=attribute_format,
+            )
+            if reason is None:
+                break
+            _log.warning(
+                "Whole-file merge attempt %d/%d rejected: %s",
+                attempt + 1, max_retries + 1, reason,
+            )
+            attempt_snippet = _append_corrective_note(safe_snippet, reason)
 
         if reason is not None:
-            # Single corrective retry — the same one-shot budget the chunk
-            # loop's retry machinery grants. The corrective note rides on
-            # the snippet (merge_fn's only prompt channel); the retry is
-            # validated against the ORIGINAL snippet, so the note itself
-            # can never contaminate the gate.
-            _log.warning(
-                "Whole-file merge %s, retrying once with a corrective note",
-                reason,
+            # Budget exhausted: reject the whole-file merge — no write.
+            # Rejection convention = the chunk loop's: the original file is
+            # kept as merged_code (never the corrupted payload), parse_valid
+            # is forced False (the universal "do not persist this" signal),
+            # and the chunks_rejected/chunks_used accounting makes the
+            # existing MCP/CLI gates refuse the write naturally.
+            _log.error(
+                "Whole-file merge rejected after %d attempt(s) (%s) — "
+                "keeping the original file",
+                attempts, reason,
             )
-            retry = merge_fn(
-                safe_code, _append_corrective_note(safe_snippet, reason),
-                language,
+            return ChunkedMergeResult(
+                merged_code=original_code,
+                parse_valid=False,
+                chunks_used=1,
+                chunk_regions=[(1, total_lines)],
+                model_tokens=whole_tokens,
+                latency_ms=whole_latency,
+                chunks_rejected=1,
+                retries=attempts - 1,
             )
-            retry_merged = _unescape_tags(retry.merged_code, tag_nonce)
-            retry_merged = _normalize_merged_eol(retry_merged, original_code)
-            retry_reason = _whole_file_rejection_reason(
-                original_code, retry_merged, snippet, language,
-                getattr(retry, "truncated", False),
-            )
-            if retry_reason is None:
-                result = retry
-                merged = retry_merged
-            else:
-                # Both attempts unusable: reject the whole-file merge — no
-                # write. Rejection convention = the chunk loop's: the
-                # original file is kept as merged_code (never the
-                # corrupted payload), parse_valid is forced False (the
-                # universal "do not persist this" signal), and the
-                # chunks_rejected/chunks_used accounting makes the
-                # existing MCP/CLI gates refuse the write naturally.
-                _log.error(
-                    "Whole-file merge rejected after retry (%s) — keeping "
-                    "the original file",
-                    retry_reason,
-                )
-                return ChunkedMergeResult(
-                    merged_code=original_code,
-                    parse_valid=False,
-                    chunks_used=1,
-                    chunk_regions=[(1, total_lines)],
-                    model_tokens=result.tokens_generated + retry.tokens_generated,
-                    latency_ms=result.latency_ms + retry.latency_ms,
-                    chunks_rejected=1,
-                )
 
+        # parse_valid is the pipeline's RELATIVE verdict (Step A2): the
+        # battery accepted this output, so it introduces no new structural
+        # breakage — a preserved pre-existing defect does not make it
+        # parse-invalid. Tokens/latency sum EVERY consumed attempt.
         return ChunkedMergeResult(
             merged_code=merged,
-            parse_valid=result.parse_valid,
+            parse_valid=True,
             chunks_used=1,
             chunk_regions=[(1, total_lines)],
-            model_tokens=result.tokens_generated,
-            latency_ms=result.latency_ms,
+            model_tokens=whole_tokens,
+            latency_ms=whole_latency,
             chunks_rejected=0,
+            retries=attempts - 1,
         )
 
     # For multi-chunk edits, split the snippet so each chunk only sees
@@ -1783,10 +2578,12 @@ def chunked_merge(
     result_lines = list(original_lines)
     total_tokens = 0
     total_latency = 0.0
+    total_retries = 0
     rejected_chunks = 0
     chunk_regions = []
 
-    for chunk in reversed(chunks):
+    for rev_pos, chunk in enumerate(reversed(chunks)):
+        chunk_pos = len(chunks) - 1 - rev_pos  # index into `chunks` order
         start_idx = chunk.start_line - 1  # 0-indexed
         end_idx = chunk.end_line           # exclusive
 
@@ -1794,102 +2591,113 @@ def chunked_merge(
         # the ONLY text carrying this nonce, so even a user file containing
         # placeholder-looking strings cannot collide with it.
         tag_nonce = _new_tag_nonce()
-        chunk_text = "".join(original_lines[start_idx:end_idx])
-        chunk_text = _escape_tags(chunk_text, tag_nonce)
+        raw_chunk = "".join(original_lines[start_idx:end_idx])
+        escaped_chunk = _escape_tags(raw_chunk, tag_nonce)
 
-        # Use the appropriate snippet portion for this chunk
-        if len(chunks) > 1 and "<imports>" in chunk.matched_nodes:
+        # Use the appropriate snippet portion for this chunk. Step D2:
+        # text-anchor windows each get the snippet PORTION scoped to their
+        # anchors (computed once, above, in `chunks` order).
+        if text_window_snippets is not None:
+            chunk_snippet = text_window_snippets[chunk_pos]
+        elif len(chunks) > 1 and "<imports>" in chunk.matched_nodes:
             chunk_snippet = import_snippet
         elif len(chunks) > 1:
             chunk_snippet = code_snippet
         else:
             chunk_snippet = snippet
 
-        safe_chunk_snippet = _escape_tags(chunk_snippet, tag_nonce)
-        safe_chunk_snippet = _align_snippet_indent(safe_chunk_snippet, chunk_text)
-        result = merge_fn(chunk_text, safe_chunk_snippet, language)
+        # C3 seams stress: the declared NEW lines are computed from the
+        # ALIGNED snippet — the exact bytes the model is told to insert —
+        # and handed to _realign_output as protected lines, so the chunk
+        # repair's uniform shift restores the model's drifted copy of the
+        # CHUNK without re-indenting the model's verbatim echo of the
+        # declared lines (aligning before escaping is byte-identical: the
+        # tag placeholders never change a line's leading whitespace).
+        #
+        # Step D4: text-anchor window snippets are NOT re-aligned. Their
+        # anchors were matched against the window's own lines and their
+        # declared payload lines carry the file's true indentation — a
+        # uniform shift to the window's base indent (a prose paragraph at
+        # column 0) would distort a fenced code block's deeper indentation
+        # and move the declared payload off its golden bytes.
+        if is_text_anchor_edit:
+            aligned_snippet = chunk_snippet
+        else:
+            aligned_snippet = _align_snippet_indent(chunk_snippet, raw_chunk)
+        protected_new_lines = _declared_new_raw_lines(aligned_snippet, raw_chunk)
 
-        # Retry once on parse failure or a truncated (length-capped)
-        # response (B12) — the same single-retry machinery for both. A
-        # truncated response is error-shaped even when its payload looks
-        # complete; the retry gives the model one clean shot.
-        merged_chunk_code = _unescape_tags(result.merged_code, tag_nonce)
-        result_truncated = getattr(result, "truncated", False)
-        parse_failed = False
-        if language:
-            from ..data_gen.ast_analyzer import validate_parse
-            parse_failed = not validate_parse(merged_chunk_code, language)
-        if result_truncated or parse_failed:
-            _log.warning(
-                "Chunk %d-%d %s, retrying once",
-                chunk.start_line, chunk.end_line,
-                "truncated (model hit the token cap)"
-                if result_truncated else "parse invalid",
+        safe_chunk_snippet = _escape_tags(aligned_snippet, tag_nonce)
+
+        # Step A2 unified retry-until-valid loop (req. 5 + req. 9) — the
+        # SAME loop the whole-file path runs, replacing the old fixed
+        # structure (initial call + one truncation/parse retry + one
+        # anchor-score retry + the <0.5 rejection): every attempt runs the
+        # shared battery (relative parse + content faithfulness; see
+        # _merge_rejection_reason), a rejected attempt retries with its
+        # failure reason appended to the prompt, and only exhaustion
+        # rejects the chunk (existing bookkeeping, original kept). A
+        # truncated result is error-shaped (B12): it can never pass the
+        # battery, so it can never be spliced.
+        prompt_snippet = safe_chunk_snippet
+        result = None
+        merged_chunk_code: str | None = None
+        attempts = 0
+        chunk_tokens = 0
+        chunk_latency = 0.0
+        reason: str | None = None
+        for attempt in range(max_retries + 1):
+            result = merge_fn(escaped_chunk, prompt_snippet, language)
+            attempts += 1
+            chunk_tokens += result.tokens_generated
+            chunk_latency += result.latency_ms
+            candidate = _unescape_tags(result.merged_code, tag_nonce)
+            if not getattr(result, "truncated", False):
+                # Re-align BEFORE validating: the battery must judge the
+                # exact bytes a splice would write (Step 14 doctrine). The
+                # snippet's declared new lines are protected (C3 seams
+                # stress): the repair restores the model's drifted copy of
+                # the CHUNK, never the model's verbatim echo of the bytes
+                # the aligned snippet told it to insert.
+                candidate = _realign_output(
+                    candidate, raw_chunk, protected_lines=protected_new_lines,
+                )
+            # The OP SPEC is the ALIGNED snippet — the exact bytes the
+            # model was told to insert (C3's protected lines come from the
+            # same alignment). Classification is indent-invariant, so the
+            # content gate sees identical tokens either way; the D1 trait
+            # derivation, however, must measure the payload the model
+            # actually echoes, indent included.
+            reason = _merge_rejection_reason(
+                raw_chunk, candidate, aligned_snippet, language,
+                getattr(result, "truncated", False),
+                fmt=attribute_format,
             )
-            retry = merge_fn(chunk_text, safe_chunk_snippet, language)
-            retry_code = _unescape_tags(retry.merged_code, tag_nonce)
-            retry_clean = not getattr(retry, "truncated", False)
-            if language:
-                retry_clean = retry_clean and validate_parse(retry_code, language)
-            if retry_clean:
-                result = retry
-                merged_chunk_code = retry_code
-
-        # B12: a truncated result must NEVER be spliced — the model ran
-        # out of tokens mid-payload, so the best-effort text is a partial
-        # file. After the single retry above, mark the chunk rejected
-        # (existing rejection bookkeeping) and keep the original chunk.
-        if getattr(result, "truncated", False):
-            _log.error(
-                "Chunk %d-%d truncated after retry (model hit the token "
-                "cap) — rejecting edit (keeping original)",
+            if reason is None:
+                merged_chunk_code = candidate
+                break
+            _log.warning(
+                "Chunk %d-%d attempt %d/%d rejected: %s",
                 chunk.start_line, chunk.end_line,
+                attempt + 1, max_retries + 1, reason,
+            )
+            prompt_snippet = _append_corrective_note(safe_chunk_snippet, reason)
+
+        total_tokens += chunk_tokens
+        total_latency += chunk_latency
+        total_retries += attempts - 1
+
+        if merged_chunk_code is None:
+            # Budget exhausted: keep the original chunk unchanged rather
+            # than writing corrupted code to disk (rejection bookkeeping
+            # unchanged; every consumed attempt's tokens are accounted).
+            _log.error(
+                "Chunk %d-%d rejected after %d attempt(s) (%s) — keeping "
+                "the original chunk",
+                chunk.start_line, chunk.end_line, attempts, reason,
             )
             rejected_chunks += 1
-            total_tokens += result.tokens_generated
-            total_latency += result.latency_ms
             chunk_regions.append((chunk.start_line, chunk.end_line))
             continue
-
-        # Re-align output indent to match the original chunk.
-        merged_chunk_code = _realign_output(merged_chunk_code, chunk_text)
-
-        # Check for hallucinations: verify anchor lines survived.
-        # If the model dropped too many original lines, retry once.
-        raw_chunk = _unescape_tags(chunk_text, tag_nonce)
-        anchor_score = _check_hallucinations(raw_chunk, merged_chunk_code, chunk_snippet)
-        if anchor_score < 0.85:
-            _log.warning(
-                "Chunk %d-%d anchor score %.1f%% — retrying (hallucination likely)",
-                chunk.start_line, chunk.end_line, anchor_score * 100,
-            )
-            retry = merge_fn(chunk_text, safe_chunk_snippet, language)
-            retry_code = _unescape_tags(retry.merged_code, tag_nonce)
-            retry_code = _realign_output(retry_code, chunk_text)
-            retry_score = _check_hallucinations(raw_chunk, retry_code, chunk_snippet)
-            if retry_score > anchor_score:
-                merged_chunk_code = retry_code
-                result = retry
-                anchor_score = retry_score
-                _log.info("Retry improved anchor score: %.1f%% → %.1f%%", anchor_score * 100, retry_score * 100)
-            else:
-                _log.info("Retry didn't improve (%.1f%%), keeping original", retry_score * 100)
-
-        # If both attempts failed badly, keep the original chunk unchanged
-        # rather than writing corrupted code to disk.
-        if anchor_score < 0.5:
-            _log.error(
-                "Chunk %d-%d anchor score %.1f%% — rejecting edit (keeping original)",
-                chunk.start_line, chunk.end_line, anchor_score * 100,
-            )
-            rejected_chunks += 1
-            total_tokens += result.tokens_generated
-            total_latency += result.latency_ms
-            chunk_regions.append((chunk.start_line, chunk.end_line))
-            continue
-
-        total_tokens += result.tokens_generated
-        total_latency += result.latency_ms
 
         # A mid-file chunk whose last line lacks a terminator would
         # concatenate onto the following original line at splice time, so
@@ -1912,10 +2720,111 @@ def chunked_merge(
     # the original's.
     merged_code = _normalize_merged_eol(merged_code, original_code)
 
+    # Step A2: final-assembly gate — RELATIVE (req. 9). Each chunk already
+    # passed the battery against its own text; this gate checks the ASSEMBLED
+    # file against the ORIGINAL file's diagnostics: an untouched pre-existing
+    # defect is a preserved trait (parse_valid stays True), while new
+    # breakage introduced anywhere by the assembly is a regression.
     parse_valid = True
     if language:
-        from ..data_gen.ast_analyzer import validate_parse
-        parse_valid = validate_parse(merged_code, language)
+        from ..data_gen.ast_analyzer import parse_diagnostics
+        parse_valid, _rel_reason = merged_is_acceptable(
+            parse_diagnostics(original_code, language),
+            parse_diagnostics(merged_code, language),
+        )
+
+    # Step D2: structureless final-assembly TRAIT gate (req. 6 + 9). The
+    # parse rule above cannot run without a grammar, and the span-local
+    # batteries each saw only their own window — so the ASSEMBLED file is
+    # checked here against the op the FULL snippet declares, with the
+    # EXACT whole-file arithmetic the D1 gate documented
+    # (_derived_text_op on the full original + full snippet: expected =
+    # original traits transformed by the declared op, the tolerance the
+    # model-prose preset, the op-side layout/removal uncertainty the
+    # snippet's own shape carries). This is the gate that catches
+    # assembly-level corruption the per-chunk batteries cannot see — a
+    # double-spliced chunk, a dropped or duplicated window — while a
+    # faithful assembly (byte-exact reverse-order splices of validated
+    # windows) passes by construction.
+    #
+    # A merge with ANY rejected window is refused outright, before the
+    # trait arithmetic even runs: the trait view is the only assembly-
+    # level view a structureless file has, and its tolerance policy
+    # (rightly — it must absorb model seam noise) cannot certify that a
+    # missing window's declared payload is the ONLY thing missing. The
+    # D1 whole-file convention is therefore extended here: the original
+    # file is kept as merged_code (never a silently partial text edit),
+    # parse_valid is forced False (the universal "do not persist this"
+    # signal), and every chunk is reported rejected so the existing
+    # MCP/CLI gates refuse the write naturally.
+    if _is_structureless_language(language):
+        if rejected_chunks:
+            _log.error(
+                "%d/%d window(s) rejected — the structureless assembly gate "
+                "refuses a partial text edit; keeping the original file",
+                rejected_chunks, len(chunks),
+            )
+            return ChunkedMergeResult(
+                merged_code=original_code,
+                parse_valid=False,
+                chunks_used=len(chunks),
+                chunk_regions=list(reversed(chunk_regions)),
+                model_tokens=total_tokens,
+                latency_ms=total_latency,
+                chunks_rejected=len(chunks),
+                retries=total_retries,
+            )
+        op, layout_slack, removable = _derived_text_op(original_code, snippet)
+        ok, trait_reason = validate_text_output(
+            original_code, op, merged_code,
+            tolerance=TOLERANCE_MODEL_PROSE,
+            layout_slack=layout_slack,
+            removable_traits=removable,
+        )
+        if not ok:
+            _log.error(
+                "Final-assembly text-trait check failed (%s) — keeping the "
+                "original file", trait_reason,
+            )
+            return ChunkedMergeResult(
+                merged_code=original_code,
+                parse_valid=False,
+                chunks_used=len(chunks),
+                chunk_regions=list(reversed(chunk_regions)),
+                model_tokens=total_tokens,
+                latency_ms=total_latency,
+                chunks_rejected=len(chunks),
+                retries=total_retries,
+            )
+
+    # Step D3: final-assembly ATTRIBUTE/STRUCTURE gate (req. 7 + 9) — the
+    # EXACT whole-file check the span-local batteries cannot perform: each
+    # window was validated against its own text (whose scans cut mid-
+    # structure by design), so only the assembled file can verify that the
+    # fence/frontmatter STATE and every language attribute survived the
+    # splices exactly as the FULL snippet declared. The refusal convention
+    # mirrors the structureless assembly gate above: the original file is
+    # kept, parse_valid is forced False, and every chunk is reported
+    # rejected so the existing MCP/CLI gates refuse the write naturally.
+    if attribute_format is not None:
+        assembly_reason = _attribute_rejection_reason(
+            original_code, merged_code, snippet, attribute_format,
+        )
+        if assembly_reason is not None:
+            _log.error(
+                "Final-assembly %s — keeping the original file",
+                assembly_reason,
+            )
+            return ChunkedMergeResult(
+                merged_code=original_code,
+                parse_valid=False,
+                chunks_used=len(chunks),
+                chunk_regions=list(reversed(chunk_regions)),
+                model_tokens=total_tokens,
+                latency_ms=total_latency,
+                chunks_rejected=len(chunks),
+                retries=total_retries,
+            )
 
     return ChunkedMergeResult(
         merged_code=merged_code,
@@ -1925,4 +2834,5 @@ def chunked_merge(
         model_tokens=total_tokens,
         latency_ms=total_latency,
         chunks_rejected=rejected_chunks,
+        retries=total_retries,
     )

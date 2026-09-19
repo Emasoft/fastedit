@@ -17,8 +17,8 @@ Contract locked down here:
    write-with-warning behavior, word for word.
 3. Fail-loud refusals are not overridable: ``chunks_rejected >= chunks_used``
    still refuses even with ``force=True``.
-4. Unsupported file types keep their existing refusal (no detected language
-   never reaches the parse gate).
+4. No detected language is the Step-D2 SUPPORTED structureless path: it
+   reaches the merge with ``language=None`` and the parse gate stays inert.
 
 The unit under test is the tool's WRITE GATE, not the merge itself, so
 ``chunked_merge`` is stubbed at the ``tools_edit`` module boundary with a
@@ -120,6 +120,7 @@ def _result(
     parse_valid: bool,
     chunks_used: int = 1,
     chunks_rejected: int = 0,
+    retries: int = 0,
 ) -> ChunkedMergeResult:
     return ChunkedMergeResult(
         merged_code=merged_code,
@@ -129,6 +130,7 @@ def _result(
         model_tokens=12,
         latency_ms=40.0,
         chunks_rejected=chunks_rejected,
+        retries=retries,
     )
 
 
@@ -244,13 +246,25 @@ class TestFastEditParseGate:
             assert "Partial edit applied" in message, message
             assert target.read_text() == merged
 
-    def test_unsupported_file_type_still_refused_as_before(
-        self, tmp_path, monkeypatch,
-    ):
-        """(d) No detected language: the pre-existing unsupported-type
-        refusal stands; nothing is written and the parse gate is inert."""
+    def test_structureless_txt_reaches_the_merge_and_writes(self, tmp_path,
+                                                            monkeypatch):
+        """(d) Step D2: no detected language is the SUPPORTED AST-less path.
+
+        The pre-D2 extension allowlist refused ``.txt`` at the door; since
+        the structureless pipeline exists (D1 trait battery + D2 text
+        anchor windows), ``language=None`` rides into ``chunked_merge`` and
+        an accepted merge is written — the parse gate stays inert (there
+        is no grammar to parse, so ``if language and not parse_valid``
+        never fires; the pipeline's own battery is the gate).
+        """
         _install_fake_mcp(monkeypatch)
-        _stub_merge_result(monkeypatch, _result(PY_BROKEN, parse_valid=False))
+        captured: dict = {}
+
+        def _capture_merge(**kwargs):
+            captured.update(kwargs)
+            return _result("plain text, now edited.\n", parse_valid=True)
+
+        monkeypatch.setattr(tools_edit, "chunked_merge", _capture_merge)
 
         target = tmp_path / "notes.txt"
         target.write_text("plain text\n")
@@ -259,9 +273,11 @@ class TestFastEditParseGate:
             file_path=str(target), edit_snippet="whatever",
         ))
 
-        assert message.startswith("Error"), message
-        assert "unsupported file type" in message, message
-        assert target.read_text() == "plain text\n"
+        assert message.startswith("Applied edit to"), message
+        assert target.read_text() == "plain text, now edited.\n"
+        # The structureless file reached the pipeline with language=None —
+        # the D2 text-anchor path's precondition.
+        assert captured["language"] is None
 
     def test_parse_valid_edit_still_writes_and_reports_applied(
         self, tmp_path, monkeypatch,
@@ -297,3 +313,140 @@ def test_fast_edit_input_schema_documents_force():
     assert force.get("type") == "boolean"
     assert force.get("default") is False
     assert "parse check" in force.get("description", "")
+
+
+# ---------------------------------------------------------------------------
+# Step A3: validation retries surfaced in the metrics segment
+# ---------------------------------------------------------------------------
+
+
+class TestRetryMetricsSuffix:
+    """When a merge consumed validation retries, the metrics segment of the
+    success/warning message says so (`, N validation retries`); with no
+    retries the message shape is byte-stable with pre-A3 output."""
+
+    def test_fast_edit_reports_retries(self, tmp_path, monkeypatch):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        _stub_merge_result(monkeypatch, _result(merged, parse_valid=True, retries=3))
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_edit(
+            file_path=str(target), edit_snippet="x", replace="existing",
+        ))
+
+        assert message.startswith("Applied edit to"), message
+        assert ", 3 validation retries" in message, message
+
+    def test_fast_edit_reports_a_single_retry_in_the_singular(self, tmp_path, monkeypatch):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        _stub_merge_result(monkeypatch, _result(merged, parse_valid=True, retries=1))
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_edit(
+            file_path=str(target), edit_snippet="x", replace="existing",
+        ))
+
+        assert ", 1 validation retry" in message, message
+        assert ", 1 validation retries" not in message, message
+
+    def test_fast_edit_zero_retries_keeps_the_shape_stable(
+        self, tmp_path, monkeypatch,
+    ):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        _stub_merge_result(monkeypatch, _result(merged, parse_valid=True, retries=0))
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_edit(
+            file_path=str(target), edit_snippet="x", replace="existing",
+        ))
+
+        assert message.startswith("Applied edit to"), message
+        assert "validation retr" not in message, message
+
+    def test_fast_batch_edit_reports_retries(self, tmp_path, monkeypatch):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        monkeypatch.setattr(
+            tools_edit, "batch_chunked_merge",
+            lambda *a, **kw: _result(merged, parse_valid=True, retries=2),
+        )
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_batch_edit(
+            file_path=str(target),
+            edits='[{"snippet": "x", "replace": "existing"}]',
+        ))
+
+        assert message.startswith("Applied 1 edits to"), message
+        assert ", 2 validation retries" in message, message
+
+    def test_fast_batch_edit_zero_retries_keeps_the_shape_stable(
+        self, tmp_path, monkeypatch,
+    ):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        monkeypatch.setattr(
+            tools_edit, "batch_chunked_merge",
+            lambda *a, **kw: _result(merged, parse_valid=True, retries=0),
+        )
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_batch_edit(
+            file_path=str(target),
+            edits='[{"snippet": "x", "replace": "existing"}]',
+        ))
+
+        assert message.startswith("Applied 1 edits to"), message
+        assert "validation retr" not in message, message
+
+    def test_fast_multi_edit_aggregates_retries_in_the_summary(
+        self, tmp_path, monkeypatch,
+    ):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        monkeypatch.setattr(
+            tools_edit, "batch_chunked_merge",
+            lambda *a, **kw: _result(merged, parse_valid=True, retries=2),
+        )
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_multi_edit(
+            file_edits=(
+                f'[{{"file_path": "{target}", '
+                f'"edits": [{{"snippet": "x", "replace": "existing"}}]}}]'
+            ),
+        ))
+
+        assert "ok" in message, message
+        assert ", 2 validation retries" in message, message
+
+    def test_fast_multi_edit_zero_retries_keeps_the_shape_stable(
+        self, tmp_path, monkeypatch,
+    ):
+        _install_fake_mcp(monkeypatch)
+        merged = "def existing():\n    return 2\n"
+        monkeypatch.setattr(
+            tools_edit, "batch_chunked_merge",
+            lambda *a, **kw: _result(merged, parse_valid=True, retries=0),
+        )
+
+        target = tmp_path / "mod.py"
+        target.write_text(PY_ORIGINAL)
+        message = _call(tools_edit.fast_multi_edit(
+            file_edits=(
+                f'[{{"file_path": "{target}", '
+                f'"edits": [{{"snippet": "x", "replace": "existing"}}]}}]'
+            ),
+        ))
+
+        assert "ok" in message, message
+        assert "validation retr" not in message, message

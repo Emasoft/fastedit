@@ -10,35 +10,199 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import tree_sitter
 
-# Language module mapping: language name -> tree-sitter package name
-_LANGUAGE_MODULES: dict[str, str] = {
-    "python": "tree_sitter_python",
-    "javascript": "tree_sitter_javascript",
-    "typescript": "tree_sitter_typescript",
-    "tsx": "tree_sitter_typescript",
-    "rust": "tree_sitter_rust",
-    "go": "tree_sitter_go",
-    "java": "tree_sitter_java",
-    "c": "tree_sitter_c",
-    "cpp": "tree_sitter_cpp",
-    "ruby": "tree_sitter_ruby",
-    "swift": "tree_sitter_swift",
-    "kotlin": "tree_sitter_kotlin",
-    "c_sharp": "tree_sitter_c_sharp",
-    "php": "tree_sitter_php",
-    "elixir": "tree_sitter_elixir",
+
+class GrammarUnavailableError(ValueError):
+    """Raised when a language cannot be resolved to a tree-sitter grammar.
+
+    Typed subclass of :class:`ValueError` so existing
+    ``except (ValueError, ...)`` consumers keep working, but callers that
+    want to distinguish "grammar missing" from "bad input" can catch this
+    specifically. The resolver reports truthfully — it NEVER falls back to
+    "no validation"; whether an unresolvable language aborts, degrades, or
+    skips validation is the caller's policy, not the resolver's.
+
+    Attributes:
+        language: The (canonicalized) language name that could not be
+            resolved.
+    """
+
+    def __init__(self, language: str, message: str) -> None:
+        super().__init__(message)
+        self.language = language
+
+
+@dataclass(frozen=True)
+class GrammarSpec:
+    """Declarative resolution recipe for one canonical fastedit language.
+
+    Adding a language whose wheel follows the standard convention requires
+    NO code change at all (see :func:`get_language`'s generic probe); a
+    ``GrammarSpec`` row exists only where the wheel deviates — multi-grammar
+    packages (typescript/javascript/tsx in one wheel, php variants) or
+    unusual entry-point names. For those, ``entries`` are EXACT candidates:
+    the resolver never substitutes a different grammar as a fallback, since
+    e.g. parsing ``.tsx`` with the typescript grammar would mis-parse JSX.
+
+    Attributes:
+        modules: Candidate pip module names, tried in order (imported with
+            :func:`importlib.import_module`).
+        entries: Candidate attribute names inside the first module that
+            yields the grammar — a zero-arg function returning the language
+            capsule (``language()`` / ``language_typescript()``) or a bare
+            capsule constant.
+    """
+
+    modules: tuple[str, ...]
+    entries: tuple[str, ...]
+
+
+# Canonical fastedit language -> how to obtain its tree-sitter grammar.
+# Languages NOT listed here still resolve via the generic convention probe
+# (module ``tree_sitter_<canonical>``, entry ``language()`` /
+# ``language_<canonical>()``), so freshly installed wheels need no edit.
+LANGUAGE_ALIASES: dict[str, GrammarSpec] = {
+    "python": GrammarSpec(
+        modules=("tree_sitter_python",), entries=("language",),
+    ),
+    "javascript": GrammarSpec(
+        modules=("tree_sitter_javascript",), entries=("language",),
+    ),
+    # tree_sitter_typescript ships TWO grammars in one wheel (plus the JS
+    # grammar re-exported by its own wheel): exact entries, no fallback.
+    "typescript": GrammarSpec(
+        modules=("tree_sitter_typescript",), entries=("language_typescript",),
+    ),
+    "tsx": GrammarSpec(
+        modules=("tree_sitter_typescript",), entries=("language_tsx",),
+    ),
+    "rust": GrammarSpec(modules=("tree_sitter_rust",), entries=("language",)),
+    "go": GrammarSpec(modules=("tree_sitter_go",), entries=("language",)),
+    "java": GrammarSpec(modules=("tree_sitter_java",), entries=("language",)),
+    "c": GrammarSpec(modules=("tree_sitter_c",), entries=("language",)),
+    "cpp": GrammarSpec(modules=("tree_sitter_cpp",), entries=("language",)),
+    "ruby": GrammarSpec(modules=("tree_sitter_ruby",), entries=("language",)),
+    "swift": GrammarSpec(modules=("tree_sitter_swift",), entries=("language",)),
+    "kotlin": GrammarSpec(modules=("tree_sitter_kotlin",), entries=("language",)),
+    "c_sharp": GrammarSpec(
+        modules=("tree_sitter_c_sharp",), entries=("language",),
+    ),
+    # tree_sitter_php exposes variant entry points (full PHP with HTML
+    # interleaving vs php_only); ``language`` is the historical generic
+    # name some wheel revisions provide — same full grammar.
+    "php": GrammarSpec(
+        modules=("tree_sitter_php",), entries=("language_php", "language"),
+    ),
+    "elixir": GrammarSpec(
+        modules=("tree_sitter_elixir",), entries=("language",),
+    ),
+    # --- B2 broad grammar set (Step B2): every row below was verified by
+    # importing the wheel and parsing a representative snippet against
+    # tree-sitter 0.25.x before being declared. Rows exist for ALL of them
+    # (not only the multi-grammar wheels) so detect_language()'s promise
+    # keeps a declarative backer and error hints name the right wheel.
+    "html": GrammarSpec(modules=("tree_sitter_html",), entries=("language",)),
+    # tree_sitter_xml ships TWO grammars: the XML document grammar and a
+    # separate DTD grammar. Exact entries — the generic `language` probe
+    # would find neither.
+    "xml": GrammarSpec(
+        modules=("tree_sitter_xml",), entries=("language_xml",),
+    ),
+    "xml_dtd": GrammarSpec(
+        modules=("tree_sitter_xml",), entries=("language_dtd",),
+    ),
+    # tree_sitter_markdown ships the block grammar plus the markdown_inline
+    # sub-grammar used for inline constructs inside block-level nodes. Both
+    # live in the SAME wheel (there is no separate markdown-inline package on
+    # PyPI); the inline entry point is named `inline_language`.
+    "markdown": GrammarSpec(
+        modules=("tree_sitter_markdown",), entries=("language",),
+    ),
+    "markdown_inline": GrammarSpec(
+        modules=("tree_sitter_markdown",), entries=("inline_language",),
+    ),
+    "json": GrammarSpec(modules=("tree_sitter_json",), entries=("language",)),
+    "yaml": GrammarSpec(modules=("tree_sitter_yaml",), entries=("language",)),
+    "css": GrammarSpec(modules=("tree_sitter_css",), entries=("language",)),
+    "bash": GrammarSpec(modules=("tree_sitter_bash",), entries=("language",)),
+    "toml": GrammarSpec(modules=("tree_sitter_toml",), entries=("language",)),
+    "sql": GrammarSpec(modules=("tree_sitter_sql",), entries=("language",)),
+    "dockerfile": GrammarSpec(
+        modules=("tree_sitter_dockerfile",), entries=("language",),
+    ),
+    # --- B2 all-grammars extra: verified wheels that are NOT hard
+    # dependencies. `language="<name>"` resolves when the extra (or the bare
+    # wheel) is installed and raises the typed GrammarUnavailableError with a
+    # pip hint otherwise. No extensions map to these by default: the
+    # EXTENSION_TO_LANGUAGE contract is "resolvable on a DEFAULT install".
+    "scala": GrammarSpec(modules=("tree_sitter_scala",), entries=("language",)),
+    "lua": GrammarSpec(modules=("tree_sitter_lua",), entries=("language",)),
+    "perl": GrammarSpec(modules=("tree_sitter_perl",), entries=("language",)),
+    "julia": GrammarSpec(modules=("tree_sitter_julia",), entries=("language",)),
+    "zig": GrammarSpec(modules=("tree_sitter_zig",), entries=("language",)),
+    "svelte": GrammarSpec(modules=("tree_sitter_svelte",), entries=("language",)),
+    "graphql": GrammarSpec(modules=("tree_sitter_graphql",), entries=("language",)),
+    # tree-sitter-hcl also parses Terraform configuration (HCL is Terraform's
+    # syntax; a `variable`/`resource` block verified parse-clean).
+    "hcl": GrammarSpec(modules=("tree_sitter_hcl",), entries=("language",)),
+    "make": GrammarSpec(modules=("tree_sitter_make",), entries=("language",)),
+    "nix": GrammarSpec(modules=("tree_sitter_nix",), entries=("language",)),
 }
 
-# File extension -> language mapping
+# Alternate spellings (user input, other tools' naming) -> canonical
+# fastedit name. Canonicalization happens BEFORE the parser cache key, so
+# ``csharp`` and ``c_sharp`` share one parser object. Targets must be
+# canonical names present in LANGUAGE_ALIASES.
+LANGUAGE_NAME_ALIASES: dict[str, str] = {
+    "csharp": "c_sharp",
+    "c#": "c_sharp",
+    "golang": "go",
+    "c++": "cpp",
+    # B2: common alternate spellings for the broad grammar set. All targets
+    # are canonical B2 names whose wheels are verified (bash/hcl/dockerfile/
+    # make/graphql) — "terraform"→hcl is honest because the HCL grammar
+    # parses Terraform configuration (probe-verified on a `variable` block).
+    "sh": "bash",
+    "shell": "bash",
+    "zsh": "bash",
+    "docker": "dockerfile",
+    "makefile": "make",
+    "gql": "graphql",
+    "terraform": "hcl",
+    "yml": "yaml",
+}
+
+# Optional aggregate packs, tried as a FALLBACK after the per-language
+# wheels. Never a required dependency: when absent the resolver simply
+# reports :class:`GrammarUnavailableError` instead.
+_LANGUAGE_PACK_MODULES: tuple[str, ...] = (
+    "tree_sitter_languages",
+    "tree_sitter_language_pack",
+)
+
+# File extension -> language mapping. Every value MUST be a canonical name
+# resolvable by :func:`get_language` whose grammar is a HARD dependency —
+# detect_language() promises resolution on a DEFAULT install, so B2 wires
+# only the core-format extensions here. Languages served by the optional
+# ``all-grammars`` extra (scala, lua, perl, julia, zig, svelte, graphql,
+# hcl, make, nix, and every pack-only language) deliberately have NO
+# extension mapping: they resolve when requested explicitly
+# (``language="scala"``) and raise the typed GrammarUnavailableError with a
+# pip hint when the extra is absent — never a silent plain-text fallback
+# for a file fastedit claims to understand.
 EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".py": "python",
     ".js": "javascript",
     ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".rs": "rust",
     ".go": "go",
     ".java": "java",
@@ -49,14 +213,42 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".cxx": "cpp",
     ".hpp": "cpp",
     ".hh": "cpp",
+    ".hxx": "cpp",
     ".rb": "ruby",
     ".swift": "swift",
     ".kt": "kotlin",
     ".kts": "kotlin",
     ".cs": "c_sharp",
     ".php": "php",
+    ".phtml": "php",
+    ".php3": "php",
+    ".php4": "php",
+    ".php5": "php",
     ".ex": "elixir",
     ".exs": "elixir",
+    # --- B2 core formats (hard dependencies; wheel-verified) ---
+    ".html": "html",
+    ".htm": "html",
+    # SVG is XML with namespaced attributes — the XML grammar parses a
+    # representative SVG document with zero error traits (probe-verified).
+    # Same for DTD files via the xml wheel's dedicated DTD sub-grammar.
+    ".xml": "xml",
+    ".svg": "xml",
+    ".dtd": "xml_dtd",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".css": "css",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".toml": "toml",
+    ".sql": "sql",
+    # Extension-only form: bare "Dockerfile" / "Containerfile" carry no
+    # suffix, so detect_language() (suffix-based) cannot see them — the
+    # .dockerfile convention still reaches the grammar.
+    ".dockerfile": "dockerfile",
 }
 
 # AST node types that represent function-like constructs per language
@@ -281,43 +473,198 @@ class FileStructure:
             return "very_complex"
 
 
-# Cache loaded languages
+# Caches — parse calls happen on multi-MB files, so a language and its
+# parser are resolved once per process and reused. Keyed by CANONICAL
+# language name (alias spellings share one entry). Failed resolutions are
+# never cached negatively: installing a grammar mid-process is picked up
+# on the next call.
 _language_cache: dict[str, tree_sitter.Language] = {}
 _parser_cache: dict[str, tree_sitter.Parser] = {}
 
 
+def clear_grammar_caches() -> None:
+    """Drop every cached Language/Parser (used by tests and B2 verification)."""
+    _language_cache.clear()
+    _parser_cache.clear()
+
+
+def canonical_language_name(lang: str) -> str:
+    """Map any accepted spelling to its canonical fastedit language name.
+
+    Handles casing/whitespace and the declared :data:`LANGUAGE_NAME_ALIASES`
+    (``csharp`` → ``c_sharp``, ``golang`` → ``go``, ``c++`` → ``cpp``).
+    Purely lexical — does NOT verify a grammar is actually resolvable.
+    """
+    name = str(lang).strip().lower()
+    return LANGUAGE_NAME_ALIASES.get(name, name)
+
+
+def _grammar_module_candidates(canonical: str) -> tuple[str, ...]:
+    """Candidate pip module names for a canonical language, in try order."""
+    spec = LANGUAGE_ALIASES.get(canonical)
+    if spec is not None:
+        return spec.modules
+    # Generic convention: a wheel named after the language. The no-underscore
+    # variant covers packages that flatten multi-word names
+    # (tree_sitter_<x> where <x> keeps underscores is the dominant form).
+    return (
+        f"tree_sitter_{canonical}",
+        f"tree_sitter_{canonical.replace('_', '')}",
+    )
+
+
+def _grammar_entry_candidates(canonical: str) -> tuple[str, ...]:
+    """Candidate grammar entry-point names, in try order.
+
+    Table'd languages use their declared EXACT entries (never a generic
+    fallback that could silently substitute a different grammar, as with
+    the typescript/tsx split wheel). Table-less languages get the standard
+    wheel conventions.
+    """
+    spec = LANGUAGE_ALIASES.get(canonical)
+    if spec is not None:
+        return spec.entries
+    return ("language", f"language_{canonical}")
+
+
+def _language_from_module(module: object, entry: str) -> tree_sitter.Language | None:
+    """Build a Language from one module attribute, or None if absent.
+
+    Handles the known wheel conventions generically: a zero-arg function
+    returning the language capsule (``language()``, ``language_tsx()``, ...)
+    or a bare capsule/pointer attribute.
+    """
+    attribute = getattr(module, entry, None)
+    if attribute is None:
+        return None
+    capsule = attribute() if callable(attribute) else attribute
+    return tree_sitter.Language(capsule)
+
+
+def _resolve_from_language_pack(canonical: str) -> tree_sitter.Language | None:
+    """Fallback resolver over the optional aggregate grammar packs.
+
+    Tries each declared pack module (``tree_sitter_languages`` or the newer
+    ``tree_sitter_language_pack``) via its ``get_language(name)`` — or
+    ``get_parser(name).language`` when only the parser getter exists.
+    Returns None when no pack is importable or the pack doesn't know the
+    language; never raises for absence.
+    """
+    for pack_name in _LANGUAGE_PACK_MODULES:
+        try:
+            pack = importlib.import_module(pack_name)
+        except ImportError:
+            continue
+        getter = getattr(pack, "get_language", None)
+        if getter is not None:
+            try:
+                obj = getter(canonical)
+            except Exception:  # noqa: BLE001 — pack lookup failure = "not here"
+                obj = None
+            if obj is not None:
+                language_obj = (
+                    obj if isinstance(obj, tree_sitter.Language)
+                    else tree_sitter.Language(obj)
+                )
+                return language_obj
+        parser_getter = getattr(pack, "get_parser", None)
+        if parser_getter is not None:
+            try:
+                pack_parser = parser_getter(canonical)
+            except Exception:  # noqa: BLE001 — pack lookup failure = "not here"
+                pack_parser = None
+            if pack_parser is not None and hasattr(pack_parser, "parse"):
+                language_obj = getattr(pack_parser, "language", None)
+                if isinstance(language_obj, tree_sitter.Language):
+                    return language_obj
+    return None
+
+
+def _grammar_unavailable(
+    canonical: str,
+    modules: tuple[str, ...],
+    failures: list[str],
+) -> GrammarUnavailableError:
+    """Build the typed error for an unresolvable language.
+
+    The message names the language, what was tried, and the pip install
+    hint — the caller decides policy, the resolver stays truthful.
+    """
+    primary = modules[0].replace("_", "-")  # tree_sitter_zig → tree-sitter-zig
+    detail = ""
+    if failures:
+        detail = " Underlying errors: " + "; ".join(failures[-3:])
+    return GrammarUnavailableError(
+        canonical,
+        f"no tree-sitter grammar available for language '{canonical}'. "
+        f"Tried modules: {', '.join(modules)}. Install a grammar wheel "
+        f"(`pip install {primary}`) or an aggregate language pack "
+        f"(`pip install tree-sitter-languages`), then retry.{detail}",
+    )
+
+
 def get_language(lang: str) -> tree_sitter.Language:
-    """Load a tree-sitter language, caching for reuse."""
-    if lang in _language_cache:
-        return _language_cache[lang]
+    """Resolve a canonical language name to a tree-sitter Language.
 
-    module_name = _LANGUAGE_MODULES.get(lang)
-    if not module_name:
-        raise ValueError(f"Unsupported language: {lang}")
+    Resolution order per language:
 
-    mod = importlib.import_module(module_name)
+    1. Declared :data:`LANGUAGE_ALIASES` spec — import each candidate
+       ``tree_sitter_<x>`` module, try each declared (exact) entry point.
+    2. Generic convention probe — module ``tree_sitter_<canonical>``, entry
+       ``language()`` / ``language_<canonical>()``. This is what makes a
+       freshly ``pip install``ed wheel work with zero code changes.
+    3. Optional aggregate pack (:func:`_resolve_from_language_pack`) —
+       ``tree_sitter_languages``-style ``get_language``/``get_parser``.
 
-    # Some grammars use non-standard function names
-    if lang == "tsx":
-        ts_lang = tree_sitter.Language(mod.language_tsx())
-    elif lang == "typescript":
-        ts_lang = tree_sitter.Language(mod.language_typescript())
-    elif lang == "php":
-        ts_lang = tree_sitter.Language(mod.language_php())
-    else:
-        ts_lang = tree_sitter.Language(mod.language())
+    Exhausting all three raises :class:`GrammarUnavailableError` naming the
+    language and the ``pip install`` hint. Results are cached per canonical
+    name; failures are not cached.
+    """
+    canonical = canonical_language_name(lang)
+    cached = _language_cache.get(canonical)
+    if cached is not None:
+        return cached
 
-    _language_cache[lang] = ts_lang
-    return ts_lang
+    modules = _grammar_module_candidates(canonical)
+    entries = _grammar_entry_candidates(canonical)
+    failures: list[str] = []
+    for module_name in modules:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            failures.append(f"{module_name}: {exc}")
+            continue
+        for entry in entries:
+            try:
+                language_obj = _language_from_module(module, entry)
+            except Exception as exc:  # noqa: BLE001 — wheel ABI errors are "not resolvable here"
+                failures.append(f"{module_name}.{entry}: {exc}")
+                continue
+            if language_obj is not None:
+                _language_cache[canonical] = language_obj
+                return language_obj
+
+    pack_language = _resolve_from_language_pack(canonical)
+    if pack_language is not None:
+        _language_cache[canonical] = pack_language
+        return pack_language
+
+    raise _grammar_unavailable(canonical, modules, failures)
 
 
 def get_parser(lang: str) -> tree_sitter.Parser:
-    """Get a parser for the given language, caching for reuse."""
-    if lang in _parser_cache:
-        return _parser_cache[lang]
+    """Get a parser for the given language, caching for reuse.
 
-    parser = tree_sitter.Parser(get_language(lang))
-    _parser_cache[lang] = parser
+    Alias spellings canonicalize to the same key, so ``get_parser("csharp")``
+    and ``get_parser("c_sharp")`` return the identical parser object.
+    """
+    canonical = canonical_language_name(lang)
+    cached = _parser_cache.get(canonical)
+    if cached is not None:
+        return cached
+
+    parser = tree_sitter.Parser(get_language(canonical))
+    _parser_cache[canonical] = parser
     return parser
 
 
@@ -501,9 +848,211 @@ def analyze_file_from_path(file_path: str | Path) -> FileStructure | None:
 
 
 def validate_parse(source: str, language: str) -> bool:
-    """Check if source code parses without errors."""
-    tree = parse_code(source, language)
-    return not tree.root_node.has_error
+    """Check if source code parses without errors.
+
+    Delegates to :func:`parse_diagnostics` so every absolute check sees the
+    same defect set the relative rule sees — including the C2 suite-opener
+    scan for colon-headed indentation languages, which tree-sitter's
+    error recovery silently waves through.
+    """
+    return not parse_diagnostics(source, language).errors
+
+
+class ParseDiagnostics(NamedTuple):
+    """Ordered tree-sitter error traits for one parse (Step A2, req. 9).
+
+    ``errors`` is the document-ordered list of ``(start_byte, end_byte,
+    kind)`` spans for the parse's ERROR and MISSING nodes (``kind`` is
+    ``"ERROR"`` or ``"MISSING"``). ``is_valid`` is True iff the parse
+    produced no error trait at all (identical to
+    :func:`validate_parse`). ``source`` is the exact text the byte spans
+    index — see :func:`parse_diagnostics` for the normalization contract.
+    """
+
+    errors: list[tuple[int, int, str]]
+    is_valid: bool
+    source: str
+
+
+def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
+    """Tree-sitter parse producing ordered error traits (Step A2, req. 9).
+
+    Where :func:`validate_parse` answers the ABSOLUTE question "does this
+    text parse?", this function answers the trait question "WHAT does the
+    parser object to, and where?" — the input's structural defects as
+    first-class, comparable data. The relative validation rule
+    (:func:`fastedit.inference.chunked_merge.merged_is_acceptable`)
+    compares a merged output's traits against the original's so a
+    pre-existing defect can be preserved (EDIT-NOT-CORRECT) while new
+    breakage is rejected.
+
+    Trait collection rules:
+
+      * **TOPMOST traits only** — an ERROR or MISSING node is recorded
+        once and NOT descended into. Error recovery nests further ERROR /
+        MISSING nodes inside an outer one; recording the outermost span
+        keeps one broken construct = one trait, which is the granularity
+        the relative rule (and its unit tests) reason about.
+      * **Document order** — the pre-order walk yields spans ascending by
+        ``start_byte``.
+
+    Normalization contract (mind the pipeline's CR handling): the source
+    is parsed exactly the way every other AST consumer in the pipeline
+    sees it — after :func:`fastedit.split_join.normalize_bare_cr_for_ast`
+    swaps each bare CR for LF. That substitution is 1 byte for 1 byte at
+    identical offsets, so the returned spans index the SAME byte positions
+    in the caller's raw text; but because a bare CR changes where lines
+    break, consumers that need the text AROUND a span (line text for
+    defect identity, human-readable messages) MUST read it from
+    ``ParseDiagnostics.source`` — the normalized copy the spans refer to —
+    never by re-slicing a differently normalized copy. No offset mapping
+    is ever needed: positions are identical by construction.
+    """
+    from ..split_join import normalize_bare_cr_for_ast
+
+    normalized = normalize_bare_cr_for_ast(source)
+    tree = parse_code(normalized, language)
+    root = tree.root_node
+    errors: list[tuple[int, int, str]] = []
+
+    def _walk(node: tree_sitter.Node) -> None:
+        # MISSING before ERROR: a missing token is reported as MISSING even
+        # when the parser also wrapped the region in an ERROR ancestor —
+        # the topmost check below keeps one construct = one trait.
+        if node.is_missing:
+            errors.append((node.start_byte, node.end_byte, "MISSING"))
+            return
+        if node.is_error:
+            errors.append((node.start_byte, node.end_byte, "ERROR"))
+            return
+        for child in node.children:
+            _walk(child)
+
+    _walk(root)
+    if not errors and language in _COLON_SUITE_LANGUAGES:
+        # tree-sitter-python silently recovers vanished suites (C2): its
+        # external INDENT/DEDENT machinery re-anchors a compound statement
+        # whose body is missing without emitting ERROR or MISSING nodes, so
+        # the walk above reports a clean parse for a file CPython refuses
+        # with ``SyntaxError: expected an indented block``. The stress tier
+        # hit exactly that: a merge emitted the guard line without
+        # re-indenting the body and the parse gate called the corrupted file
+        # valid. The tokenizer-level scan below is the missing judge — it is
+        # only consulted when tree-sitter found nothing (the expensive case
+        # is the clean file; a file tree-sitter already rejects is invalid
+        # regardless).
+        errors = _colon_suite_opener_violations(normalized)
+    return ParseDiagnostics(
+        errors=errors, is_valid=not errors, source=normalized,
+    )
+
+
+_COLON_SUITE_LANGUAGES = frozenset({"python"})
+"""Languages whose compound statements are colon-headed indentation suites.
+
+Declarative extension point (CLAUDE.md): a language joins the suite-opener
+judgment by adding its name here. Ruby/Elixir style ``end``-blocked grammars
+never qualify — their suites cannot vanish silently the way an indentation
+suite's can.
+"""
+
+
+def _colon_suite_opener_violations(source: str) -> list[tuple[int, int, str]]:
+    """Indentation-suite traits the tree-sitter grammar silently recovers.
+
+    Walks the source with the stdlib :mod:`tokenize` stream (exact string,
+    comment and indentation handling; O(1) memory) and flags every compound
+    statement header — a logical line whose LAST significant token is a
+    top-level ``:`` — whose suite never opens: the next token is not an
+    INDENT (a peer or shallower statement follows, or the file ends). Each
+    violation is reported as an ``INDENT`` trait span over the header's
+    colon, so the relative parse rule treats it like any other defect
+    trait: inherited when the original carried it, a regression when a
+    merge introduces it.
+
+    False-positive analysis: an empty suite is a SyntaxError in CPython
+    without exception — ``pass`` (or any statement) is always required — so
+    a flagged file is genuinely broken. Dict/annotation/slice/lambda colons
+    never end a logical line at bracket depth 0 (a significant token always
+    follows them), inline suites (``if x: return``) do not end in a colon,
+    and multi-line strings/bracket continuations are handled by the
+    tokenizer and the depth counter respectively.
+    """
+    import io
+    import tokenize
+
+    line_starts = [0]
+    for line in source.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+
+    def _byte_offset(row: int, col: int) -> int:
+        """(1-indexed row, 0-indexed col) → byte offset in *source*."""
+        return line_starts[row - 1] + col
+
+    significant_types = (
+        tokenize.OP, tokenize.NAME, tokenize.STRING, tokenize.NUMBER,
+        tokenize.FSTRING_START, tokenize.FSTRING_MIDDLE, tokenize.FSTRING_END,
+    )
+    violations: list[tuple[int, int, str]] = []
+    depth = 0
+    # A top-level ":" seen in the current logical line that no significant
+    # token has followed yet — the candidate compound-statement header.
+    colon_candidate: tuple[int, int] | None = None
+    # A CONFIRMED header (its NEWLINE arrived) still waiting for its suite.
+    open_header: tuple[int, int] | None = None
+
+    def _flag() -> list[tuple[int, int, str]]:
+        assert open_header is not None
+        return [(open_header[0], open_header[1], "INDENT")]
+
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.NEWLINE:
+                # The logical line ended. A surviving candidate is a header.
+                if colon_candidate is not None:
+                    open_header = colon_candidate
+                    colon_candidate = None
+                continue
+            if tok.type in (tokenize.NL, tokenize.COMMENT, tokenize.ENCODING):
+                continue
+            if tok.type == tokenize.INDENT:
+                # The suite opened — any waiting header is satisfied.
+                colon_candidate = None
+                open_header = None
+                continue
+            if tok.type == tokenize.DEDENT:
+                continue  # judged when the next significant token arrives
+            if tok.type == tokenize.ENDMARKER:
+                if open_header is not None:
+                    violations.extend(_flag())
+                continue
+            if tok.type not in significant_types:
+                continue
+            # A significant token: it cancels a colon candidate (the colon
+            # did not close the logical line — a dict pair, lambda, inline
+            # suite, ...) and satisfies-or-condemns a waiting header.
+            colon_candidate = None
+            if open_header is not None:
+                violations.extend(_flag())
+                open_header = None
+            if tok.type == tokenize.OP:
+                if tok.string in "([{":
+                    depth += 1
+                elif tok.string in ")]}":
+                    depth -= 1
+                elif tok.string == ":" and depth == 0:
+                    colon_candidate = (
+                        _byte_offset(*tok.start), _byte_offset(*tok.end),
+                    )
+    except (SyntaxError, IndentationError, tokenize.TokenError) as exc:
+        # The tokenizer itself refused the text — a real lexical defect the
+        # tree-sitter walk did not see. Report it on the offending line.
+        row = getattr(exc, "lineno", 1) or 1
+        start = line_starts[min(row, len(line_starts) - 1)]
+        return [(start, start, "INDENT")]
+    if open_header is not None:
+        violations.extend(_flag())
+    return violations
 
 
 def count_ast_nodes(tree: tree_sitter.Tree) -> int:

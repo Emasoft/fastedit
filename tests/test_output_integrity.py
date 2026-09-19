@@ -701,7 +701,16 @@ class _StubMergeResult:
 
 
 def _run_chunked_merge(fake_results, tmp_path):
-    """Drive chunked_merge with a stubbed engine; return (result, calls)."""
+    """Drive chunked_merge with a stubbed engine; return (result, calls).
+
+    Step A2 triage: chunked_merge now runs the unified retry-until-valid
+    loop (implementation plan Step A2, req. 5) with a default budget of 8
+    retries (FASTEDIT_MAX_RETRIES). These unit tests pin the OLD
+    single-retry budget explicitly (``max_validation_retries=1``) so they
+    keep proving exactly what they proved before — one corrective retry,
+    then rejection — without stubbing nine identical failures. The
+    production default is unchanged; no rejection guarantee is weakened.
+    """
     from fastedit.inference.chunked_merge import chunked_merge
 
     calls = []
@@ -717,12 +726,18 @@ def _run_chunked_merge(fake_results, tmp_path):
         CHUNK_FILE_SNIPPET,
         str(file_path),
         merge_fn,
+        max_validation_retries=1,
     )
     return result, calls
 
 
 def _run_whole_file_merge(fake_results, tmp_path):
-    """Drive the whole-file merge branch with a stubbed engine."""
+    """Drive the whole-file merge branch with a stubbed engine.
+
+    Step A2 triage: see _run_chunked_merge — the old single-retry budget is
+    pinned explicitly so the exact-call assertions below keep testing the
+    same one-retry-then-reject contract.
+    """
     from fastedit.inference.chunked_merge import chunked_merge
 
     calls = []
@@ -738,6 +753,7 @@ def _run_whole_file_merge(fake_results, tmp_path):
         WHOLE_FILE_SNIPPET,
         str(file_path),
         merge_fn,
+        max_validation_retries=1,
     )
     return result, calls
 
@@ -893,6 +909,11 @@ def _run_whole_file_merge_stubbed(
 
     Mirrors ``_run_whole_file_merge`` but records the snippet argument too,
     so tests can observe the corrective note on the retry call.
+
+    Step A2 triage: the unified retry-until-valid loop's default budget is
+    8 retries; these tests pin the OLD single-retry budget explicitly so
+    their exact-call assertions (and the "retried once" contract they lock)
+    stay valid without stubbing nine identical failures.
     """
     from fastedit.inference.chunked_merge import chunked_merge
 
@@ -906,6 +927,7 @@ def _run_whole_file_merge_stubbed(
     file_path.write_text(original)
     result = chunked_merge(
         original, snippet, str(file_path), merge_fn, language=language,
+        max_validation_retries=1,
     )
     return result, calls
 
