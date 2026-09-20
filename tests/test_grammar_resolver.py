@@ -443,17 +443,16 @@ def test_parser_cache_identity():
     assert get_language("go") is get_language("go")
 
 
-def test_resolver_caches_are_keyed_canonically():
-    """The cache holds ONE entry per canonical language even when reached
-    through alias spellings."""
-    get_parser("csharp")
-    get_parser("c_sharp")
-    assert sum(1 for key in ast_analyzer._parser_cache if key.endswith("sharp")) == 1
-
-
 @pytest.fixture()
 def clean_resolver_caches():
-    """Isolation for tests that mutate the declarative tables."""
+    """Pristine resolver state: snapshot → clear → restore.
+
+    Serves two kinds of tests: those that mutate the declarative tables,
+    and cache-keying tests that must not see entries OTHER tests left in
+    the module-level caches (the golden matrix legitimately resolves
+    pack-only languages — ``fsharp`` among them — straight into
+    ``_parser_cache``). The pre-test entries, same objects included, are
+    put back afterwards, so warm-cache speed elsewhere is untouched."""
     saved_langs = dict(ast_analyzer._language_cache)
     saved_parsers = dict(ast_analyzer._parser_cache)
     ast_analyzer.clear_grammar_caches()
@@ -462,6 +461,21 @@ def clean_resolver_caches():
     ast_analyzer._language_cache.update(saved_langs)
     ast_analyzer._parser_cache.clear()
     ast_analyzer._parser_cache.update(saved_parsers)
+
+
+def test_resolver_caches_are_keyed_canonically(clean_resolver_caches):
+    """The cache holds ONE entry per canonical language even when reached
+    through alias spellings.
+
+    Hermetic via the fixture: ``"fsharp"`` — a DIFFERENT canonical language
+    that the golden matrix's F2 census fixtures resolve into the parser
+    cache earlier in the suite — also ends with ``"sharp"``, so the
+    one-entry count below is only meaningful on a pristine cache. The
+    production canonicalization itself is correct: ``csharp`` maps to
+    ``c_sharp`` BEFORE the cache key, and ``fsharp`` is nobody's alias."""
+    get_parser("csharp")
+    get_parser("c_sharp")
+    assert sum(1 for key in ast_analyzer._parser_cache if key.endswith("sharp")) == 1
 
 
 def test_generic_convention_resolves_grammar_missing_from_table(

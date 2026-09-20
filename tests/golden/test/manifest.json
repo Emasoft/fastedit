@@ -1,0 +1,56 @@
+{
+  "language": "test",
+  "ext": "test",
+  "filename": "original.test",
+  "symbol_semantics": "self-documenting test records (==== header / name / body) — fastedit anchoring: none yet; EXCLUDED: the grammar cannot complete any test record (see census_excluded)",
+  "requires_wheel": "tree_sitter_language_pack",
+  "census_excluded": {
+    "reason": "pack grammar defect (tree-sitter-language-pack 0.13.0): the `test` grammar parses the header (separator / name / separator) but its `input` region greedily consumes the closing separator line, so EVERY complete test record ends in a MISSING-separator error trait at EOF, and a header-only file is an outright ERROR node. F3 verified a matrix of real-syntax shapes (recorded below with their exact parse_diagnostics errors) — none parse clean, so no census fixture is fabricated. The F1 census correctly reported parse_degraded; the grammar itself is the problem",
+    "attempts": [
+      {
+        "description": "complete test record: header + input + closing separator",
+        "snippet": "================\nSample test\n================\nprint(\"hi\")\n================\n",
+        "parse_errors": [
+          [
+            75,
+            75,
+            "MISSING"
+          ]
+        ]
+      },
+      {
+        "description": "complete test record, closing separator without a trailing newline",
+        "snippet": "================\nSample test\n================\nprint(\"hi\")\n================",
+        "parse_errors": [
+          [
+            74,
+            74,
+            "MISSING"
+          ]
+        ]
+      },
+      {
+        "description": "header only (no input, no closing separator)",
+        "snippet": "================\nSample test\n================\n",
+        "parse_errors": [
+          [
+            0,
+            46,
+            "ERROR"
+          ]
+        ]
+      },
+      {
+        "description": "two complete test records",
+        "snippet": "================\nOne\n================\ndo it\n================\nTwo\n================\nagain\n================\n",
+        "parse_errors": [
+          [
+            105,
+            105,
+            "MISSING"
+          ]
+        ]
+      }
+    ]
+  }
+}

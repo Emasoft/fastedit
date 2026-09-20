@@ -64,6 +64,8 @@ def _manifest_cases():
     cases = []
     for manifest_path in sorted(GOLDEN_DIR.glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("census_excluded"):
+            continue  # excluded language: no ops — see the census-exclusion test
         lang_dir = manifest_path.parent
         language = manifest["language"]
         skip_marks = []
@@ -237,6 +239,129 @@ def test_every_manifest_op_is_supported_or_declared():
         assert not missing, (
             f"{manifest_path}: ops {sorted(missing)} are neither exercised "
             f"nor declared unsupported"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F2 census-batch fixtures: one parse-clean fixture per census language.
+#
+# These manifests carry no (or few) anchoring ops — the census languages
+# mostly have no declarative symbol anchoring row in ast_utils yet, and each
+# manifest declares the hole via its ``unsupported`` entries. What EVERY
+# census fixture does claim is that its original parses with ZERO error
+# traits in its own language (for the parse_degraded-retry languages that
+# claim IS the F2 finding: the census's trivial probe line was the problem,
+# not the grammar). This test pins that claim so a grammar bump that breaks
+# a fixture fails loudly instead of silently rotting the golden corpus.
+# ---------------------------------------------------------------------------
+
+def _census_fixture_cases():
+    cases = []
+    for manifest_path in sorted(GOLDEN_DIR.glob("*/manifest.json")):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not manifest.get("census_fixture"):
+            continue  # B3's op-bearing fixtures already parse via the ops
+        lang_dir = manifest_path.parent
+        language = manifest["language"]
+        skip_marks = []
+        wheel = manifest.get("requires_wheel")
+        if wheel and not _wheel_present(wheel):
+            skip_marks = [
+                pytest.mark.skipif(
+                    True,
+                    reason=(
+                        f"{wheel} is an all-grammars extra dependency, not a "
+                        f"hard dependency — the {language} census fixture "
+                        f"describes this venv's pack and cannot parse without "
+                        f"it"
+                    ),
+                ),
+            ]
+        cases.append(pytest.param(
+            lang_dir, manifest,
+            id=f"{language}:census-original-parses-clean",
+            marks=skip_marks,
+        ))
+    return cases
+
+
+@pytest.mark.parametrize(("lang_dir", "manifest"), _census_fixture_cases())
+def test_census_fixture_original_parses_clean(lang_dir, manifest):
+    language = manifest["language"]
+    original = (lang_dir / manifest["filename"]).read_text(encoding="utf-8")
+    diags = parse_diagnostics(original, language)
+    assert diags.is_valid, (
+        f"{language} census fixture {manifest['filename']} does not parse "
+        f"clean: {diags.errors[:3]} — the fixture claims a parse-clean "
+        f"canonical snippet for this language"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F3 census exclusions: census languages whose grammar is genuinely BROKEN
+# (recorded in the generator's EXCLUDED_LANGUAGES, written into the manifest
+# as ``census_excluded``). The exclusion is fail-loud documentation, never a
+# silent shrug: this test re-parses EVERY recorded attempt and pins the
+# EXACT parse errors, so an upstream grammar fix fails here — at which point
+# the exclusion is lifted (real census fixture in CENSUS_LANGUAGES with a
+# census_note + pack_census.json verdict flip), never outlived silently.
+# ---------------------------------------------------------------------------
+
+def _census_excluded_cases():
+    cases = []
+    for manifest_path in sorted(GOLDEN_DIR.glob("*/manifest.json")):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not manifest.get("census_excluded"):
+            continue  # ordinary manifests are covered by the tests above
+        lang_dir = manifest_path.parent
+        language = manifest["language"]
+        skip_marks = []
+        wheel = manifest.get("requires_wheel")
+        if wheel and not _wheel_present(wheel):
+            skip_marks = [
+                pytest.mark.skipif(
+                    True,
+                    reason=(
+                        f"{wheel} is an all-grammars extra dependency, not a "
+                        f"hard dependency — the {language} exclusion record "
+                        f"describes this venv's pack and cannot parse without "
+                        f"it"
+                    ),
+                ),
+            ]
+        cases.append(pytest.param(
+            lang_dir, manifest,
+            id=f"{language}:census-excluded-grammar-defect",
+            marks=skip_marks,
+        ))
+    return cases
+
+
+@pytest.mark.parametrize(("lang_dir", "manifest"), _census_excluded_cases())
+def test_census_excluded_grammar_defect_is_real(lang_dir, manifest):
+    language = manifest["language"]
+    excluded = manifest["census_excluded"]
+    assert excluded.get("reason"), f"{language}: exclusion needs a reason"
+    attempts = excluded.get("attempts")
+    assert attempts, f"{language}: exclusion needs recorded attempts"
+    for attempt in attempts:
+        diags = parse_diagnostics(attempt["snippet"], language)
+        assert not diags.is_valid, (
+            f"{language} census-excluded attempt "
+            f"({attempt['description']}) now parses clean — the grammar "
+            f"defect is fixed upstream: lift the exclusion by authoring a "
+            f"real census fixture (tests/golden/_generate.py "
+            f"CENSUS_LANGUAGES) with a census_note and flipping the "
+            f"pack_census.json verdict"
+        )
+        assert (
+            [list(err) for err in diags.errors]
+            == [list(err) for err in attempt["parse_errors"]]
+        ), (
+            f"{language} census-excluded attempt "
+            f"({attempt['description']}) parse errors changed to "
+            f"{diags.errors} — re-record the exclusion (or lift it if the "
+            f"grammar is now healthy)"
         )
 
 
