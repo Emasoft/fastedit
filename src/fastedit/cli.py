@@ -20,6 +20,7 @@ import contextlib
 import sys
 from pathlib import Path
 
+from .cli_help import EPILOG
 from .file_lock import FileLockedError, acquire_edit_lock
 
 # ---------------------------------------------------------------------------
@@ -1739,12 +1740,15 @@ def main():
     parser = argparse.ArgumentParser(
         prog="fastedit",
         description="FastEdit — AST-aware code editing via CLI",
-        epilog=(
-            "Installer: scripts/install-dev.sh (fork install, repair, revert — see its --help). "
-            "Diagnose: fastedit doctor. MCP setup: fastedit mcp-install."
-        ),
+        # RawDescriptionHelpFormatter: keeps the option list formatting while
+        # printing the guide (cli_help.EPILOG) verbatim, un-wrapped.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EPILOG,
     )
-    sub = parser.add_subparsers(dest="command")
+    # metavar: the 19-command choices token is unbreakable for argparse and
+    # renders as a single 147-character line in usage; "command" keeps the
+    # usage lines short (the epilog's COMMANDS section lists every command).
+    sub = parser.add_subparsers(dest="command", metavar="command")
 
     # --- read (no model) ---
     read_p = sub.add_parser("read", help="Show file structure (functions, classes, line ranges)")
