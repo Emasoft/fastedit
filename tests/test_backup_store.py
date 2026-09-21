@@ -13,11 +13,17 @@ Step 19 additions lock down:
 * **B39** — ``_atomic_write`` fsyncs the file before close and the directory
   after ``os.replace`` (asserted by counting ``os.fsync`` calls, not by
   mocking the OS deeply).
+* **B39 (store)** — ``BackupStore.__setitem__`` fsyncs the backup fd before
+  close/replace, fsyncs the store directory after the rename (best-effort),
+  and the ``.meta`` write is fsynced too: a power cut must not keep the main
+  file's new content while losing the just-written backup, which would leave
+  that edit without an undo step.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import time
 from pathlib import Path
 
@@ -240,3 +246,219 @@ def test_directory_fsync_failure_does_not_break_the_write(tmp_path, monkeypatch)
     _atomic_write(target, "new\n")  # must not raise
 
     assert target.read_text(encoding="utf-8") == "new\n"
+
+
+# ---------------------------------------------------------------------------
+# B39 for the store: __setitem__ durability (backup fd + store dir + .meta)
+#
+# _atomic_write already fsyncs its own writes (B39), but the backup it stores
+# first went through BackupStore.__setitem__, which did write_all + close +
+# replace with NO fsync: a power-loss window could keep the main file's
+# fsync'd new content while losing the just-written backup, leaving that edit
+# without an undo step. The <hash>.meta write (plain write_text) had the same
+# gap. The recorder below is the B39 counting pattern extended with
+# write/close/replace ordering so fsync-vs-rename order can be asserted
+# without mocking the OS deeply.
+# ---------------------------------------------------------------------------
+
+
+def _install_fsync_recorder(monkeypatch) -> list[tuple]:
+    """Record fd-level open/write/fsync/close ordering plus every
+    ``os.replace`` target. Every fake delegates to the real syscall, so the
+    real work still happens. Returns *events*, an ordered list of
+    ``("open", fd, token, path)`` / ``("write", fd, token)`` /
+    ``("fsync", fd, token, is_dir)`` / ``("close", fd, token)`` /
+    ``("replace", src, dst)`` tuples.
+
+    *token* identifies the open session the event belongs to, and *is_dir*
+    is resolved with ``fstat`` at fsync time: fd NUMBERS are reused the
+    instant a descriptor is closed (a directory fd closed after one rename
+    can come back as the next tmp file's fd), so classifying by fd number
+    alone would misattribute a file fsync to a directory or mix two
+    sessions."""
+    real_open, real_write = os.open, os.write
+    real_fsync, real_close, real_replace = os.fsync, os.close, os.replace
+    events: list[tuple] = []
+    tokens: dict[int, int] = {}
+    next_token = [0]
+
+    def fake_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        next_token[0] += 1
+        tokens[fd] = next_token[0]
+        events.append(("open", fd, next_token[0], os.fspath(path)))
+        return fd
+
+    def fake_write(fd, data):
+        events.append(("write", fd, tokens.get(fd)))
+        return real_write(fd, data)
+
+    def fake_fsync(fd):
+        is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        events.append(("fsync", fd, tokens.get(fd), is_dir))
+        return real_fsync(fd)
+
+    def fake_close(fd):
+        events.append(("close", fd, tokens.pop(fd, None)))
+        return real_close(fd)
+
+    def fake_replace(src, dst, *args, **kwargs):
+        events.append(("replace", os.fspath(src), os.fspath(dst)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "write", fake_write)
+    monkeypatch.setattr(os, "fsync", fake_fsync)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "replace", fake_replace)
+    return events
+
+
+def _first_replace_index(events: list[tuple], suffix: str) -> int | None:
+    """Index of the first os.replace whose destination ends with *suffix*
+    (".bak" = the backup rename, ".meta" = the meta rename)."""
+    for i, event in enumerate(events):
+        if event[0] == "replace" and event[2].endswith(suffix):
+            return i
+    return None
+
+
+def _fd_sessions(events: list[tuple], fd: int, kind: str) -> dict:
+    """Indexes of *kind* events for descriptor *fd*, grouped by open session
+    token, so a reused fd number cannot mix two open sessions."""
+    grouped: dict = {}
+    for i, ev in enumerate(events):
+        if ev[0] == kind and ev[1] == fd:
+            grouped.setdefault(ev[2], []).append(i)
+    return grouped
+
+
+def _assert_fsynced_after_last_write_before_close(
+    events: list[tuple], fd: int, what: str,
+) -> None:
+    """The durability ordering contract for one content descriptor: within
+    each of its open sessions, at least one fsync AFTER the descriptor's
+    last write and BEFORE it is closed."""
+    writes = _fd_sessions(events, fd, "write")
+    fsyncs = _fd_sessions(events, fd, "fsync")
+    closes = _fd_sessions(events, fd, "close")
+    assert writes, f"{what}: descriptor {fd} was never written ({events})"
+    for token, write_idxs in writes.items():
+        session = f"descriptor {fd} (open #{token})"
+        session_fsyncs = fsyncs.get(token, [])
+        assert session_fsyncs, f"{what}: {session} was never fsync'd ({events})"
+        assert max(write_idxs) < min(session_fsyncs), (
+            f"{what}: {session} fsync must follow the last write ({events})"
+        )
+        session_closes = closes.get(token, [])
+        assert session_closes, f"{what}: {session} was never closed ({events})"
+        assert min(session_fsyncs) < min(session_closes), (
+            f"{what}: {session} fsync must precede close ({events})"
+        )
+
+
+def test_setitem_fsyncs_the_backup_fd_before_close_and_replace(
+    tmp_path, monkeypatch,
+):
+    """B39 for the store: the backup's content fd is fsync'd after its last
+    write and before it is closed and renamed. Without it a power cut can
+    keep the main file's fsync'd new content while losing the just-written
+    backup — that edit would have no undo step."""
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+    store = BackupStore()
+    events = _install_fsync_recorder(monkeypatch)
+
+    store[str(tmp_path / "f.py")] = b"state one\n"
+
+    bak_idx = _first_replace_index(events, ".bak")
+    assert bak_idx is not None, f"no .bak replace observed: {events}"
+    pre = events[:bak_idx]
+    written_fds = {ev[1] for ev in pre if ev[0] == "write"}
+    # Only the backup tmp descriptor is written before the backup rename
+    # (the .meta write comes after it).
+    assert len(written_fds) == 1, pre
+    _assert_fsynced_after_last_write_before_close(
+        pre, written_fds.pop(), "backup fd",
+    )
+
+
+def test_setitem_fsyncs_the_store_directory_after_the_replace(
+    tmp_path, monkeypatch,
+):
+    """B39 for the store: after os.replace the store DIRECTORY is fsync'd so
+    the rename itself is durable (same contract as _atomic_write) — the
+    content fsync alone does not make the rename survive a power cut."""
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+    store = BackupStore()
+    events = _install_fsync_recorder(monkeypatch)
+
+    store[str(tmp_path / "f.py")] = b"state one\n"
+
+    bak_idx = _first_replace_index(events, ".bak")
+    assert bak_idx is not None, f"no .bak replace observed: {events}"
+    dir_fsyncs_after = [
+        i for i, ev in enumerate(events)
+        if ev[0] == "fsync" and ev[3] and i > bak_idx
+    ]
+    assert dir_fsyncs_after, (
+        f"the store directory was never fsync'd after the rename: {events}"
+    )
+
+
+def test_setitem_tolerates_a_refusing_directory_fsync(tmp_path, monkeypatch):
+    """B39 for the store: the directory fsync is best-effort — a filesystem
+    that refuses it must not fail an otherwise good backup write (the
+    content fd was already fsync'd), matching _atomic_write's contract."""
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+    real_fsync = os.fsync
+
+    def refusing_dir_fsync(fd):
+        # fstat at fsync time: fd numbers are reused the instant a
+        # descriptor is closed (the dir fd closed after one rename can come
+        # back as the next tmp file's fd), so a set of once-dir fds would
+        # misfile a later FILE fsync and break an otherwise good write.
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(45, "Operation not supported")  # e.g. some filesystems
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", refusing_dir_fsync)
+
+    store = BackupStore()
+    target = tmp_path / "f.py"
+    store[str(target)] = b"state one\n"  # must not raise
+
+    # The write landed complete, meta included, despite the refusing
+    # directory fsync.
+    assert store._meta_path(str(target)).read_text(
+        encoding="utf-8",
+    ) == str(target)
+    assert store.pop(str(target)) == b"state one\n"
+
+
+def test_meta_write_is_fsynced_too(tmp_path, monkeypatch):
+    """B39 for the store: the <hash>.meta write (the original path used for
+    undo/diff display) is fsynced as well, through a real descriptor write
+    path — and content + encoding stay exactly what the old
+    ``Path.write_text(file_path, encoding="utf-8")`` produced."""
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+    store = BackupStore()
+    target = tmp_path / "f.py"
+    events = _install_fsync_recorder(monkeypatch)
+
+    store[str(target)] = b"state one\n"
+
+    bak_idx = _first_replace_index(events, ".bak")
+    assert bak_idx is not None, f"no .bak replace observed: {events}"
+    post = events[bak_idx + 1:]
+    written_fds = {ev[1] for ev in post if ev[0] == "write"}
+    assert written_fds, (
+        "no descriptor-level write observed after the backup rename: the "
+        f".meta write bypasses the fsyncable write path ({post})"
+    )
+    for fd in written_fds:
+        _assert_fsynced_after_last_write_before_close(post, fd, ".meta write")
+
+    # Behavior identical: the meta still records the original path, utf-8.
+    meta = store._meta_path(str(target))
+    assert meta.exists()
+    assert meta.read_text(encoding="utf-8") == str(target)

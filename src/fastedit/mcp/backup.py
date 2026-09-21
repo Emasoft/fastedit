@@ -98,6 +98,13 @@ class BackupStore:
         pass what they read off disk or hold in memory; the store never
         decodes or encodes. Only the newest ``_MAX_BACKUPS_PER_FILE``
         backups per file are kept (B38).
+
+        Durability (B39, the same contract as ``_atomic_write``): the
+        backup content is fsync'd before close, and the store directory is
+        fsync'd (best-effort) after the rename. Without it a power cut can
+        keep the main file's fsync'd new content while losing the
+        just-written backup -- that edit would have no undo step, since
+        ``fastedit undo`` restores from backups, not from the main file.
         """
         ts = time.time_ns()
         target = self._dir / f"{self._hash(file_path)}-{ts:020d}.bak"
@@ -108,18 +115,29 @@ class BackupStore:
             ts += 1
             target = self._dir / f"{self._hash(file_path)}-{ts:020d}.bak"
         fd, tmp = tempfile.mkstemp(dir=self._dir, suffix=".tmp")
+        closed = False
         try:
             write_all(fd, data)
+            # B39: fsync the content BEFORE close/replace -- the rename
+            # alone does not make the bytes durable.
+            os.fsync(fd)
+            closed = True
             os.close(fd)
-            os.replace(tmp, target)
+            os.replace(tmp, target)  # atomic on POSIX
+            _fsync_directory(self._dir)  # B39: durable rename (best-effort)
         except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            if not closed:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
-        # Metadata (original path) so undo/diff can display it.
-        self._meta_path(file_path).write_text(file_path, encoding="utf-8")
+        # Metadata (original path) so undo/diff can display it. Funneled
+        # through _atomic_write (B39) so the meta is fsync'd too: same
+        # content and encoding as the old
+        # ``write_text(file_path, encoding="utf-8")``, plus a temp+replace
+        # write so a crash cannot leave a half-written meta.
+        _atomic_write(self._meta_path(file_path), file_path, encoding="utf-8")
         self._prune_per_file(file_path)
 
     def __contains__(self, file_path: str) -> bool:
