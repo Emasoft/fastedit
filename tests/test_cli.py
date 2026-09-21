@@ -743,6 +743,14 @@ class TestArgparseRegistration:
         for cmd in ["read", "edit", "delete", "move", "rename", "search", "diff", "undo"]:
             assert cmd in result.stdout, f"Subcommand '{cmd}' not in help output"
 
+    def test_help_epilog_names_installer_doctor_and_mcp_install(self):
+        """Top-level --help points at the installer, the doctor, and MCP setup."""
+        result = run_cli("--help")
+        assert result.returncode == 0
+        assert "scripts/install-dev.sh" in result.stdout
+        assert "fastedit doctor" in result.stdout
+        assert "fastedit mcp-install" in result.stdout
+
     def test_batch_edit_subcommand_exists(self):
         """The 'batch-edit' subcommand should be recognized."""
         result = run_cli("batch-edit", "--help")
