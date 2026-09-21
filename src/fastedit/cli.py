@@ -1602,6 +1602,10 @@ def main():
     parser = argparse.ArgumentParser(
         prog="fastedit",
         description="FastEdit — AST-aware code editing via CLI",
+        epilog=(
+            "Installer: scripts/install-dev.sh (fork install, repair, revert — see its --help). "
+            "Diagnose: fastedit doctor. MCP setup: fastedit mcp-install."
+        ),
     )
     sub = parser.add_subparsers(dest="command")
 

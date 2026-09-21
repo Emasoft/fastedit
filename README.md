@@ -128,13 +128,16 @@ Avoid `pip install fastedits` into a Homebrew / distro-managed Python — it wil
 
 ### This fork
 
-This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with the swap script instead.
+This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with **`install-dev.sh`**, the repo's one installer. It has two forward modes:
+
+- **Fork install** (default) — installs from the fork's git repo, pinned to a branch/tag/sha. This is how you use the fork without cloning it.
+- **Dev install** (`--dev`) — installs **editable** from the repo's working tree, so your local changes take effect immediately, no reinstall. For development.
 
 **Remote install (no clone needed)** — download the script, then run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/feat/create-file/scripts/install-fork.sh -o /tmp/install-fork.sh
-bash /tmp/install-fork.sh
+curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/feat/create-file/scripts/install-dev.sh -o /tmp/install-dev.sh
+bash /tmp/install-dev.sh
 ```
 
 Download-then-run, deliberately, rather than `curl … | bash`: piping straight into a shell executes a **partial** script if the connection drops mid-transfer, and a shell will happily run the first half of an installer. Downloading first makes the fetch either succeed or fail as a whole, and leaves the script on disk to read before running it — which you should.
@@ -143,14 +146,26 @@ Download-then-run, deliberately, rather than `curl … | bash`: piping straight 
 
 ```bash
 git clone https://github.com/Emasoft/fastedit && cd fastedit
-scripts/install-fork.sh                       # swaps in the fork (default: feat/create-file)
-scripts/install-fork.sh --extras mlx,mcp      # override the auto-selected extras
-scripts/install-fork.sh --ref v1.2.3          # pin a branch/tag/sha
-scripts/install-fork.sh --no-model            # skip the ~3 GB model download
-scripts/install-fork.sh --revert              # undo — back to upstream from PyPI
+scripts/install-dev.sh                        # fork install, pinned to feat/create-file
+scripts/install-dev.sh --dev                  # dev install: editable, tracks your working tree
+scripts/install-dev.sh --all-grammars no      # skip the offline grammar pack without being asked
+scripts/install-dev.sh --extras mlx,mcp       # override the auto-selected extras
+scripts/install-dev.sh --ref v1.2.3           # pin a branch/tag/sha (fork mode only)
+scripts/install-dev.sh --no-model             # skip the ~3 GB model download
+scripts/install-dev.sh --revert               # undo — back to upstream from PyPI
 ```
 
-By default the script installs **every extra this platform can install** — `mlx,mcp` on Apple Silicon, `vllm,mcp` on Linux with an NVIDIA driver, `mcp` elsewhere — because an extras-less install leaves the downloaded merge model unloadable. Note `--ref` applies to the *package* the script installs; to install from a different branch you must also fetch that branch's script, since the URL above pins `feat/create-file`.
+### Grammars: the one question the installer asks
+
+By default the script installs **every extra this platform can install** — `mlx,mcp` on Apple Silicon, `vllm,mcp` on Linux with an NVIDIA driver, `mcp` elsewhere — because an extras-less install leaves the downloaded merge model unloadable. On top of that it asks one yes/no question:
+
+```
+Install all grammars? (offline 173-language tree-sitter pack — every tree-sitter-supported format works) [Y/n]
+```
+
+**Enter = yes.** Answering yes adds the `all-grammars` extra, so every tree-sitter-supported language resolves offline (see "Supported languages" below). Answer `n`, or pre-answer with `--all-grammars no` to skip the pack. In non-interactive runs (CI, piped stdin) there is no prompt: all grammars default **on**, and the installer says so in one line — pass `--all-grammars no` to opt out. `--revert` never asks and never installs the pack.
+
+After installing, the installer verifies the grammar axis honestly via the tool's own Python and warns if the pack was selected but is missing. Note `--ref` applies to the *package* the script installs; to install a different branch's code in fork mode you must also fetch that branch's script, since the URL above pins `feat/create-file`. (`--ref` has no effect with `--dev`, which installs your working tree; the installer points that out.)
 
 The fork ships under the same PyPI name and console-script names as upstream, so the script uninstalls any existing `fastedits` from every method it finds (uv tool, pipx, pip) before installing, then verifies the `fastedit` that actually ends up on PATH is the fork — not a shadowed leftover. Add `--dry-run` to any of the above to see the commands without running them.
 
@@ -161,6 +176,19 @@ FASTEDIT_BACKEND=llm FASTEDIT_LLM_API_BASE=http://localhost:1234/v1 fastedit edi
 ```
 
 Works with LM Studio, llama.cpp, Ollama (via OpenAI-compatible endpoint), vLLM, TGI, any OpenAI-API-compatible server.
+
+## Development
+
+To hack on FastEdit, clone the repo and use the editable dev install, so your changes take effect without reinstalling:
+
+```bash
+git clone https://github.com/Emasoft/fastedit && cd fastedit
+uv sync --extra mlx --extra mcp --extra all-grammars   # extras are platform-marked; resolves everywhere
+uv run pytest -q                                       # hermetic default tier
+scripts/install-dev.sh --dev                           # editable install of your working tree
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the three test tiers, linting, the PR workflow, and how `scripts/install-dev.sh` works (source menu, branch autodetect, preflight/sweep/postflight, model-cache handling, per-platform extras).
 
 ## CLI
 

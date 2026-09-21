@@ -1,0 +1,1019 @@
+#!/usr/bin/env bash
+# Install the `fastedits` CLI from this fork — or revert to upstream.
+#
+# ONE installer, two forward modes:
+#
+#   default (fork)  install from the fork's git repo, pinned to --ref.
+#   --dev           install EDITABLE from this repo's working tree, so local
+#                   changes take effect without reinstalling. For development.
+#
+# How the mode is chosen:
+#   interactive (terminal on stdin): you are ASKED — "[1] local working tree
+#     (editable) [2] remote GitHub fork". A standalone copy of this script
+#     (curl|bash, no fastedit clone next to it) has no local tree to offer,
+#     so it skips the menu and installs from the fork, saying so in one line.
+#   non-interactive: no menu; --dev decides, otherwise the remote fork.
+#   --revert never shows the menu.
+#
+# In fork mode, run from inside a clone, the ref defaults to THAT CLONE's
+# current branch (`git rev-parse --abbrev-ref HEAD`) and — on a real run —
+# is verified to exist on the fork remote (`git ls-remote --heads`, bounded)
+# before anything is touched; a missing branch aborts loudly listing the
+# remote's actual heads. An explicit --ref overrides autodetect (and skips
+# the check: it may name a tag or a sha, which --heads cannot see).
+#
+# This fork is deliberately NOT published to PyPI (PyPI stays upstream's
+# release channel). Fork mode IS the fork's distribution mechanism: it
+# points `uv tool install` at the fork's git repo instead.
+#
+# The fork and upstream share the same PyPI name (`fastedits`) and the
+# same console-script names (fastedit, fastedit-hook, fastedit-mcp), so
+# a leftover install from ANY method collides with the one this script
+# just installed, and whichever sits first on PATH silently wins. That is
+# why the preflight below reports every installed fastedits (uv tool /
+# pipx / pip, plus which fastedit binary wins on PATH right now), the
+# sweep uninstalls every method, and the postflight step resolves the
+# binary that will actually run and confirms it is the fork, not just
+# that *a* fastedit exists somewhere.
+#
+# Model caches under ~/.cache/fastedit/models are reported as VALID
+# (holds *.safetensors) or STALE (a partial download). VALID caches are
+# kept — they are shared between fork and upstream. STALE caches are
+# removed (asked on a terminal [Y/n]; removed by default without one) so
+# the next pull reinstalls cleanly. --revert keeps every cache: it never
+# touches model weights (existing contract).
+set -euo pipefail
+
+FORK_URL="https://github.com/Emasoft/fastedit"
+PACKAGE="fastedits"
+REF="feat/create-file"
+EXTRAS=""
+# Whether --extras was PASSED, tracked separately from its value. `--extras ""`
+# is a deliberate opt-out and must be distinguishable from never passing the
+# flag at all; testing `-z "$EXTRAS"` alone conflates the two and silently
+# installs a backend the user explicitly declined (measured: it did exactly
+# that before this flag existed).
+EXTRAS_SET=0
+REVERT=0
+DRY_RUN=0
+NO_MODEL=0
+# DEV=1 installs editable from this repo's working tree instead of the fork's
+# git URL. It is set by --dev, or by picking [1] in the source menu. REPO_ROOT
+# is resolved unconditionally (this script's parent directory) because the
+# menu needs to know whether a local fastedit tree EXISTS (pyproject.toml
+# beside the script) — but it is only VALIDATED when DEV resolves to 1, so a
+# downloaded copy of this script run without --dev never depends on where it
+# happens to sit.
+DEV=0
+REPO_ROOT=""
+HAVE_LOCAL_TREE=0
+# Whether --ref was passed -- tracked only so --dev can say --ref had no
+# effect, rather than silently swallowing a flag the user typed.
+REF_SET=0
+# REF_AUTO=1 marks a branch that was AUTODETECTED from the local clone. Only
+# such a branch is verified against the fork remote: an explicit --ref is the
+# user's pin and may legitimately name a tag or a sha, which
+# `git ls-remote --heads` cannot see.
+REF_AUTO=0
+
+# The all-grammars decision. ALL_GRAMMARS holds the resolved answer
+# ("yes"/"no"); ALL_GRAMMARS_SET records whether the FLAG was passed, so a
+# resolved answer can be told apart from an unresolved one -- the same
+# flag-vs-empty distinction EXTRAS_SET makes for --extras.
+ALL_GRAMMARS=""
+ALL_GRAMMARS_SET=0
+
+# Model cache root — mirrors src/fastedit/model_download.py's
+# DEFAULT_CACHE_DIR (~/.cache/fastedit/models). fastedit's own pull resolves
+# env var -> local dir -> cache dir -> download, in that order, so we don't
+# re-implement that lookup here; the script only needs WHERE caches live to
+# report and clean them.
+MODELS_DIR="${HOME}/.cache/fastedit/models"
+
+# Tolerable "nothing to do" outcomes across uv / pipx / pip. A real
+# failure (permissions, corrupt env, network) must NOT match this and
+# must still abort the script.
+TOLERABLE_UNINSTALL_RE='not installed|nothing to uninstall|externally-managed-environment'
+
+# ONE line stating the platform mapping — the single source used by both
+# usage() and the source menu, so the two surfaces cannot drift apart.
+platform_line() {
+  printf '%s\n' "Platforms: Darwin/arm64 -> mlx (model mlx-8bit); Linux with NVIDIA -> vllm (model bf16); anything else -> mcp only; Windows: run this script under Git Bash/WSL (bash required, no native path)"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: install-dev.sh [--dev] [--ref REF] [--extras LIST] [--all-grammars yes|no]
+                      [--revert] [--no-model] [--dry-run]
+
+  --dev          Development install: EDITABLE, from this repo's working tree
+                 (the directory the script lives in). Your local changes are
+                 picked up without reinstalling. Cannot be combined with
+                 --revert. Skips the source menu.
+  --ref REF      Branch, tag or commit SHA of the fork to install. No effect
+                 with --dev. Without --ref in fork mode, a run from inside a
+                 clone installs THAT CLONE's current branch (verified to
+                 exist on the fork remote); a standalone run keeps the
+                 built-in default (feat/create-file).
+  --extras LIST  Comma-separated extras. DEFAULT: every extra this platform
+                 can install (mlx,mcp on Apple Silicon; vllm,mcp on Linux with
+                 an NVIDIA driver; mcp elsewhere). Pass --extras "" for none --
+                 the model pull is then skipped, since nothing could load it.
+  --all-grammars yes|no
+                 Install (yes) or skip (no) the offline 173-language grammar
+                 pack (the `all-grammars` extra) without being asked. When the
+                 flag is not passed the script ASKS (Enter = yes); with no
+                 terminal on stdin it defaults to yes and says so.
+  --revert       Uninstall the fork and reinstall upstream fastedits
+                 from PyPI (undoes the swap; leaves downloaded model
+                 weights in place — they're shared with the fork).
+                 Never asks about grammars and never installs them.
+  --no-model     Skip downloading the merge model (~3 GB). The stale
+                 model-cache cleanup below still runs. Ignored with
+                 --revert, which never touches the model.
+  --dry-run      Print the commands that would run; execute nothing
+                 (model caches are reported, never removed)
+  -h, --help     Show this help
+EOF
+  platform_line
+  cat <<'EOF'
+
+Source menu: on an interactive run (terminal on stdin) with neither --dev nor
+--revert, and this script sitting inside a fastedit clone, you are asked
+"Install from: [1] local working tree (editable, tracks your changes) [2]
+remote GitHub fork (pinned branch)" — Enter = 1, the detected local tree.
+A standalone run (curl|bash, no clone next to the script) skips the menu and
+installs from the remote fork. Without a terminal: --dev decides, otherwise
+the remote fork.
+
+Preflight: before installing, the script reports every installed fastedits
+(uv tool, pipx, pip — plus which fastedit binary wins on PATH right now) and
+every model cache under ~/.cache/fastedit/models (VALID = holds
+*.safetensors). VALID caches are kept — shared between fork and upstream.
+STALE (partial) caches are removed so the next pull reinstalls cleanly:
+asked on a terminal [Y/n], removed by default without one, printed as
+"would remove" by --dry-run. --revert keeps every cache.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dev)
+      DEV=1
+      shift
+      ;;
+    --ref)
+      REF="$2"
+      REF_SET=1
+      shift 2
+      ;;
+    --extras)
+      EXTRAS="$2"
+      EXTRAS_SET=1
+      shift 2
+      ;;
+    --all-grammars)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --all-grammars requires a value: yes or no" >&2
+        usage >&2
+        exit 1
+      fi
+      case "$2" in
+        yes|YES|Yes|y|Y) ALL_GRAMMARS="yes"; ALL_GRAMMARS_SET=1 ;;
+        no|NO|No|n|N)    ALL_GRAMMARS="no";  ALL_GRAMMARS_SET=1 ;;
+        *)
+          echo "error: --all-grammars expects 'yes' or 'no', got: $2" >&2
+          usage >&2
+          exit 1
+          ;;
+      esac
+      shift 2
+      ;;
+    --revert)
+      REVERT=1
+      shift
+      ;;
+    --no-model)
+      NO_MODEL=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$DEV" -eq 1 && "$REVERT" -eq 1 ]]; then
+  echo "error: --dev and --revert contradict each other: --dev installs this working tree," >&2
+  echo "error: --revert restores upstream fastedits from PyPI. Pick one." >&2
+  exit 1
+fi
+
+if [[ -n "$EXTRAS" ]]; then
+  PKG_SPEC="${PACKAGE}[${EXTRAS}]"
+else
+  PKG_SPEC="${PACKAGE}"
+fi
+
+# PREFLIGHT — fail before touching anything if uv is missing, so we
+# never half-uninstall the current tool.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "error: 'uv' is not on PATH. Install it first: https://docs.astral.sh/uv/" >&2
+  exit 1
+fi
+
+# Resolve the script's own repo root unconditionally: the source menu (and the
+# branch autodetect below) need to know whether a local fastedit tree EXISTS
+# (pyproject.toml beside this script), not just --dev. Validation stays with
+# DEV -- a downloaded copy of this script run without --dev must not abort
+# just because of where it happens to sit.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${REPO_ROOT}/pyproject.toml" ]]; then
+  HAVE_LOCAL_TREE=1
+fi
+
+# Extras in a PEP 508 direct reference (`pkg[extra] @ git+...`) are what this
+# script installs, and older uv did not support bracket extras on a tool
+# install (astral-sh/uv#6296). The failure mode there is the one this whole
+# script exists to prevent and it is SILENT: extras quietly dropped, the model
+# still downloaded, the backend absent, exit 0. Verified working on 0.12.12;
+# a floor of 0.5.0 is well below that and well above the issue. Warn rather
+# than abort -- the bound is inferred from an issue, not measured on old
+# versions, so refusing to install on it would be a guess with teeth. The
+# same bracket shape appears in dev mode as `path[extra]`, so the warning
+# covers both modes.
+#
+# The MAJOR.MINOR shape is validated before comparing, and that guard is not
+# decoration -- it was measured. Without it, a `uv --version` whose second field
+# is not the version (a wrapper, a shim, a localized build printing
+# "uv version 0.12.12") makes the comparison operate on the literal word, and
+# bash arithmetic treats an unset name as 0, so BOTH tests pass and a MODERN uv
+# gets warned at. A warning that cries wolf is worse than no warning: it teaches
+# the reader to scroll past the one line that would have mattered.
+_uv_ver="$(uv --version 2>/dev/null | awk '{print $2}')"
+if [[ "$_uv_ver" =~ ^[0-9]+\.[0-9]+ ]]; then
+  _uv_major="${_uv_ver%%.*}"
+  _uv_minor="${_uv_ver#*.}"; _uv_minor="${_uv_minor%%.*}"
+  if [[ "$_uv_major" -eq 0 && "$_uv_minor" -lt 5 ]]; then
+    echo "warning: uv $_uv_ver is older than 0.5; bracket extras on a tool install may be" >&2
+    echo "warning: silently ignored, leaving the merge model installed but unloadable." >&2
+    echo "warning: run 'fastedit doctor' afterwards and check the backend line." >&2
+  fi
+fi
+
+# Bound a command's runtime when a timeout binary exists. macOS ships without
+# coreutils' `timeout` (homebrew provides `gtimeout`); there we run unbounded
+# rather than fail -- the bound is a safety net for a hung network call, not a
+# correctness requirement.
+run_bounded() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Render argv as a shell-quoted line a user can copy-paste and get the
+# same invocation (so a spec like "fastedits @ git+https://..." stays one
+# paste-able token). An argument made only of characters that never need
+# quoting (word chars, path/URL punctuation) is left bare -- that's the
+# common case (uv, tool, uninstall, fastedits) and unquoted reads best.
+# Anything else is wrapped in single quotes -- far more readable than
+# printf %q's backslash-per-space/bracket escaping -- except when the
+# argument itself contains a single quote, where %q is used instead so
+# correctness never depends on the nicer-looking branch.
+quote_argv() {
+  local out="" arg quoted
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^[A-Za-z0-9_./:+@=-]+$ ]]; then
+      quoted="$arg"
+    elif [[ "$arg" == *"'"* ]]; then
+      printf -v quoted '%q' "$arg"
+    else
+      quoted="'${arg}'"
+    fi
+    out+="${out:+ }${quoted}"
+  done
+  printf '%s' "$out"
+}
+
+# Decide DEV (editable local tree) vs the remote fork install when the user
+# gave no explicit choice. Precedence, in order:
+#   --dev / --revert flags win and never prompt (--dev --revert already
+#     errored out above; --revert never shows the menu);
+#   standalone (no fastedit clone next to this script): there is no local
+#     tree to offer, so never prompt -- install from the fork, and on a
+#     terminal say so in one line;
+#   interactive (terminal on stdin): ASK, defaulting to the detected local
+#     tree ([1]); a bare Enter or anything unrecognized takes the default,
+#     the same convention the all-grammars [Y/n] prompt uses;
+#   non-interactive: no menu; --dev decides, otherwise the remote fork.
+resolve_source_mode() {
+  if [[ "$DEV" -eq 1 || "$REVERT" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$HAVE_LOCAL_TREE" -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      echo "note: no fastedit repo found next to this script — skipping the source menu and installing from the remote fork (${FORK_URL})" >&2
+    fi
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    return 0
+  fi
+  local answer=""
+  platform_line >&2
+  printf '%s' "Install from: [1] local working tree (editable, tracks your changes) [2] remote GitHub fork (pinned branch) — choose [1/2]: " >&2
+  read -r answer || answer=""
+  answer="${answer//[[:space:]]/}"
+  case "$answer" in
+    2) return 0 ;;
+    *) DEV=1 ;;  # 1, bare Enter (the detected default), or anything else -> local tree
+  esac
+}
+
+# Run one uninstall command, tolerating "there was nothing to remove"
+# in whatever shape that tool spells it, without masking a real failure.
+run_uninstall_step() {
+  local label="$1"
+  shift
+  echo "+ $(quote_argv "$@")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  local out status=0
+  out=$("$@" 2>&1) || status=$?
+  if [[ -n "$out" ]]; then
+    echo "$out"
+  fi
+  if [[ "$status" -ne 0 ]] && ! grep -qiE "$TOLERABLE_UNINSTALL_RE" <<<"$out"; then
+    echo "error: ${label} failed" >&2
+    exit "$status"
+  fi
+}
+
+# Sweep every install method that could be shadowing the one we're about
+# to put in place. uv is always attempted (it's our own preflight
+# dependency); pipx/pip only if actually present on this machine.
+sweep_uninstall() {
+  local pkg="$1"
+  echo "Sweeping other install locations for ${pkg} (uv tool, pipx, pip)..."
+  run_uninstall_step "uv tool uninstall" uv tool uninstall "$pkg"
+
+  if command -v pipx >/dev/null 2>&1; then
+    run_uninstall_step "pipx uninstall" pipx uninstall "$pkg"
+  fi
+
+  local pipbin=""
+  if command -v pip3 >/dev/null 2>&1; then
+    pipbin="pip3"
+  elif command -v pip >/dev/null 2>&1; then
+    pipbin="pip"
+  fi
+  if [[ -n "$pipbin" ]]; then
+    run_uninstall_step "${pipbin} uninstall" "$pipbin" uninstall -y "$pkg"
+  fi
+}
+
+# The package spec for a given extras list, in the shape the current mode
+# installs: a PEP 508 direct reference against the fork's git repo in fork
+# mode, a plain `path[extras]` in dev mode (verified working on uv 0.12.13:
+# bracket extras on a local path resolve, and --editable tracks the tree).
+# Empty extras -> bare package name / bare path.
+build_spec() {
+  local extras="$1"
+  if [[ "$DEV" -eq 1 ]]; then
+    if [[ -n "$extras" ]]; then
+      printf '%s[%s]' "$REPO_ROOT" "$extras"
+    else
+      printf '%s' "$REPO_ROOT"
+    fi
+  else
+    if [[ -n "$extras" ]]; then
+      printf '%s[%s] @ git+%s@%s' "$PACKAGE" "$extras" "$FORK_URL" "$REF"
+    else
+      printf '%s @ git+%s@%s' "$PACKAGE" "$FORK_URL" "$REF"
+    fi
+  fi
+}
+
+do_install() {
+  local spec="$1"
+  if [[ "$DEV" -eq 1 ]]; then
+    echo "+ uv tool install --force --editable $(quote_argv "$spec")"
+  else
+    echo "+ uv tool install $(quote_argv "$spec")"
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$DEV" -eq 1 ]]; then
+    uv tool install --force --editable "$spec"
+  else
+    uv tool install "$spec"
+  fi
+}
+
+# Same install, but a failure is REPORTED rather than fatal. This exists for
+# exactly one caller: the optional backend-extra attempt below. The sweep
+# uninstalls before it installs, so any install step that can fail is a step
+# that can leave this machine with NO fastedit at all — and with no fastedit
+# there is no sanctioned way to edit source and repair it. A compiled extra
+# (mlx) is the only genuinely failure-prone spec this script builds, so it is
+# the one install that must never be allowed to abort the run.
+do_install_optional() {
+  do_install "$1" || return 1
+}
+
+# Verify that the AUTODETECTED branch actually exists on the fork remote
+# before anything is uninstalled. `uv tool install git+...@missing-branch`
+# would fail anyway, but only AFTER the sweep has already removed the
+# previous install -- this check fails LOUDLY, with the remote's actual
+# heads listed, while the machine still has a working fastedit.
+#
+# Runs on real installs only: --dry-run prints the command it WOULD run and
+# skips the network, keeping dry-runs hermetic. An unreachable remote is a
+# warning, not an abort (offline preview must still work, and uv's own
+# resolution fails clearly later if the ref truly does not exist); a
+# definitive "remote reachable, branch absent" is an abort.
+verify_remote_ref() {
+  if [[ "$REF_AUTO" -ne 1 ]]; then
+    return 0
+  fi
+  echo "+ $(quote_argv git ls-remote --heads "$FORK_URL" "$REF")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "note: dry-run: the fork-remote branch check is skipped (no network); the real run verifies before installing."
+    return 0
+  fi
+  local heads status=0
+  heads=$(run_bounded 20 git ls-remote --heads "$FORK_URL" 2>/dev/null) || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "warning: could not verify branch '${REF}' against ${FORK_URL} (git ls-remote failed or timed out)." >&2
+    echo "warning: continuing — 'uv tool install' fails clearly if the branch does not exist." >&2
+    return 0
+  fi
+  # awk exact match, not grep: a ref like "feat/x" must not match the head
+  # "refs/heads/feat/x-y", and a regex-metacharacter branch name must not be
+  # interpreted as a pattern.
+  if ! awk -v want="refs/heads/${REF}" '$2 == want { found=1 } END { exit found ? 0 : 1 }' <<<"$heads"; then
+    echo "error: branch '${REF}' does not exist on the fork remote (${FORK_URL})." >&2
+    echo "error: refs/heads on ${FORK_URL}:" >&2
+    if [[ -n "$heads" ]]; then
+      awk '{print "  " $2}' <<<"$heads" | sort >&2
+    else
+      echo "  (the remote reports no branches)" >&2
+    fi
+    echo "error: push the branch, or pin one that exists with --ref <branch|tag|sha>." >&2
+    exit 1
+  fi
+  echo "verified: branch '${REF}' exists on the fork remote"
+}
+
+# PREFLIGHT DETECTION — report what is installed and what is cached, BEFORE
+# anything is uninstalled. Runs even in --dry-run: a dry run should print
+# everything the real run would act on, so the transcript is a complete
+# preview. Purely informational: never installs, never removes.
+detect_installed_fastedits() {
+  echo "preflight: currently installed ${PACKAGE} (uv tool / pipx / pip):"
+  local found=0 line
+
+  # `uv tool list` prints one tool per block, headed "fastedits v0.1.2".
+  local uv_list=""
+  uv_list="$(run_bounded 15 uv tool list 2>/dev/null || true)"
+  if [[ -n "$uv_list" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "$PACKAGE "*) echo "  uv tool: $line"; found=1 ;;
+      esac
+    done <<<"$uv_list"
+  fi
+
+  # `pipx list --short` prints one "name version" pair per line.
+  if command -v pipx >/dev/null 2>&1; then
+    local pipx_list=""
+    pipx_list="$(run_bounded 15 pipx list --short 2>/dev/null || true)"
+    if [[ -n "$pipx_list" ]]; then
+      while IFS= read -r line; do
+        case "$line" in
+          "$PACKAGE "*) echo "  pipx: $line"; found=1 ;;
+        esac
+      done <<<"$pipx_list"
+    fi
+  fi
+
+  # Same pip resolution the sweep uses, so the report never names a pip the
+  # sweep would not touch. `pip show` exits non-zero when absent.
+  local pipbin=""
+  if command -v pip3 >/dev/null 2>&1; then
+    pipbin="pip3"
+  elif command -v pip >/dev/null 2>&1; then
+    pipbin="pip"
+  fi
+  if [[ -n "$pipbin" ]]; then
+    local show=""
+    if show="$(run_bounded 15 "$pipbin" show "$PACKAGE" 2>/dev/null)"; then
+      local ver loc
+      ver="$(awk -F': ' '/^Version:/ {print $2; exit}' <<<"$show")"
+      loc="$(awk -F': ' '/^Location:/ {print $2; exit}' <<<"$show")"
+      echo "  ${pipbin}: ${PACKAGE} ${ver:-?} (${loc:-unknown location})"
+      found=1
+    fi
+  fi
+
+  # The binary that would actually win on PATH right now -- the same
+  # resolution the postflight re-checks after the install.
+  local bin_path=""
+  bin_path="$(command -v fastedit 2>/dev/null || true)"
+  if [[ -n "$bin_path" ]]; then
+    echo "  binary: ${bin_path} (the fastedit that wins on PATH right now)"
+    found=1
+  fi
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "  (none found — clean slate)"
+  fi
+}
+
+# VALID or STALE for one model directory: VALID iff it holds at least one
+# real weight file (*.safetensors). A dir with only config/tokenizer files
+# is a partial download -- pulling into it would resume over a half-written
+# state, so it is the thing the cleanup below offers to remove.
+model_cache_state() {
+  local dir="$1"
+  if compgen -G "${dir}/*.safetensors" >/dev/null 2>&1; then
+    printf '%s' "VALID"
+  else
+    printf '%s' "STALE (partial, no *.safetensors)"
+  fi
+}
+
+detect_model_caches() {
+  echo "preflight: model caches under ${MODELS_DIR}:"
+  if [[ ! -d "$MODELS_DIR" ]]; then
+    echo "  (no cache directory — nothing cached yet)"
+    return 0
+  fi
+  local d name size state any=0
+  # Non-glob iteration guard: with no entries the pattern stays literal and
+  # the [[ -d ]] test skips it.
+  for d in "$MODELS_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    any=1
+    name="$(basename "$d")"
+    size="$(run_bounded 15 du -sh "$d" 2>/dev/null | awk '{print $1}' || true)"
+    state="$(model_cache_state "$d")"
+    echo "  ${name}  ${size:-?}  ${state}"
+  done
+  if [[ "$any" -eq 0 ]]; then
+    echo "  (no model directories)"
+  fi
+}
+
+# Act on what detect_model_caches reported: keep VALID caches (they are
+# shared between fork and upstream -- deleting them would cost a ~3 GB
+# re-download for nothing), remove STALE ones so the next pull reinstalls
+# cleanly. --revert keeps EVERY cache (existing contract: revert never
+# touches model weights). Like every prompt in this script, the question is
+# resolved BEFORE the sweep, so nobody sits uninstalled while a prompt waits.
+# In --dry-run nothing is removed: the action is printed as "would remove".
+handle_model_caches() {
+  if [[ "$REVERT" -eq 1 ]]; then
+    echo "model caches: kept — --revert leaves downloaded weights in place (shared with upstream)"
+    return 0
+  fi
+  if [[ ! -d "$MODELS_DIR" ]]; then
+    return 0
+  fi
+  local d name answer state
+  for d in "$MODELS_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    state="$(model_cache_state "$d")"
+    if [[ "$state" == "VALID" ]]; then
+      echo "model cache ${name}: kept — shared cache"
+      continue
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "would remove stale model cache ${name} (${d}) — partial download, no *.safetensors; the next pull reinstalls it cleanly"
+      continue
+    fi
+    answer=""
+    if [[ -t 0 ]]; then
+      printf '%s' "remove stale model cache '${name}' (${d})? [Y/n] " >&2
+      read -r answer || answer=""
+      answer="${answer//[[:space:]]/}"
+      case "$answer" in
+        n|N|no|NO|No)
+          echo "model cache ${name}: kept (kept at your request)"
+          continue
+          ;;
+      esac
+    else
+      echo "note: non-interactive: removing stale model cache '${name}' (partial, no *.safetensors); the pull reinstalls it cleanly" >&2
+    fi
+    run_bounded 60 rm -rf "$d"
+    echo "removed stale model cache '${name}' (${d})"
+  done
+}
+
+# Resolve whether all-grammars goes into the install. Precedence:
+# --revert (never asks, never adds), then the --all-grammars flag, then the
+# interactive prompt / non-interactive default.
+ask_all_grammars() {
+  if [[ "$REVERT" -eq 1 ]]; then
+    printf '%s' "no"
+    return 0
+  fi
+  if [[ "$ALL_GRAMMARS_SET" -eq 1 ]]; then
+    printf '%s' "$ALL_GRAMMARS"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    local answer=""
+    printf '%s' "Install all grammars? (offline 173-language tree-sitter pack — every tree-sitter-supported format works) [Y/n] " >&2
+    read -r answer || answer=""
+    answer="${answer//[[:space:]]/}"
+    case "$answer" in
+      n|N|no|NO|No) printf '%s' "no" ;;
+      *) printf '%s' "yes" ;;  # Enter (empty), y/yes, and anything unrecognized -> the [Y] default
+    esac
+  else
+    echo "note: non-interactive: all grammars enabled by default; pass --all-grammars no to skip" >&2
+    printf '%s' "yes"
+  fi
+}
+
+# Append all-grammars to an extras list, deduped. Answering yes to the prompt
+# IS an instruction, so it outranks an empty --extras opt-out for grammars
+# only: "" becomes exactly "all-grammars", and a list that already carries the
+# extra is left alone. Answering no changes nothing.
+extras_with_all_grammars() {
+  local extras="$1"
+  if [[ "$GRAMMARS_ANSWER" != "yes" ]]; then
+    printf '%s' "$extras"
+    return 0
+  fi
+  if [[ -z "$extras" ]]; then
+    printf '%s' "all-grammars"
+    return 0
+  fi
+  case ",${extras}," in
+    *,all-grammars,*) printf '%s' "$extras" ;;
+    *) printf '%s' "${extras},all-grammars" ;;
+  esac
+}
+
+# `fastedit pull` (get_model_path) already resolves env var -> local dir
+# -> cache dir -> download, in that order, so it's a no-op when the
+# model is already cached. We don't re-implement that lookup here —
+# duplicating fastedit's own cache path would just be a second, driftable
+# copy of the same logic. We only decide WHICH model this platform wants.
+detect_model() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  if [[ "$os" == "Darwin" && "$arch" == "arm64" ]]; then
+    echo "mlx-8bit"
+    return 0
+  fi
+  if [[ "$os" == "Linux" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    echo "bf16"
+    return 0
+  fi
+  return 1
+}
+
+# EVERY extra this platform can actually install (owner directive 2026-09-13:
+# "it must install with all extras by default"). A default install must not be
+# crippled -- an extras-less one cached 1.7 GB at mlx-8bit and then died with
+# `ModuleNotFoundError: No module named 'mlx'` on the first model-merge edit.
+#
+# "All extras" cannot be taken literally, and that is the whole reason this is
+# a function rather than a constant: the three declared extras are not
+# co-installable. `mlx` ships no Linux wheels; `vllm` ships no macOS wheels.
+# Asking for both guarantees a failed resolve on EVERY platform, which would
+# turn a crippled install into no install at all. So it means every extra that
+# is installable HERE:
+#
+#   Darwin/arm64      -> mlx,mcp     (mlx is the backend for the mlx-8bit model)
+#   Linux + nvidia    -> vllm,mcp    (vllm is the declared CUDA backend extra)
+#   anything else     -> mcp         (pure Python, installs anywhere)
+#
+# `mcp` is unconditional: it is the MCP server, part of the advertised surface,
+# and pure Python via fastmcp. The install is non-fatal (see do_install_optional)
+# precisely because mlx and vllm are compiled wheels that CAN fail to build --
+# a failure falls back to the bare spec rather than leaving no fastedit at all.
+detect_backend_extra() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  if [[ "$os" == "Darwin" && "$arch" == "arm64" ]]; then
+    echo "mlx,mcp"
+    return 0
+  fi
+  if [[ "$os" == "Linux" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    echo "vllm,mcp"
+    return 0
+  fi
+  echo "mcp"
+  return 0
+}
+
+pull_model() {
+  local model="$1"
+  echo "+ fastedit pull --model $(quote_argv "$model")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  fastedit pull --model "$model"
+}
+
+# A failed postflight is only useful if it tells the user how to fix it,
+# not just what's wrong -- otherwise it gets shrugged off as noise ("it
+# always says that") and the safety check it guards stops being trusted.
+# The usual fix is the one `uv tool install` itself hints at moments
+# earlier: uv's own bin dir isn't on PATH yet.
+print_path_hint() {
+  local uv_bin=""
+  uv_bin=$(uv tool dir --bin 2>/dev/null || true)
+  if [[ -n "$uv_bin" ]]; then
+    echo "hint: uv installs tools into ${uv_bin} -- make sure it's on PATH." >&2
+  fi
+  echo "hint: run 'uv tool update-shell' (then open a new shell) or add uv's tool bin dir to PATH yourself." >&2
+}
+
+# POSTFLIGHT — the whole point of this script. Resolve the fastedit that
+# will actually run (not just "one exists somewhere") and confirm it is
+# the fork. A stale upstream earlier on PATH, or an upstream reinstalled
+# by something else, must fail loudly here rather than pass silently.
+verify_fork_install() {
+  local resolved
+  if ! resolved=$(command -v fastedit); then
+    echo "error: no 'fastedit' found on PATH after install" >&2
+    print_path_hint
+    exit 1
+  fi
+
+  local all_matches
+  all_matches=$(type -a fastedit 2>/dev/null | grep '^fastedit is ' | sed 's/^fastedit is //' || true)
+  local match_count
+  match_count=$(printf '%s\n' "$all_matches" | grep -c . || true)
+
+  local help_output
+  if ! help_output=$(fastedit --help 2>&1); then
+    echo "error: 'fastedit --help' failed after install" >&2
+    echo "$help_output" >&2
+    exit 1
+  fi
+
+  local missing=()
+  local cmd
+  for cmd in create duplicate split join; do
+    if ! grep -qw "$cmd" <<<"$help_output"; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "error: the 'fastedit' on PATH (${resolved}) is missing fork subcommands: ${missing[*]}" >&2
+    if [[ "$match_count" -gt 1 ]]; then
+      echo "error: multiple 'fastedit' binaries are on PATH — a shadowed upstream may be winning:" >&2
+      printf '  %s\n' "$all_matches" >&2
+    fi
+    echo "error: the install did not actually put the fork in place — aborting" >&2
+    print_path_hint
+    exit 1
+  fi
+
+  if [[ "$match_count" -gt 1 ]]; then
+    echo "warning: multiple 'fastedit' binaries found on PATH; the one that wins is ${resolved}:" >&2
+    printf '  %s\n' "$all_matches" >&2
+  fi
+  echo "verified: fastedit at ${resolved} lists create, duplicate, split, join"
+}
+
+# The grammar axis, reported honestly. The probe runs ONLY when all-grammars
+# was actually selected -- interrogating an install that never asked for the
+# pack would just report an expected absence and teach the reader to scroll
+# past this block. It uses the tool env's OWN python (the venv uv made for
+# the installed tool), not whatever python is first on PATH: the point is to
+# test what the installed tool can actually load.
+verify_grammars() {
+  if [[ "$GRAMMARS_SELECTED" -ne 1 ]]; then
+    echo "grammars: all-grammars not selected — extended languages (scala, lua, perl, ...) will not resolve"
+    return 0
+  fi
+  local tool_python=""
+  tool_python="$(uv tool dir 2>/dev/null)/${PACKAGE}/bin/python"
+  if [[ ! -x "$tool_python" ]]; then
+    echo "warning: all-grammars was selected, but no python was found at ${tool_python}; cannot verify the grammar pack." >&2
+    return 0
+  fi
+  if "$tool_python" -c "from tree_sitter_language_pack import get_language" 2>/dev/null; then
+    echo "grammars: all-grammars pack present (verified via the tool's own python)"
+  else
+    echo "warning: all-grammars was selected, but 'tree_sitter_language_pack' is not importable in the tool environment." >&2
+    if [[ "$DEV" -eq 1 ]]; then
+      echo "warning: extended languages will not resolve. Retry: uv tool install --force --editable '$(build_spec "all-grammars")'" >&2
+    else
+      echo "warning: extended languages will not resolve. Retry: uv tool install --force '$(build_spec "all-grammars")'" >&2
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Mode resolution, branch autodetect, preflight detection
+# ---------------------------------------------------------------------------
+
+resolve_source_mode
+
+# Validation must cover BOTH ways DEV can become 1: explicit --dev from a
+# stray copy of this script (no pyproject.toml -> abort loudly rather than
+# half-install), and menu pick [1] (which only ever offers a detected tree).
+if [[ "$DEV" -eq 1 ]]; then
+  if [[ ! -f "${REPO_ROOT}/pyproject.toml" ]]; then
+    echo "error: --dev installs from this repo's working tree, but no pyproject.toml was found at ${REPO_ROOT}" >&2
+    echo "error: run this script from a checkout of the fastedit repo, or drop --dev to install from git." >&2
+    exit 1
+  fi
+  if [[ "$REF_SET" -eq 1 ]]; then
+    echo "note: --ref has no effect with --dev (dev installs from the working tree, not a git ref)" >&2
+  fi
+fi
+
+# BRANCH AUTODETECT (fork mode) — default the ref to the CURRENT branch of the
+# local clone, so re-running the installer from a checkout tracks the branch
+# you are actually on instead of a hardcoded one. Only when: forward mode, no
+# explicit --ref, and a local tree was detected. Detached HEAD or a failed
+# query falls back to the built-in default with a note.
+if [[ "$REVERT" -eq 0 && "$DEV" -eq 0 && "$REF_SET" -eq 0 && "$HAVE_LOCAL_TREE" -eq 1 ]]; then
+  detected_ref="$(run_bounded 10 git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -n "$detected_ref" && "$detected_ref" != "HEAD" ]]; then
+    REF="$detected_ref"
+    REF_AUTO=1
+    echo "branch: installing the local clone's current branch '${REF}' from the fork"
+  else
+    echo "note: could not detect the local clone's branch (detached HEAD?) — keeping the default '${REF}'" >&2
+  fi
+fi
+
+verify_remote_ref
+
+# PREFLIGHT DETECTION — printed for real runs and dry runs alike, before
+# anything is uninstalled.
+detect_installed_fastedits
+detect_model_caches
+
+if [[ "$REVERT" -eq 1 ]]; then
+  echo "Reverting to upstream ${PACKAGE} from PyPI..."
+  handle_model_caches
+  sweep_uninstall "$PACKAGE"
+  do_install "$PKG_SPEC"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    echo "reverted: ${PACKAGE} is now upstream (no create/duplicate/split/join — that's expected)"
+  fi
+else
+  # Resolve the grammar question BEFORE the sweep: the sweep uninstalls the
+  # current fastedit, and nobody should be left uninstalled while a prompt
+  # waits for an answer. The stale-cache question follows the same rule.
+  GRAMMARS_ANSWER=$(ask_all_grammars)
+  if [[ "$GRAMMARS_ANSWER" == "yes" ]]; then
+    GRAMMARS_SELECTED=1
+  else
+    GRAMMARS_SELECTED=0
+  fi
+  handle_model_caches
+
+  if [[ "$DEV" -eq 1 ]]; then
+    echo "dev install (editable, tracks your working tree)"
+    echo "Installing ${PACKAGE} editable from ${REPO_ROOT} in place of upstream ${PACKAGE}..."
+  else
+    echo "fork install (pinned to ${REF})"
+    echo "Installing fork ${FORK_URL}@${REF} in place of upstream ${PACKAGE}..."
+  fi
+  sweep_uninstall "$PACKAGE"
+
+  # Two-phase, and the order is the whole point. The model is only useful if
+  # the backend that loads it is installed, so try the backend extra FIRST --
+  # but never let that attempt decide whether this machine ends up with a
+  # fastedit. `mlx` is a compiled wheel; resolution or build CAN fail, and the
+  # sweep above has already removed the previous install. So a failure falls
+  # back to the bare spec (the near-unfailable pure-Python one) and downgrades
+  # to deterministic-edit-only, which still works.
+  # BACKEND_READY is tracked rather than probed. It records what we INSTALLED,
+  # which is not the same as what is IMPORTABLE: a wheel can install and still
+  # fail to load (wrong arch under Rosetta, a broken build). So this closes the
+  # common case, not the whole class -- if the import fails anyway, the pull is
+  # a wasted download, not a corruption.
+  #
+  # 0 means "we have positive evidence there is no backend", NOT "we don't
+  # know". Absence of a mapping is not evidence of an absent backend: on a
+  # platform where we never attempted an install we must NOT infer failure,
+  # because the user may already have a working runtime we know nothing about.
+  # Downgrading their previously-working model pull on a guess would be the
+  # same unverified inference we refused to encode in detect_backend_extra.
+  # Tri-state, deliberately. BACKEND_ATTEMPTED distinguishes "we tried to
+  # install a backend and it failed" from "we never tried, so we know
+  # nothing" -- and ONLY the first is grounds for withholding the model.
+  BACKEND_ATTEMPTED=0
+  BACKEND_READY=0
+  BACKEND_EXTRA=""
+  INSTALL_EXTRAS=""
+  if [[ "$EXTRAS_SET" -eq 0 ]] && BACKEND_EXTRA=$(detect_backend_extra); then
+    # `mcp` is NOT a merge backend -- it is the MCP server. On a platform where
+    # the auto-selected set is mcp-only (neither mlx nor vllm is installable),
+    # the install succeeding tells us nothing about merge capability, so the
+    # model pull must stay withheld. Setting READY on a bare `mcp` success would
+    # silently restore the original defect: 1.8 GB downloaded with nothing able
+    # to load it.
+    INSTALL_EXTRAS=$(extras_with_all_grammars "$BACKEND_EXTRA")
+    case ",${INSTALL_EXTRAS}," in
+      *,mlx,*|*,vllm,*) BACKEND_ATTEMPTED=1 ;;
+    esac
+    if do_install_optional "$(build_spec "$INSTALL_EXTRAS")"; then
+      case ",${INSTALL_EXTRAS}," in
+        *,mlx,*|*,vllm,*) BACKEND_READY=1 ;;
+      esac
+    else
+      echo "warning: installing the '${INSTALL_EXTRAS}' extras failed; falling back to a bare install." >&2
+      echo "warning: deterministic edits will work; model-merge edits will not, and the model pull is skipped." >&2
+      if [[ "$DEV" -eq 1 ]]; then
+        echo "warning: to retry later: uv tool install --force --editable '$(build_spec "$INSTALL_EXTRAS")'" >&2
+      else
+        echo "warning: to retry later: uv tool install --force '$(build_spec "$INSTALL_EXTRAS")'" >&2
+      fi
+      do_install "$(build_spec "")"
+    fi
+  else
+    # An explicit --extras is the user's call: honour it exactly and make no
+    # backend guess on top of it (the grammar answer is the one addition it
+    # can carry, because the user was asked about it directly).
+    INSTALL_EXTRAS=$(extras_with_all_grammars "$EXTRAS")
+    do_install "$(build_spec "$INSTALL_EXTRAS")"
+    case ",${INSTALL_EXTRAS}," in *,mlx,*|*,vllm,*) BACKEND_READY=1 ;; esac
+    # `--extras ""` is not ignorance, it is an instruction. The user just told
+    # us not to install a backend, so this install provides none -- that is
+    # POSITIVE evidence, and pulling 1.7 GB of weights for the backend they
+    # declined would be the same "act on an inference" error as the Linux
+    # branch above, with the sign flipped. An unmapped PLATFORM teaches us
+    # nothing (attempted stays 0); an explicit empty --extras teaches us
+    # something (attempted is 1). They are different states and must not
+    # collapse into one flag value.
+    if [[ "$EXTRAS_SET" -eq 1 && "$BACKEND_READY" -eq 0 ]]; then
+      BACKEND_ATTEMPTED=1
+    fi
+  fi
+
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    verify_fork_install
+    verify_grammars
+  fi
+
+  if [[ "$NO_MODEL" -eq 0 ]]; then
+    if [[ "$BACKEND_ATTEMPTED" -eq 1 && "$BACKEND_READY" -eq 0 ]]; then
+      # Skip ONLY on positive evidence: we tried to install the backend on this
+      # platform and the install failed. Pulling ~1.7 GB that nothing can load
+      # is what this script used to do, and it produced a green install whose
+      # first model-merge edit raised ModuleNotFoundError.
+      #
+      # The condition is deliberately NOT `BACKEND_READY -eq 0` alone. That
+      # would also catch the case where we never attempted an install (no
+      # extra is mapped for this platform), and withhold the model from a
+      # machine that may well have a working runtime already -- a downgrade of
+      # previously-working behaviour, inferred from our own ignorance.
+      # Two different reasons land here and they must not share a message: a
+      # FAILED attempt (BACKEND_EXTRA names what we tried) versus the user
+      # DECLINING extras. Telling someone who passed --extras "" that an
+      # install "failed" sends them debugging a failure that never happened.
+      if [[ -n "$BACKEND_EXTRA" ]]; then
+        echo "note: the '${BACKEND_EXTRA}' backend failed to install — skipping the model pull (~1.7 GB nothing could load)."
+        echo "note: install a backend first, then run 'fastedit pull' — see the warnings above."
+      else
+        echo "note: no backend extra was installed (--extras \"\") — skipping the model pull (~1.7 GB nothing could load)."
+        echo "note: if you already have a backend, run 'fastedit pull' yourself, or re-run without --extras."
+      fi
+    elif MODEL=$(detect_model); then
+      pull_model "$MODEL"
+      if [[ "$DRY_RUN" -eq 0 ]]; then
+        fastedit doctor || true
+      fi
+    else
+      echo "note: no known model for this platform ($(uname -s)/$(uname -m)) — skipping model pull."
+      echo "note: run 'fastedit pull --model mlx-8bit' (Apple Silicon) or 'fastedit pull --model bf16' (Linux GPU) manually if needed."
+    fi
+  fi
+fi
