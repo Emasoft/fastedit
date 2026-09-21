@@ -9,8 +9,13 @@ does not list) and probes EVERY name through fastedit's real resolver
 
 Classification per language:
 
-* ``ok`` — resolved, and at least one trivial probe snippet parses with zero
-  error traits;
+* ``ok`` — resolved, and at least one probe snippet parses with zero error
+  traits. v2 flavors (optional entry fields): ``guarded_parse`` — a
+  G1a-guarded grammar (PATHOLOGICAL_RECOVERY_GRAMMARS) whose REAL snippet
+  parsed clean under the subprocess watchdog (healthy-with-watchdog;
+  guarded grammars never receive trivial probes, which would wedge);
+  ``filtered_artifacts`` — the parse's known-grammar-artifact traits were
+  filtered per G1a (the ``test`` grammar's systematic MISSING-at-EOF);
 * ``parse_degraded`` — resolved, but no probe snippet parses cleanly (the
   grammar cannot express any of the trivial one-liners, or parsing raised);
 * ``unresolvable`` — the resolver could not serve the language, the probe
@@ -61,9 +66,18 @@ from pathlib import Path
 
 from fastedit.data_gen.ast_analyzer import LANGUAGE_ALIASES
 
-PROBE_VERSION = 1
+PROBE_VERSION = 2
 """Bump when the probe program, snippets, or entry schema change — it
-invalidates the cached snapshot so every language is re-probed."""
+invalidates the cached snapshot so every language is re-probed.
+
+v2: real per-language snippets for the two grammars whose verdict the
+trivial one-liners cannot express — cobol (G1a-guarded: a trivial line is
+unrecoverable input whose parse wedges, so guarded grammars NEVER receive
+trivial probes — each wedge would cost the whole census timeout) and test
+(G1a artifact filter: the trivial lines are outright ERROR nodes while the
+real record parses with the systematic artifact filtered). An ok verdict
+may additionally carry ``guarded_parse`` (healthy-with-watchdog) or
+``filtered_artifacts`` (the known-grammar-artifact count)."""
 
 PACK_MODULE = "tree_sitter_language_pack"
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "golden" / "pack_census.json"
@@ -172,7 +186,35 @@ except Exception as exc:  # noqa: BLE001 — wheel ABI errors etc. = unresolvabl
 parse_exception = None
 parsed_any = False
 clean = False
-for snippet in SNIPPETS:
+filtered_artifacts = 0
+# Real per-language snippets for the languages whose verdict the trivial
+# one-liners cannot express (probe v2). Guarded grammars
+# (aa.PATHOLOGICAL_RECOVERY_GRAMMARS) receive ONLY these: a trivial line is
+# unrecoverable input for such a grammar and the parse wedges until the
+# watchdog deadline (15s) — longer than the census's own per-language kill
+# (10s) — so probing trivial lines at a guarded grammar can only burn the
+# census timeout. `test` is the artifact case: every trivial line is an
+# outright ERROR node, while the real record parses with the known
+# systematic artifact filtered (G1a) — exactly the ok claim to verify.
+REAL_SNIPPETS = {
+    "cobol": (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. HELLO.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       MAIN-PARA.\n"
+        '           DISPLAY "HELLO".\n'
+        "           STOP RUN.\n"
+    ),
+    "test": (
+        "================\nSample test\n================\n"
+        'print("hi")\n================\n'
+    ),
+}
+guarded = name in aa.PATHOLOGICAL_RECOVERY_GRAMMARS
+candidates = tuple(REAL_SNIPPETS.get(name, ()))
+if not guarded:
+    candidates = candidates + SNIPPETS
+for snippet in candidates:
     try:
         diagnostics = aa.parse_diagnostics(snippet, name)
     except Exception as exc:  # noqa: BLE001 — a crashing parse is a verdict
@@ -181,12 +223,28 @@ for snippet in SNIPPETS:
     parsed_any = True
     if diagnostics.is_valid:
         clean = True
+        filtered_artifacts = len(diagnostics.grammar_artifacts)
         break
 
 if clean:
     verdict["status"] = "ok"
     verdict["reason"] = None
-    verdict["detail"] = "resolved; probe snippet parsed with zero error traits"
+    if guarded:
+        verdict["guarded_parse"] = True
+        verdict["detail"] = (
+            "resolved; real per-language snippet parsed with zero error "
+            "traits under fastedit's subprocess parse watchdog "
+            "(PATHOLOGICAL_RECOVERY_GRAMMARS member — healthy-with-watchdog)"
+        )
+    else:
+        verdict["detail"] = "resolved; probe snippet parsed with zero error traits"
+        if filtered_artifacts:
+            verdict["filtered_artifacts"] = filtered_artifacts
+            verdict["detail"] += (
+                f" ({filtered_artifacts} known grammar artifact trait(s) "
+                f"filtered — see _GRAMMAR_ARTIFACT_FILTERS)"
+            )
+    finish()
 elif parsed_any:
     verdict["status"] = "parse_degraded"
     verdict["reason"] = "no_clean_parse"
@@ -321,6 +379,15 @@ def _probe_one(name: str, probe_timeout: float) -> dict:
         served_by if served_by in ("direct_wheel", "language_pack")
         else "language_pack"
     )
+    # G1b flavor fields (both optional; plain ok entries carry neither):
+    # ``guarded_parse`` — the ok was earned under the subprocess parse
+    # watchdog (healthy-with-watchdog); ``filtered_artifacts`` — how many
+    # known grammar artifact traits the ok parse filtered (G1a).
+    if verdict.get("guarded_parse") is True:
+        entry["guarded_parse"] = True
+    filtered = verdict.get("filtered_artifacts")
+    if isinstance(filtered, int) and filtered > 0:
+        entry["filtered_artifacts"] = filtered
     return entry
 
 

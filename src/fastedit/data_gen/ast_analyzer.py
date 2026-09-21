@@ -8,6 +8,7 @@ This powers the AST-aware data generation pipeline.
 from __future__ import annotations
 
 import importlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -854,6 +855,11 @@ def validate_parse(source: str, language: str) -> bool:
     same defect set the relative rule sees — including the C2 suite-opener
     scan for colon-headed indentation languages, which tree-sitter's
     error recovery silently waves through.
+
+    Guarded grammars (:data:`PATHOLOGICAL_RECOVERY_GRAMMARS`) route through
+    the subprocess watchdog with the same routing: healthy input returns
+    the ordinary verdict; a wedged parse raises the typed
+    :class:`ParseWatchdogTimeout` instead of hanging.
     """
     return not parse_diagnostics(source, language).errors
 
@@ -864,14 +870,296 @@ class ParseDiagnostics(NamedTuple):
     ``errors`` is the document-ordered list of ``(start_byte, end_byte,
     kind)`` spans for the parse's ERROR and MISSING nodes (``kind`` is
     ``"ERROR"`` or ``"MISSING"``). ``is_valid`` is True iff the parse
-    produced no error trait at all (identical to
-    :func:`validate_parse`). ``source`` is the exact text the byte spans
+    produced no (unfiltered) error trait — identical to
+    :func:`validate_parse`. ``source`` is the exact text the byte spans
     index — see :func:`parse_diagnostics` for the normalization contract.
+
+    ``grammar_artifacts`` (Step G1a) holds the traits that were removed
+    from ``errors`` because they match a declared KNOWN grammar artifact
+    (:data:`_GRAMMAR_ARTIFACT_FILTERS`) — an error trait the grammar
+    itself emits systematically for well-formed input, not a property of
+    the text. It is empty for every language without a declared filter.
     """
 
     errors: list[tuple[int, int, str]]
     is_valid: bool
     source: str
+    grammar_artifacts: tuple[tuple[int, int, str], ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Step G1a — bounded parse watchdog for pathological-recovery grammars
+# ---------------------------------------------------------------------------
+
+PATHOLOGICAL_RECOVERY_GRAMMARS = frozenset({"cobol"})
+"""Grammars whose error recovery can wedge FOREVER on unrecoverable input.
+
+Declarative extension point (CLAUDE.md): a language whose tree-sitter
+grammar's error recovery loops instead of terminating joins by adding its
+name here — every parse of it is then routed through the bounded
+subprocess watchdog (:func:`bounded_parse_diagnostics`) instead of the
+in-process parse. Healthy input is unaffected (the grammar parses it
+normally); pathological input gets a typed :class:`ParseWatchdogTimeout`
+instead of hanging the whole edit pipeline.
+
+Measured behavior behind the founding member (Phase F census, where the
+``cobol`` probe hung attempt #1 and is classified unresolvable only
+because the census runs hang-proof per-language subprocesses):
+
+* ``get_language("cobol")`` resolves instantly and parsing a REAL cobol
+  program completes in 0.0s with zero error traits — the grammar is
+  healthy on well-formed input;
+* parsing INVALID cobol (e.g. the single line ``x``) NEVER returns: the
+  grammar's error recovery wedges on unrecoverable input, hanging any
+  in-process parse.
+
+Members are canonical language names (:func:`canonical_language_name`).
+"""
+
+PARSE_WATCHDOG_TIMEOUT_SECONDS = 15.0
+"""Hard deadline for one bounded subprocess parse.
+
+Generous over the census's 10 s probe cap so a slow-but-terminating
+recovery on a large healthy file is never misclassified as a wedge —
+while still bounded, which is the point. Bounded is the contract;
+precision is not.
+"""
+
+
+class ParseWatchdogTimeout(RuntimeError):
+    """A :data:`PATHOLOGICAL_RECOVERY_GRAMMARS` parse exceeded its deadline.
+
+    Raised by :func:`bounded_parse_diagnostics` when the subprocess parse
+    did not terminate within the watchdog budget — the measured signature
+    of the grammar's error recovery wedging on unrecoverable input. No
+    honest diagnostics exist for such text, so the typed error is the
+    verdict.
+
+    A :class:`RuntimeError` subclass on purpose: the existing
+    ``except (ValueError, RuntimeError, ImportError)`` consumers (e.g.
+    :func:`fastedit.inference.ast_utils.get_ast_map_from_source`) treat a
+    wedge exactly like an unresolvable grammar (empty AST map) with zero
+    changes, while callers that want to distinguish "wedged parse" can
+    catch this specifically.
+
+    Attributes:
+        language: The canonical language whose parse was bounded.
+        timeout_seconds: The deadline that was exceeded.
+    """
+
+    def __init__(self, language: str, timeout_seconds: float) -> None:
+        super().__init__(
+            f"parse of '{language}' exceeded the {timeout_seconds}s parse "
+            f"watchdog — the grammar's error recovery wedged on "
+            f"unrecoverable input (see PATHOLOGICAL_RECOVERY_GRAMMARS); "
+            f"no honest diagnostics exist for this text"
+        )
+        self.language = language
+        self.timeout_seconds = timeout_seconds
+
+
+# The watchdog worker: a tiny `python -c` program executed in a FRESH
+# interpreter. It reads the source from a temp file (large texts never
+# travel through argv or a pipe), parses with the UNGUARDED in-process
+# path — never the routing wrapper, so a guarded grammar cannot spawn
+# watchdogs recursively — and writes one JSON document (UTF-8 bytes) with
+# the parse diagnostics. The parent imposes the hard deadline via
+# subprocess.run(timeout=...) and kills the wedged child on expiry.
+_WATCHDOG_WORKER_PROGRAM = """\
+import json
+import sys
+
+import fastedit.data_gen.ast_analyzer as analyzer
+
+with open(sys.argv[1], "rb") as fh:
+    source = fh.read().decode("utf-8")
+diagnostics = analyzer._parse_diagnostics_unguarded(source, sys.argv[2])
+payload = {
+    "errors": [list(span) for span in diagnostics.errors],
+    "grammar_artifacts": [
+        list(span) for span in diagnostics.grammar_artifacts
+    ],
+    "source": diagnostics.source,
+}
+sys.stdout.buffer.write(json.dumps(payload).encode("utf-8"))
+"""
+
+
+def bounded_parse_diagnostics(
+    source: str,
+    language: str,
+    timeout_seconds: float = PARSE_WATCHDOG_TIMEOUT_SECONDS,
+) -> ParseDiagnostics:
+    """Parse *source* under a hard deadline in a killable subprocess.
+
+    The bounded path for :data:`PATHOLOGICAL_RECOVERY_GRAMMARS` members —
+    callers route ONLY listed grammars here (:func:`parse_diagnostics`
+    and :func:`validate_parse` do exactly that). The parse runs in a
+    fresh ``python -c`` worker that reads the text from a temp file and
+    writes JSON diagnostics, so a grammar whose error recovery wedges on
+    unrecoverable input is killed at the deadline instead of hanging the
+    pipeline forever. The worker reuses
+    :func:`_parse_diagnostics_unguarded`, so the subprocess verdict is
+    byte-identical to the in-process one for healthy input — one code
+    path, no drift.
+
+    Returns:
+        Real :class:`ParseDiagnostics` for input that parses within the
+        deadline.
+
+    Raises:
+        ParseWatchdogTimeout: the deadline expired — the measured
+            "error recovery wedged" verdict; no honest diagnostics exist.
+        GrammarUnavailableError: the grammar itself cannot be resolved
+            (checked in THIS process first, so the typed error survives).
+        RuntimeError: the worker crashed or produced malformed output
+            (its stderr tail is included) — a loud failure, never silence.
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    # Resolve the grammar HERE first: an unresolvable guarded grammar
+    # raises the typed GrammarUnavailableError from this process instead
+    # of degrading into a generic worker-crash report.
+    get_parser(language)
+
+    fd, temp_path = tempfile.mkstemp(prefix="fastedit-watchdog-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(source.encode("utf-8"))
+        # Guarantee the worker can import fastedit the same way this
+        # process does, even when the parent's sys.path was patched at
+        # runtime (e.g. a checkout run without an installed wheel).
+        env = dict(os.environ)
+        package_root = str(Path(__file__).resolve().parents[2])
+        python_path = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            f"{package_root}{os.pathsep}{python_path}"
+            if python_path else package_root
+        )
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable, "-c", _WATCHDOG_WORKER_PROGRAM,
+                    temp_path, language,
+                ],
+                capture_output=True,
+                encoding="utf-8",
+                timeout=timeout_seconds,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ParseWatchdogTimeout(language, timeout_seconds) from exc
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-3:]
+        raise RuntimeError(
+            f"parse watchdog worker for '{language}' failed "
+            f"(exit {proc.returncode}): {' | '.join(tail)}"
+        )
+    try:
+        payload = json.loads(proc.stdout)
+        errors = [tuple(span) for span in payload["errors"]]
+        artifacts = [
+            tuple(span) for span in payload["grammar_artifacts"]
+        ]
+        return ParseDiagnostics(
+            errors=errors,
+            is_valid=not errors,
+            source=payload["source"],
+            grammar_artifacts=tuple(artifacts),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"parse watchdog worker for '{language}' produced malformed "
+            f"output: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Step G1a — known grammar artifacts (systematic grammar-defect traits)
+# ---------------------------------------------------------------------------
+
+_GRAMMAR_ARTIFACT_FILTERS: dict[str, tuple[tuple[str, str], ...]] = {
+    "test": (("MISSING", "eof"),),
+}
+"""Per-language declarative filters for KNOWN grammar artifacts (G1a).
+
+A grammar artifact is an error trait a grammar emits SYSTEMATICALLY — for
+every parse of its own well-formed input — because of a defect in the
+grammar, not in the text. The founding member is the language-pack
+``test`` grammar (tree-sitter-language-pack 0.13.0): its ``input`` region
+greedily consumes the record separator, so EVERY complete test record
+ends in one zero-width ``MISSING`` trait at EOF (recorded fail-loud with
+exact errors in tests/golden/test/manifest.json, pinned by the census
+test so an upstream fix lifts the exclusion loudly).
+
+Each value is a tuple of ``(kind, locator)`` signatures; a trait is an
+artifact when its kind matches AND the locator matches. Locators are the
+declarative matchers in ``_GRAMMAR_ARTIFACT_LOCATORS`` — ``"eof"`` means
+a zero-width trait pinned at the very end of the normalized source. A
+signature must stay NARROW: it filters a systematic emission, never a
+genuine defect (a header-only ``.test`` file is an outright ERROR node
+and is deliberately NOT matched).
+
+Why matching artifacts are REMOVED from the trait lists (visible only in
+``ParseDiagnostics.grammar_artifacts``): the relative parse rule
+(:func:`fastedit.inference.chunked_merge.merged_is_acceptable`) compares
+merged vs original traits as a multiset keyed by (kind, containing line).
+A systematic artifact is a constant of the GRAMMAR, not of the TEXT — it
+carries no edit information and can never distinguish a faithful merge
+from a corrupted one. Worse, its position tracks EOF, so any edit that
+changes the file's length moves its containing line: left inside the
+trait lists it would flip between "inherited" and "new" — phantom
+rejections of faithful merges — or, when a genuinely NEW defect lands on
+the file's last line, be satisfied by it and make the rule blind to real
+breakage. Removing the artifact from BOTH the original's and the merged's
+trait lists makes it vanish from the rule's accounting entirely — exactly
+"treated as inherited (never new)" — while every REAL trait keeps its
+normal behavior (a NEW real error in a .test file still rejects the
+merge). An artifact-only parse is therefore VALID: the grammar, not the
+text, is what fails to parse cleanly. The removed traits stay tagged in
+``grammar_artifacts`` so what was filtered remains introspectable and
+fail-loud rather than silent.
+"""
+
+# Declarative locators for ``_GRAMMAR_ARTIFACT_FILTERS`` signatures:
+# (start_byte, end_byte, source_byte_length) -> bool. Adding a new artifact
+# shape means adding a locator here and a signature row — no new branches.
+_GRAMMAR_ARTIFACT_LOCATORS: dict[str, object] = {
+    "eof": lambda start, end, source_len: start == end == source_len,
+}
+
+
+def _is_known_grammar_artifact(
+    span: tuple[int, int, str],
+    source_len: int,
+    filters: tuple[tuple[str, str], ...],
+) -> bool:
+    """True iff *span* matches one of the declared artifact signatures.
+
+    A signature is ``(kind, locator)``: the trait's kind must equal the
+    signature's kind and the named locator must accept the span's
+    position. Unknown locator names never match (a typo'd signature
+    filters nothing — fail-silent-proof by construction, and pinned by
+    the declarative-table test).
+    """
+    start, end, kind = span
+    for want_kind, locator in filters:
+        if kind != want_kind:
+            continue
+        predicate = _GRAMMAR_ARTIFACT_LOCATORS.get(locator)
+        if predicate is not None and predicate(start, end, source_len):
+            return True
+    return False
 
 
 def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
@@ -885,6 +1173,17 @@ def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
     compares a merged output's traits against the original's so a
     pre-existing defect can be preserved (EDIT-NOT-CORRECT) while new
     breakage is rejected.
+
+    Routing (Step G1a):
+
+      * A language in :data:`PATHOLOGICAL_RECOVERY_GRAMMARS` parses under
+        the subprocess watchdog (:func:`bounded_parse_diagnostics`) —
+        same return value, bounded runtime; a wedged parse raises the
+        typed :class:`ParseWatchdogTimeout` instead of hanging.
+      * Traits matching a declared known grammar artifact
+        (:data:`_GRAMMAR_ARTIFACT_FILTERS`) are removed from ``errors``
+        and tagged in ``ParseDiagnostics.grammar_artifacts``.
+      * Every other language keeps the in-process path unchanged.
 
     Trait collection rules:
 
@@ -908,8 +1207,25 @@ def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
     never by re-slicing a differently normalized copy. No offset mapping
     is ever needed: positions are identical by construction.
     """
+    canonical = canonical_language_name(language)
+    if canonical in PATHOLOGICAL_RECOVERY_GRAMMARS:
+        return bounded_parse_diagnostics(source, canonical)
+    return _parse_diagnostics_unguarded(source, language)
+
+
+def _parse_diagnostics_unguarded(
+    source: str, language: str,
+) -> ParseDiagnostics:
+    """The in-process parse behind :func:`parse_diagnostics` — no watchdog.
+
+    Contract (traits, normalization, artifact filtering) is documented on
+    :func:`parse_diagnostics`. This is ALSO the worker-side entry point
+    for :func:`bounded_parse_diagnostics`: the subprocess calls THIS, so
+    the guarded path can never spawn watchdogs recursively.
+    """
     from ..split_join import normalize_bare_cr_for_ast
 
+    canonical = canonical_language_name(language)
     normalized = normalize_bare_cr_for_ast(source)
     tree = parse_code(normalized, language)
     root = tree.root_node
@@ -929,7 +1245,7 @@ def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
             _walk(child)
 
     _walk(root)
-    if not errors and language in _COLON_SUITE_LANGUAGES:
+    if not errors and canonical in _COLON_SUITE_LANGUAGES:
         # tree-sitter-python silently recovers vanished suites (C2): its
         # external INDENT/DEDENT machinery re-anchors a compound statement
         # whose body is missing without emitting ERROR or MISSING nodes, so
@@ -942,8 +1258,26 @@ def parse_diagnostics(source: str, language: str) -> ParseDiagnostics:
         # is the clean file; a file tree-sitter already rejects is invalid
         # regardless).
         errors = _colon_suite_opener_violations(normalized)
+
+    # Step G1a: known grammar artifacts are removed from the trait list
+    # (tagged in .grammar_artifacts) — see _GRAMMAR_ARTIFACT_FILTERS for
+    # why removal-from-both-sides is the sound relative-rule integration.
+    artifacts: tuple[tuple[int, int, str], ...] = ()
+    filters = _GRAMMAR_ARTIFACT_FILTERS.get(canonical)
+    if filters:
+        kept: list[tuple[int, int, str]] = []
+        matched: list[tuple[int, int, str]] = []
+        source_len = len(normalized.encode("utf-8"))
+        for span in errors:
+            if _is_known_grammar_artifact(span, source_len, filters):
+                matched.append(span)
+            else:
+                kept.append(span)
+        errors = kept
+        artifacts = tuple(matched)
     return ParseDiagnostics(
         errors=errors, is_valid=not errors, source=normalized,
+        grammar_artifacts=artifacts,
     )
 
 

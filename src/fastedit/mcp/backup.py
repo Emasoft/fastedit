@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..io_utils import UnsupportedEncodingError
+from ..io_utils import UnsupportedEncodingError, write_all
 
 logger = logging.getLogger("fastedit.backup")
 
@@ -109,7 +109,7 @@ class BackupStore:
             target = self._dir / f"{self._hash(file_path)}-{ts:020d}.bak"
         fd, tmp = tempfile.mkstemp(dir=self._dir, suffix=".tmp")
         try:
-            os.write(fd, data)
+            write_all(fd, data)
             os.close(fd)
             os.replace(tmp, target)
         except BaseException:
@@ -318,7 +318,7 @@ def _atomic_write(
                 had_bom = False
             if had_bom and not data.startswith(b"\xef\xbb\xbf"):
                 data = b"\xef\xbb\xbf" + data
-        os.write(fd, data)
+        write_all(fd, data)
         # B39: the content must survive a power cut, not just the rename.
         os.fsync(fd)
         closed = True

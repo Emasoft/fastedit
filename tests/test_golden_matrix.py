@@ -346,21 +346,30 @@ def test_census_excluded_grammar_defect_is_real(lang_dir, manifest):
     assert attempts, f"{language}: exclusion needs recorded attempts"
     for attempt in attempts:
         diags = parse_diagnostics(attempt["snippet"], language)
-        assert not diags.is_valid, (
+        # G1a: known grammar artifacts (e.g. `test`'s MISSING-at-EOF
+        # emission) are removed from .errors and tagged in
+        # .grammar_artifacts — the relative parse rule must never count
+        # them. This exclusion pin therefore watches the UNFILTERED
+        # emission (real traits + tagged artifacts) so the defect stays
+        # fail-loud: an upstream grammar fix empties the view entirely and
+        # the exclusion must be lifted loudly, exactly as before G1a.
+        unfiltered = [list(err) for err in diags.errors] + [
+            list(err) for err in diags.grammar_artifacts
+        ]
+        assert unfiltered, (
             f"{language} census-excluded attempt "
-            f"({attempt['description']}) now parses clean — the grammar "
-            f"defect is fixed upstream: lift the exclusion by authoring a "
-            f"real census fixture (tests/golden/_generate.py "
-            f"CENSUS_LANGUAGES) with a census_note and flipping the "
-            f"pack_census.json verdict"
+            f"({attempt['description']}) now parses with no error traits "
+            f"at all — the grammar defect is fixed upstream: lift the "
+            f"exclusion by authoring a real census fixture "
+            f"(tests/golden/_generate.py CENSUS_LANGUAGES) with a "
+            f"census_note and flipping the pack_census.json verdict"
         )
         assert (
-            [list(err) for err in diags.errors]
-            == [list(err) for err in attempt["parse_errors"]]
+            unfiltered == [list(err) for err in attempt["parse_errors"]]
         ), (
             f"{language} census-excluded attempt "
             f"({attempt['description']}) parse errors changed to "
-            f"{diags.errors} — re-record the exclusion (or lift it if the "
+            f"{unfiltered} — re-record the exclusion (or lift it if the "
             f"grammar is now healthy)"
         )
 

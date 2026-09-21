@@ -308,11 +308,13 @@ Per-language model accuracy (156-example benchmark):
 | **Tokens for location** | 0 | ~50% of output | ~50% of output |
 | **What the model sees** | ~35-line chunk | Entire file context | Entire file context |
 | **Failure mode** | Symbol not found (immediate, clear error) | Can't find old lines (silent misapply) | Can't find SEARCH block |
-| **Languages** | 13 | Any | Any |
+| **Languages** | 23 | Any | Any |
 
 ## Supported languages
 
-Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#, PHP
+**Default install** (hard dependencies, wired by file extension): Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#, PHP — plus the core formats HTML, XML/SVG/DTD, Markdown, JSON, YAML, CSS, Bash, TOML, SQL, and Dockerfile.
+
+**With the `all-grammars` extra** (`pip install fastedit[all-grammars]`): Scala, Lua, Perl, Julia, Zig, Svelte, GraphQL, HCL/Terraform, Make, Nix, and every language in the bundled tree-sitter pack resolve on explicit `language=` requests (verified against the e2e census in `tests/golden/pack_census.json`).
 
 ## Testing
 

@@ -28,7 +28,38 @@ from pathlib import Path
 # duplicating the heuristics here would let the two detectors drift apart.
 from .filetype import _BOM_TEXT_ENCODINGS, detect_file_type
 
-__all__ = ["UnsupportedEncodingError", "read_source", "write_source"]
+__all__ = [
+    "UnsupportedEncodingError",
+    "read_source",
+    "write_all",
+    "write_source",
+]
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write ALL of *data* to the raw file descriptor *fd*, looping on
+    partial writes.
+
+    A single ``os.write`` is allowed to write fewer bytes than requested
+    and report the count without error — POSIX promises only the returned
+    count (a >2 GiB single write is capped by the kernel's MAX_RW_COUNT on
+    Linux; a signal interruption can stop one early), and Windows has its
+    own per-call limits. Ignoring the return value silently TRUNCATES the
+    payload in exactly those cases. Every descriptor-level write of
+    unbounded-size content (whole-file backups, whole-file temp copies)
+    must go through this loop: it completes only when every byte landed,
+    and refuses to spin forever if the descriptor reports a zero-byte
+    write for non-empty data.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - defensive: no spin on 0
+            raise OSError(
+                f"os.write reported {written} bytes written for "
+                f"{len(view)} remaining"
+            )
+        view = view[written:]
 
 
 class UnsupportedEncodingError(ValueError):

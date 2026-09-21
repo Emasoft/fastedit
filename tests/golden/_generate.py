@@ -11,7 +11,9 @@ clean — the census probe verdict was an artifact of the trivial probe line,
 not the grammar. ``EXCLUDED_LANGUAGES``: the degraded names whose grammar is
 genuinely broken, recorded with the exact parse_diagnostics errors instead
 of a fabricated fixture (see ``_write_excluded`` and the fail-loud pin in
-tests/test_golden_matrix.py). Languages with no declarative symbol
+tests/test_golden_matrix.py) — empty since G1b lifted its founding member
+(``test``), whose defect record now rides IN the exercised fixture as
+``grammar_defect_workaround``. Languages with no declarative symbol
 anchoring in ast_utils declare their anchoring ops ``unsupported`` — an
 honest hole, never silent.
 
@@ -1444,10 +1446,12 @@ type Post {
 #     their census verdicts are flipped to ok in tests/golden/
 #     pack_census.json, as are F2's 15 batch-1 retries and graphql (whose
 #     B3 fixture already proves its grammar). The one genuine grammar
-#     defect — `test` — is NOT fabricated: it is recorded in
-#     EXCLUDED_LANGUAGES below with the exact parse errors, and
-#     test_golden_matrix re-pins the failure so an upstream grammar fix
-#     surfaces as a loud test failure.
+#     defect — `test` — stayed un-fabricated through F3 (recorded with the
+#     exact parse errors); G1b lifted it: G1a's artifact filter makes
+#     same-record edits land, G1b adds the declarative anchoring row, and
+#     the exercised fixture below carries the defect record as
+#     ``grammar_defect_workaround`` (fail-loud documentation, re-pinned by
+#     tests/test_golden_matrix.py::test_grammar_defect_workaround_is_real).
 #
 # Anchoring honesty: fastedit's declarative symbol anchoring
 # (_FUNCTION_LIKE_NODE_TYPES / _CLASS_LIKE_NODE_TYPES / _CONST_LIKE_NODE_TYPES
@@ -3787,35 +3791,147 @@ end architecture;
 ''',
         "unsupported": _anchoring_unsupported(),
     },
-]
-
-
-# ---------------------------------------------------------------------------
-# F3: census exclusions — census languages whose grammar is genuinely BROKEN
-# in the installed pack. Never fabricate a parse-clean claim: the attempted
-# real-syntax snippets and their EXACT parse_diagnostics errors are recorded
-# here, written into the language's manifest as ``census_excluded``, and
-# re-pinned by
-# tests/test_golden_matrix.py::test_census_excluded_grammar_defect_is_real so
-# an upstream grammar fix surfaces as a loud test failure. When that fires,
-# lift the exclusion: move the language into CENSUS_LANGUAGES with a
-# census_note and flip its pack_census.json verdict.
-# ---------------------------------------------------------------------------
-
-EXCLUDED_LANGUAGES: list[dict] = [
+    # --- G1b: the two census exclusions flip to exercised fixtures --------
+    #
+    # G1a bounded both grammars' quirks (cobol's error recovery wedges ->
+    # PATHOLOGICAL_RECOVERY_GRAMMARS subprocess watchdog; `test`'s
+    # systematic MISSING-at-EOF emission -> _GRAMMAR_ARTIFACT_FILTERS).
+    # G1b adds the declarative anchoring rows (ast_utils
+    # _FORMAT_SYMBOL_SPECS) and these exercised goldens, flipping the last
+    # two census exclusions: pack_census.json now accounts for 175/175
+    # (ok — plain or guarded) with zero exclusions.
+    {
+        "language": "cobol", "ext": "cob", "filename": "original.cob",
+        "census_fixture": True, "requires_wheel": _CENSUS_PACK,
+        "census_note": (
+            "census (F1) verdict was unresolvable/timeout: the grammar "
+            "resolves instantly and parses REAL cobol in 0.0s, but its "
+            "error recovery LOOPS FOREVER on unrecoverable input — every "
+            "trivial probe line wedges the parse. G1a bounded the grammar "
+            "behind the subprocess parse watchdog "
+            "(PATHOLOGICAL_RECOVERY_GRAMMARS); the v2 census probe feeds "
+            "guarded grammars their real snippet ONLY (a wedge costs the "
+            "whole probe) and this program parses with zero error traits "
+            "under the watchdog — healthy-with-watchdog, verdict ok. G1b "
+            "adds declarative anchoring (program_definition/paragraph_"
+            "header) and this exercised op"
+        ),
+        "symbol_semantics": (
+            "program_definition (named by its PROGRAM-ID, span = the whole "
+            "compilation unit) and paragraph_header (named by the header "
+            "text minus its terminating period; the grammar brackets ONLY "
+            "the header line — statements are siblings inside procedure_"
+            "division — so a paragraph anchor spans its header line alone). "
+            "after=<PROGRAM-ID> therefore appends at EOF: the one insert "
+            "shape whose splice cannot mangle paragraph ownership"
+        ),
+        "original": '''       IDENTIFICATION DIVISION.
+       PROGRAM-ID. HELLO.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY "HELLO".
+           PERFORM SETUP-PARA.
+           STOP RUN.
+       SETUP-PARA.
+           MOVE 1 TO WS-COUNT.
+           DISPLAY "SETUP".
+''',
+        "ops": [
+            {
+                "op": "insert_after", "symbol": "HELLO",
+                "snippet": (
+                    '       NEW-PARA.\n'
+                    '           DISPLAY "ADDED".\n'
+                ),
+                "anchor_start_line": 1,
+                "anchor_head": "       IDENTIFICATION DIVISION.",
+                "anchor_end_line": 10,
+                "anchor_tail": '           DISPLAY "SETUP".',
+                "snippet_head": "       NEW-PARA.",
+            },
+        ],
+        "unsupported": [
+            {
+                "op": "replace_symbol",
+                "reason": (
+                    "G1b anchoring resolves the spans (program = whole "
+                    "compilation unit; paragraph = its header line only), "
+                    "but a program replace is a whole-file rewrite and a "
+                    "paragraph replace would splice around the header "
+                    "while the body lines are siblings of it — declared "
+                    "here, not exercised in the deterministic golden scope"
+                ),
+            },
+            {
+                "op": "delete_symbol",
+                "reason": (
+                    "same span shapes as replace_symbol: deleting a "
+                    "paragraph header would promote its body into the "
+                    "previous paragraph (the grammar brackets only the "
+                    "header), and deleting the program deletes the file — "
+                    "declared here, not exercised in the golden scope"
+                ),
+            },
+        ],
+    },
     {
         "language": "test", "ext": "test", "filename": "original.test",
-        "requires_wheel": _CENSUS_PACK,
+        "census_fixture": True, "requires_wheel": _CENSUS_PACK,
+        "census_note": (
+            "census (F1) verdict was parse_degraded and F3 kept the "
+            "exclusion fail-loud: every trivial probe line is an outright "
+            "ERROR node for this grammar, and the grammar's own complete "
+            "record ends in one systematic zero-width MISSING trait at EOF "
+            "(the defect record below). G1a's artifact filter removes that "
+            "systematic trait from the trait lists (tagged in "
+            ".grammar_artifacts), so a same-record edit on a .test file now "
+            "LANDS; G1b adds the declarative record-anchoring row "
+            "(_FORMAT_SYMBOL_SPECS['test']) and this exercised op. Census "
+            "verdict flips to ok — the artifact is FILTERED, not absent "
+            "(the v2 probe reports the filtered count)"
+        ),
         "symbol_semantics": (
-            "self-documenting test records (==== header / name / body) — "
-            "fastedit anchoring: none yet; EXCLUDED: the grammar cannot "
-            "complete any test record (see census_excluded)"
+            "the `test` record (header separator/name/separator + input + "
+            "closing separator), named by its header's `name` line. The "
+            "grammar models a whole file as ONE record whose input swallows "
+            "inner separators, so the record span is the whole file and "
+            "after=<record name> appends a new record at EOF"
         ),
         "original": (
             "================\nSample test\n================\n"
             'print("hi")\n================\n'
         ),
-        "census_excluded": {
+        "ops": [
+            {
+                "op": "insert_after", "symbol": "Sample test",
+                "snippet": (
+                    "================\nSecond record\n================\n"
+                    'print("bye")\n================\n'
+                ),
+                "anchor_start_line": 1, "anchor_head": "================",
+                "anchor_end_line": 5, "anchor_tail": "================",
+                "snippet_head": "================",
+            },
+        ],
+        "unsupported": [
+            {
+                "op": "replace_symbol",
+                "reason": (
+                    "G1b record anchoring resolves the span, but the "
+                    "record's span IS the whole file (one record per file "
+                    "in this grammar), so a replace is a whole-file rewrite "
+                    "— declared here, not exercised in the golden scope"
+                ),
+            },
+            {
+                "op": "delete_symbol",
+                "reason": (
+                    "same span shape as replace_symbol: deleting the record "
+                    "deletes the file — declared here, not exercised"
+                ),
+            },
+        ],
+        "grammar_defect_workaround": {
             "reason": (
                 "pack grammar defect (tree-sitter-language-pack 0.13.0): "
                 "the `test` grammar parses the header (separator / name / "
@@ -3824,9 +3940,17 @@ EXCLUDED_LANGUAGES: list[dict] = [
                 "in a MISSING-separator error trait at EOF, and a "
                 "header-only file is an outright ERROR node. F3 verified a "
                 "matrix of real-syntax shapes (recorded below with their "
-                "exact parse_diagnostics errors) — none parse clean, so no "
-                "census fixture is fabricated. The F1 census correctly "
-                "reported parse_degraded; the grammar itself is the problem"
+                "exact parse_diagnostics errors) — none parse clean, so F3 "
+                "excluded the language instead of fabricating a fixture. "
+                "G1a's _GRAMMAR_ARTIFACT_FILTERS['test'] = (('MISSING', "
+                "'eof'),) removes the SYSTEMATIC EOF emission from the "
+                "trait lists (tagged in .grammar_artifacts) so same-record "
+                "edits land while header-only breakage still rejects; G1b "
+                "flipped the exclusion into this exercised fixture. The "
+                "recorded attempts stay as negative evidence: they pin the "
+                "defect exactly (test_golden_matrix."
+                "test_grammar_defect_workaround_is_real) so an upstream "
+                "grammar fix — or a regression — surfaces loudly"
             ),
             "attempts": [
                 {
@@ -3873,6 +3997,29 @@ EXCLUDED_LANGUAGES: list[dict] = [
         },
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# F3: census exclusions — census languages whose grammar is genuinely BROKEN
+# in the installed pack. Never fabricate a parse-clean claim: the attempted
+# real-syntax snippets and their EXACT parse_diagnostics errors are recorded
+# here, written into the language's manifest as ``census_excluded``, and
+# re-pinned by
+# tests/test_golden_matrix.py::test_census_excluded_grammar_defect_is_real so
+# an upstream grammar fix surfaces as a loud test failure. When that fires,
+# lift the exclusion: move the language into CENSUS_LANGUAGES with a
+# census_note and flip its pack_census.json verdict.
+#
+# EMPTY since G1b: the founding member `test` was lifted into
+# CENSUS_LANGUAGES (G1a's artifact filter made same-record edits land; G1b
+# added the anchoring row and the exercised op) — its F3 defect record
+# survives verbatim as the fixture's ``grammar_defect_workaround``, and the
+# fail-loud pin moved to
+# test_grammar_defect_workaround_is_real. The list REMAINS as the
+# extension point for the next genuinely-broken grammar.
+# ---------------------------------------------------------------------------
+
+EXCLUDED_LANGUAGES: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -3988,6 +4135,10 @@ def _write_lang(entry: dict) -> None:
         manifest["census_note"] = entry["census_note"]
     if entry.get("census_fixture"):
         manifest["census_fixture"] = True
+    if entry.get("grammar_defect_workaround"):
+        # G1b: a lifted exclusion keeps its F3 defect record verbatim —
+        # negative evidence, re-pinned fail-loud by the matrix runner.
+        manifest["grammar_defect_workaround"] = entry["grammar_defect_workaround"]
 
     (lang_dir / filename).write_bytes(original_text.encode("utf-8"))
 

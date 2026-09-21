@@ -516,3 +516,92 @@ class TestCliDisplayOnlyDecode:
         diff = run_cli("diff", str(f))
         assert diff.returncode == 0
         assert "no backup" in diff.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# G2 audit: ``io_utils.write_all`` — descriptor writes must never silently
+# truncate. A single os.write may legally write fewer bytes than requested
+# (POSIX returns the count written; a >2 GiB single write is capped by the
+# kernel on Linux, and signal interruption can stop one early) — ignoring
+# the return value truncates the payload in exactly those cases. Every
+# whole-file descriptor write (backups, undo, temp copies) now goes through
+# the looping helper; these tests pin the loop against simulated partial
+# writes.
+# ---------------------------------------------------------------------------
+
+
+def test_write_all_completes_when_os_write_is_partial(monkeypatch, tmp_path):
+    from fastedit import io_utils
+
+    real_write = os.write
+    calls: list[int] = []
+
+    def partial_write(fd, data):
+        chunk = bytes(data)[:5]  # never more than 5 bytes per call
+        calls.append(len(chunk))
+        return real_write(fd, chunk)
+
+    monkeypatch.setattr(io_utils.os, "write", partial_write)
+    payload = b"0123456789" * 7  # 70 bytes -> 14 partial calls
+    target = tmp_path / "partial.bin"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    try:
+        io_utils.write_all(fd, payload)
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == payload
+    assert len(calls) > 1  # the loop actually looped
+
+
+def test_write_all_refuses_a_zero_byte_write(monkeypatch, tmp_path):
+    from fastedit import io_utils
+
+    def zero_write(_fd, _data):
+        return 0
+
+    monkeypatch.setattr(io_utils.os, "write", zero_write)
+    fd = os.open(tmp_path / "zero.bin", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    try:
+        with pytest.raises(OSError, match="0 bytes written"):
+            io_utils.write_all(fd, b"nonempty")
+    finally:
+        os.close(fd)
+
+
+def test_backup_store_round_trips_through_partial_writes(
+    monkeypatch, tmp_path,
+):
+    """Integration: BackupStore's raw-bytes record (the undo path) survives
+    simulated partial os.write -- the worst place to lose bytes silently."""
+    from fastedit.mcp.backup import BackupStore
+
+    real_write = os.write
+
+    def partial_write(fd, data):
+        return real_write(fd, bytes(data)[:3])
+
+    monkeypatch.setattr(os, "write", partial_write)
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+    store = BackupStore()
+    payload = bytes(range(256)) * 41  # 10496 bytes
+    store["f.py"] = payload
+    assert store.pop("f.py") == payload
+
+
+def test_atomic_write_round_trips_through_partial_writes(
+    monkeypatch, tmp_path,
+):
+    """Integration: _atomic_write's fsync'd payload lands complete even when
+    the descriptor write is repeatedly partial."""
+    from fastedit.mcp.backup import _atomic_write
+
+    real_write = os.write
+
+    def partial_write(fd, data):
+        return real_write(fd, bytes(data)[:7])
+
+    monkeypatch.setattr(os, "write", partial_write)
+    target = tmp_path / "dest.txt"
+    payload = b"atomic-payload-" * 300
+    _atomic_write(target, payload)
+    assert target.read_bytes() == payload

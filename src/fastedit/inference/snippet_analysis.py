@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 
+from ..io_utils import write_all
 from .ast_utils import (
     ASTNode,
     ChunkRegion,
@@ -233,7 +234,7 @@ def _top_level_extras(
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=ext)
-            os.write(fd, snippet.encode())
+            write_all(fd, snippet.encode())
             os.close(fd)
             result = subprocess.run(
                 ["tldr", "structure", tmp_path, "--format", "compact"],
@@ -296,7 +297,7 @@ def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
-        os.write(fd, snippet.encode())
+        write_all(fd, snippet.encode())
         os.close(fd)
 
         result = subprocess.run(
@@ -342,7 +343,7 @@ def _get_snippet_definitions(snippet: str, language: str | None) -> list[ASTNode
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
-        os.write(fd, snippet.encode())
+        write_all(fd, snippet.encode())
         os.close(fd)
         nodes = _get_ast_via_structure(tmp_path)
         if not nodes:

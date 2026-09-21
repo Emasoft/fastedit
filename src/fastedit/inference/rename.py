@@ -247,6 +247,8 @@ def _run_tldr_references(
     import tempfile
     from pathlib import Path as _Path
 
+    from ..io_utils import write_all
+
     # tldr counts rows by scanning for "\n" -- a bare CR (classic-Mac line
     # ending) is invisible to it and collapses a single-file lookup's rows
     # into one, corrupting the line/column it reports. Point it at an
@@ -262,7 +264,7 @@ def _run_tldr_references(
             if re.search(rb"\r(?!\n)", raw):
                 normalized = re.sub(rb"\r(?!\n)", b"\n", raw)
                 fd, tmp_path = tempfile.mkstemp(suffix=_Path(root).suffix)
-                os.write(fd, normalized)
+                write_all(fd, normalized)
                 os.close(fd)
                 query_root = _Path(tmp_path)
         except OSError:

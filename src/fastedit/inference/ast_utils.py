@@ -126,6 +126,8 @@ def get_ast_map_from_source(
         Empty list if the language is unsupported or parsing fails.
     """
     from ..data_gen.ast_analyzer import (
+        PATHOLOGICAL_RECOVERY_GRAMMARS,
+        bounded_parse_diagnostics,
         canonical_language_name,
         detect_language,
         get_parser,
@@ -139,6 +141,16 @@ def get_ast_map_from_source(
         return []
 
     try:
+        if language in PATHOLOGICAL_RECOVERY_GRAMMARS:
+            # Step G1a: guarded grammar — parse under the watchdog's hard
+            # subprocess deadline first. A wedged error recovery (the
+            # measured cobol behavior: invalid input loops forever) raises
+            # ParseWatchdogTimeout — a RuntimeError, caught below — and
+            # yields the SAME empty map an unresolvable grammar gets; it
+            # must never hang the pipeline. Healthy input falls through to
+            # the normal in-process parse (0.0s measured); the probe costs
+            # one bounded subprocess parse, the price of a bounded verdict.
+            bounded_parse_diagnostics(source_code, language)
         parser = get_parser(language)
         tree = parser.parse(source_code.encode("utf-8"))
     except (ValueError, RuntimeError, ImportError):
@@ -577,6 +589,35 @@ def _dockerfile_stage_name(node, language: str, source_bytes: bytes) -> str:
     )
 
 
+def _cobol_symbol_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a COBOL symbol (G1b).
+
+    ``program_definition`` names by its ``program_name`` descendant (the
+    PROGRAM-ID text — the grammar nests it inside the identification
+    division, it is not a ``name`` field); ``paragraph_header`` names by the
+    header text minus its terminating period (``MAIN-PARA.`` →
+    ``MAIN-PARA`` — the same spelling a PERFORM statement addresses).
+    """
+    if node.type == "paragraph_header":
+        text = _node_text(node, source_bytes).strip()
+        return text.removesuffix(".")
+    ident = _first_descendant_of_type(node, ("program_name",))
+    return _node_text(ident, source_bytes) if ident is not None else ""
+
+
+def _test_record_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a ``test``-grammar record (G1b): its header's ``name`` line.
+
+    The record node is ``test`` (header = separator/name/separator); the
+    record's ``name`` line text is the key a same-record edit addresses.
+    """
+    header = _first_child_of_type(node, ("header",))
+    if header is None:
+        return ""
+    name_node = _first_child_of_type(header, ("name",))
+    return _node_text(name_node, source_bytes) if name_node is not None else ""
+
+
 def _name_field_name(node, language: str, source_bytes: bytes) -> str:
     """Name of a definition node that uses the conventional ``name`` field.
 
@@ -745,6 +786,37 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
         kind="type",
         extract=_name_field_name,
     ),
+    # G1b: the two census languages whose grammar quirks G1a bounded (cobol
+    # wedges its error recovery; test emits a systematic MISSING-at-EOF
+    # artifact). Their golden dirs flip from declared holes to exercised ops
+    # through these rows — the flip condition the F2/F3 fixtures recorded.
+    #   cobol    program_definition (named by its PROGRAM-ID) and
+    #            paragraph_header (named by the header text minus its
+    #            period). The grammar brackets ONLY the header line of a
+    #            paragraph — statements are siblings inside
+    #            procedure_division — so a paragraph anchor spans its header
+    #            line alone; the program spans the whole compilation unit,
+    #            making after=<PROGRAM-ID> the append-at-EOF anchor.
+    #   test     the `test` record (header + input + closing separator),
+    #            named by its header's `name` line. The grammar models a
+    #            whole file as one record whose input swallows inner
+    #            separators, so the record span is the whole file and
+    #            after=<record name> appends at EOF.
+    "cobol": _FormatSymbolSpec(
+        node_types=("program_definition", "paragraph_header"),
+        kind="program",
+        kind_by_node={
+            "program_definition": "program",
+            "paragraph_header": "paragraph",
+        },
+        extract=_cobol_symbol_name,
+        recurse=True,
+    ),
+    "test": _FormatSymbolSpec(
+        node_types=("test",),
+        kind="record",
+        extract=_test_record_name,
+    ),
 }
 
 
@@ -850,6 +922,8 @@ def get_ast_map(file_path: str, total_lines: int = 0) -> list[ASTNode]:
     import tempfile
     from pathlib import Path
 
+    from ..io_utils import write_all
+
     _log = logging.getLogger("fastedit.chunked_merge")
 
     # tldr (like tree-sitter) counts rows by scanning for "\n" -- a bare CR
@@ -868,7 +942,7 @@ def get_ast_map(file_path: str, total_lines: int = 0) -> list[ASTNode]:
         if re.search(rb"\r(?!\n)", raw):
             normalized = re.sub(rb"\r(?!\n)", b"\n", raw)
             fd, tmp_path = tempfile.mkstemp(suffix=Path(file_path).suffix)
-            os.write(fd, normalized)
+            write_all(fd, normalized)
             os.close(fd)
             query_path = tmp_path
     except OSError:
