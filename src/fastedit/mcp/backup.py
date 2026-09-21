@@ -11,8 +11,11 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
+import stat
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from ..io_utils import UnsupportedEncodingError, write_all
@@ -25,6 +28,33 @@ logger = logging.getLogger("fastedit.backup")
 # step by step.
 _MAX_BACKUPS_PER_FILE = 5
 
+# Stale-temp cleanup: ``_atomic_write`` and ``BackupStore.__setitem__`` create
+# hidden ".tmp" siblings (mkstemp) and unlink them on every exception path --
+# but a SIGKILL or power cut skips all of those, leaving residue nobody owns.
+# The sweep sites (``_atomic_write`` before it creates its own temp, and
+# ``BackupStore.__init__`` for the store dir) may only delete files that are
+# BOTH exactly fastedit's own mkstemp shape AND at least _TEMP_MIN_AGE_SECS
+# old. The age threshold is deliberately conservative: a LIVE concurrent
+# fastedit's in-flight temp is seconds old (mkstemp -> write -> fsync ->
+# rename is milliseconds), so nothing under it can ever be swept mid-write;
+# site A additionally runs inside the per-file edit lock, so no legitimate
+# fastedit can hold an in-flight temp for that target anyway -- the threshold
+# is what guards against pathological same-shape collisions from OTHER tools.
+_TEMP_MIN_AGE_SECS = 60
+
+# tempfile's random segment is EXACTLY 8 characters drawn from
+# "abcdefghijklmnopqrstuvwxyz0123456789_" (tempfile._RandomNameSequence
+# .characters -- never uppercase, never another length), verified against the
+# CPython 3.x implementation. Both matchers below anchor on that with
+# fullmatch, so a name counts as fastedit's own temp only on a FULL match: a
+# missing/extra/longer random segment, uppercase letters, a different suffix,
+# or a non-hidden spelling never matches, and .bak/.meta/.lock files cannot
+# match at all.
+_TEMP_RANDOM_SEGMENT = r"[a-z0-9_]{8}"
+# Bare form: BackupStore's backup temp, tempfile.mkstemp(dir=..., suffix=
+# ".tmp") with no prefix -> "<random8>.tmp" in the backups directory.
+_BARE_TEMP_RE = re.compile(rf"{_TEMP_RANDOM_SEGMENT}\.tmp")
+
 
 class ConcurrentModificationError(RuntimeError):
     """B37: the destination changed on disk between the caller's read and
@@ -36,6 +66,81 @@ class ConcurrentModificationError(RuntimeError):
     a clean "re-read and retry" message. Nothing was written; the file on
     disk is exactly as the external writer left it.
     """
+
+
+def _stale_temp_files(
+    directory: Path, prefix: str | None = None,
+) -> Iterator[Path]:
+    """Yield fastedit's own STALE temp files in *directory* (no recursion).
+
+    A file is yielded only when BOTH hold:
+
+    * its name FULL-matches the hidden mkstemp shape this module creates --
+      prefixed form ``.{prefix}.<random8>.tmp`` when *prefix* is given (the
+      ``_atomic_write`` temp for a target named *prefix*), bare form
+      ``<random8>.tmp`` otherwise (the ``BackupStore.__setitem__`` backup
+      temp in the store dir) -- where ``<random8>`` is tempfile's 8-char
+      ``[a-z0-9_]`` segment, and
+    * it is at least ``_TEMP_MIN_AGE_SECS`` old, so a LIVE run's in-flight
+      temp (seconds old) can never match.
+
+    Everything else is skipped by construction: directories and symlinks
+    (lstat semantics -- nothing is ever followed), vanished entries,
+    near-miss names (never delete on a partial match), and young temps.
+    Never recurses and never yields a path outside *directory*.
+    """
+    now = time.time()
+    if prefix is None:
+        matcher: re.Pattern[str] = _BARE_TEMP_RE
+    else:
+        matcher = re.compile(
+            rf"\.{re.escape(prefix)}\.{_TEMP_RANDOM_SEGMENT}\.tmp",
+        )
+    try:
+        with os.scandir(directory) as scan:
+            entries = list(scan)
+    except OSError as e:
+        logger.info("Temp sweep: cannot list %s: %s", directory, e)
+        return
+    for entry in entries:
+        try:
+            # lstat semantics: a symlink to a regular file is still a
+            # symlink here and is skipped, never followed.
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue  # vanished mid-sweep: a concurrent fastedit got it
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if matcher.fullmatch(entry.name) is None:
+            continue
+        if now - st.st_mtime < _TEMP_MIN_AGE_SECS:
+            continue  # seconds old: possibly a live run's in-flight temp
+        yield Path(entry.path)
+
+
+def _sweep_stale_temps(directory: Path, prefix: str | None = None) -> None:
+    """Remove every stale fastedit temp :func:`_stale_temp_files` yields in
+    *directory*, logging the sweep (count + names) at INFO.
+
+    Best-effort by contract: an unlink failure (permissions, a concurrent
+    removal) is logged and swallowed -- a cleanup sweep must never be the
+    thing that fails an otherwise good write.
+    """
+    removed: list[str] = []
+    for path in _stale_temp_files(directory, prefix=prefix):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue  # a concurrent fastedit removed it first
+        except OSError as e:
+            logger.info("Temp sweep: could not remove %s: %s", path, e)
+            continue
+        removed.append(path.name)
+    if removed:
+        logger.info(
+            "Swept %d stale temp file(s) left by crashed run(s) in %s: %s",
+            len(removed), directory, ", ".join(sorted(removed)),
+        )
 
 
 class BackupStore:
@@ -72,6 +177,12 @@ class BackupStore:
         else:
             self._dir = Path.home() / ".fastedit" / "backups"
         self._dir.mkdir(parents=True, exist_ok=True)
+        # Sweep site B: crashed __setitem__ temps (bare "<random8>.tmp") have
+        # no exception path left to clean them up. The store dir is
+        # fastedit-owned and a live backup write from another process takes
+        # milliseconds, so anything in the bare shape older than the
+        # threshold is SIGKILL residue.
+        _sweep_stale_temps(self._dir)
         self._prune_old()
 
     def _hash(self, file_path: str) -> str:
@@ -300,6 +411,12 @@ def _atomic_write(
     the guard, preserving the behavior for callers with no read-time stat
     (new files, undo).
 
+    Before creating its own temp, crashed-run residue for THIS target --
+    ``.{path.name}.<random8>.tmp`` files at least ``_TEMP_MIN_AGE_SECS`` old
+    in the destination's directory -- is swept (best-effort, logged; see
+    :func:`_sweep_stale_temps`). A SIGKILL bypasses every exception-path
+    unlink, so this is the only cleanup those temps ever get.
+
     Raises:
         UnsupportedEncodingError: str content that *encoding* cannot
             represent. Raised BEFORE any temp file is created and before
@@ -324,6 +441,12 @@ def _atomic_write(
                 f"{path}: content cannot be encoded with {encoding!r} ({e}); "
                 f"the file was not modified."
             ) from e
+    # Sweep site A: remove crashed-run residue for THIS target before
+    # creating our own temp. Every call site holds the per-file edit lock,
+    # so no legitimate concurrent fastedit can have an in-flight temp for
+    # this target here; the matcher's exact shape plus _TEMP_MIN_AGE_SECS
+    # keep any other tool's same-shape file safe regardless.
+    _sweep_stale_temps(path.parent, prefix=path.name)
     fd, tmp = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
     )

@@ -18,10 +18,18 @@ Step 19 additions lock down:
   and the ``.meta`` write is fsynced too: a power cut must not keep the main
   file's new content while losing the just-written backup, which would leave
   that edit without an undo step.
+* **Stale-temp cleanup** — a SIGKILL bypasses every exception-path unlink and
+  leaves the hidden ``.tmp`` residue behind with nobody to clean it up. The
+  next ``_atomic_write`` to the same target (and ``BackupStore.__init__``
+  for the backups dir) sweeps EXACTLY fastedit's own mkstemp shapes —
+  ``.{target}.{8 x [a-z0-9_]}.tmp`` and the bare ``{8 x [a-z0-9_]}.tmp`` —
+  and only past a conservative age threshold, so a LIVE run's in-flight temp
+  is never touched and nothing that merely looks similar is ever deleted.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import time
@@ -462,3 +470,220 @@ def test_meta_write_is_fsynced_too(tmp_path, monkeypatch):
     meta = store._meta_path(str(target))
     assert meta.exists()
     assert meta.read_text(encoding="utf-8") == str(target)
+
+
+# ---------------------------------------------------------------------------
+# Stale-temp cleanup: identify fastedit's OWN temps exactly, sweep only the
+# residue of crashed runs, never anything else.
+#
+# tempfile.mkstemp names its temps with an 8-character random segment drawn
+# from "abcdefghijklmnopqrstuvwxyz0123456789_" (verified:
+# tempfile._RandomNameSequence().characters), so fastedit's shapes are:
+#   * ``.{target}.{random8}.tmp``  — _atomic_write's temp next to its target
+#   * ``{random8}.tmp``            — BackupStore's backup temp (no prefix)
+# Anything that differs by even one character of shape is NOT fastedit's and
+# must never be deleted. All residue below is aged with os.utime (no
+# sleeps); a "fresh" temp has mtime-now, i.e. it may be a LIVE run's
+# in-flight write.
+# ---------------------------------------------------------------------------
+
+_CRASH_AGE_SECS = 2 * 3600  # crashed-run residue is hours old
+
+
+def _age(path: Path, *, secs: float = _CRASH_AGE_SECS,
+         follow_symlinks: bool = True) -> None:
+    """Backdate *path*'s mtime so it counts as crashed-run residue."""
+    old = time.time() - secs
+    os.utime(path, (old, old), follow_symlinks=follow_symlinks)
+
+
+def test_crashed_residue_for_this_target_is_swept_on_the_next_write(
+    tmp_path, caplog,
+):
+    """A SIGKILL mid-``_atomic_write`` leaves ``.{name}.{random}.tmp`` behind;
+    the next write to the SAME target removes it before creating its own
+    temp, logging the sweep (count + names) at INFO."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    residue = tmp_path / ".f.py.ab12cd34.tmp"
+    residue.write_bytes(b"half-written by a killed run")
+    _age(residue)
+
+    with caplog.at_level(logging.INFO, logger="fastedit.backup"):
+        _atomic_write(target, "new\n")
+
+    assert not residue.exists()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Swept 1" in message and ".f.py.ab12cd34.tmp" in message
+        for message in messages
+    ), messages
+
+
+def test_fresh_same_shape_temp_survives_the_sweep(tmp_path):
+    """A same-shape temp with mtime NOW may be a LIVE concurrent fastedit's
+    in-flight write; the age threshold must protect it even though the shape
+    matches exactly."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    live = tmp_path / ".f.py.deadbeef.tmp"
+    live.write_bytes(b"in-flight temp of a live run")
+
+    _atomic_write(target, "new\n")
+
+    assert live.exists()
+    assert live.read_bytes() == b"in-flight temp of a live run"
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+
+def test_near_miss_temp_names_survive_the_sweep(tmp_path):
+    """The matcher is EXACT: a name only counts as fastedit's own temp on a
+    full ``.{target}.{8 x [a-z0-9_]}.tmp`` match. A missing middle segment,
+    a wrong-length middle, uppercase letters, a non-hidden spelling, a wrong
+    suffix, .bak/.meta/.lock siblings, a DIRECTORY with a matching name, and
+    a symlink with a matching name all survive — however old they are (every
+    case below is aged, so age is not what spares them)."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+
+    near_misses = [
+        ".f.py.tmp",                # missing the random middle segment
+        ".f.py.ab1.tmp",            # wrong-length middle (3 chars)
+        ".f.py.ab12cd345.tmp",      # wrong-length middle (9 chars)
+        ".f.py.AB12CD99.tmp",       # uppercase: tempfile's alphabet is [a-z0-9_]
+        "f.py.ab12cd34.tmp",        # non-hidden variant (no leading dot)
+        ".f.py.ab12cd34.bak",       # wrong suffix
+        "f.py.bak",                 # a .bak sibling
+        "f.py.meta",                # a .meta sibling
+        "f.py.lock",                # a .lock sibling
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90.lock",  # lock-file shape
+    ]
+    for name in near_misses:
+        p = tmp_path / name
+        p.write_bytes(b"not fastedit's temp")
+        _age(p)
+
+    # A DIRECTORY named exactly like the pattern.
+    directory_shaped = tmp_path / ".f.py.ab12cd34.tmp"
+    directory_shaped.mkdir()
+    (directory_shaped / "marker.txt").write_bytes(b"inside")
+    _age(directory_shaped)
+
+    # A SYMLINK named exactly like the pattern (points at a real file that
+    # must never be followed or touched).
+    decoy = tmp_path / "decoy.txt"
+    decoy.write_bytes(b"decoy target")
+    _age(decoy)
+    symlink_shaped = tmp_path / ".f.py.deadbeef.tmp"
+    os.symlink(decoy, symlink_shaped)
+    _age(symlink_shaped, follow_symlinks=False)
+
+    _atomic_write(target, "new\n")
+
+    for name in near_misses:
+        assert (tmp_path / name).exists(), name
+    assert directory_shaped.is_dir()  # still a directory, contents intact
+    assert (directory_shaped / "marker.txt").read_bytes() == b"inside"
+    assert symlink_shaped.is_symlink()  # still a symlink, never followed
+    assert decoy.read_bytes() == b"decoy target"
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+
+def test_other_targets_temps_survive_this_targets_sweep(tmp_path):
+    """A write to f.py sweeps only f.py-shaped residue: another target's
+    temp (``.{other}.tmp`` shape) and a bare backups-style ``{8}.tmp`` in
+    the same directory are not this target's temps and stay put."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    other = tmp_path / ".other.py.aa11bb22.tmp"
+    other.write_bytes(b"another target's residue")
+    _age(other)
+    bare = tmp_path / "cc22dd33.tmp"  # bare form belongs to the backups dir
+    bare.write_bytes(b"backups-dir shape, wrong directory")
+    _age(bare)
+
+    _atomic_write(target, "new\n")
+
+    assert other.exists()
+    assert other.read_bytes() == b"another target's residue"
+    assert bare.exists()
+    assert bare.read_bytes() == b"backups-dir shape, wrong directory"
+
+
+def test_store_init_sweeps_stale_bare_temps_and_keeps_bak(tmp_path, monkeypatch):
+    """BackupStore.__init__ sweeps bare ``{8 x [a-z0-9_]}.tmp`` residue in
+    the store dir (crashed ``__setitem__``): aged temps go, fresh temps and
+    the real .bak backups stay."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(backup_dir))
+
+    stale = backup_dir / "ab12cd34.tmp"
+    stale.write_bytes(b"crashed backup temp")
+    _age(stale)
+    fresh = backup_dir / "zz99xx11.tmp"  # mtime now: possibly a live run's
+    fresh.write_bytes(b"in-flight backup temp")
+    # AB12CD99, not AB12CD34: APFS is case-insensitive, so AB12CD34 would be
+    # the SAME directory entry as the lowercase stale temp above.
+    stale_upper = backup_dir / "AB12CD99.tmp"  # not tempfile's alphabet
+    stale_upper.write_bytes(b"uppercase near-miss")
+    _age(stale_upper)
+    bak = backup_dir / "0123456789abcdef-00000000000000000042.bak"
+    bak.write_bytes(b"real backup")
+
+    store = BackupStore()
+
+    assert store._dir == backup_dir
+    assert not stale.exists()
+    assert fresh.exists()
+    assert fresh.read_bytes() == b"in-flight backup temp"
+    assert stale_upper.exists()
+    assert bak.exists()
+    assert bak.read_bytes() == b"real backup"
+
+
+def test_sweep_unlink_failure_is_swallowed_and_logged_not_fatal(
+    tmp_path, monkeypatch, caplog,
+):
+    """A residue temp that cannot be removed (permission denied) must not
+    break the write: the sweep logs the failure in the repo's error style
+    and ``_atomic_write`` completes normally."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    stuck = tmp_path / ".f.py.ab12cd34.tmp"
+    stuck.write_bytes(b"unremovable residue")
+    _age(stuck)
+
+    real_unlink = Path.unlink
+
+    def refusing_unlink(self, missing_ok=False):
+        if self.name == ".f.py.ab12cd34.tmp":
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", refusing_unlink)
+
+    with caplog.at_level(logging.INFO, logger="fastedit.backup"):
+        _atomic_write(target, "new\n")  # must not raise
+
+    assert target.read_text(encoding="utf-8") == "new\n"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "could not remove" in message.lower() and "ab12cd34" in message
+        for message in messages
+    ), messages
+
+
+def test_write_still_lands_end_to_end_after_sweeping(tmp_path):
+    """Sweeping never disturbs the write itself: the residue is gone, the
+    new content is in place, and no temp of ours is left behind."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    residue = tmp_path / ".f.py.ab12cd34.tmp"
+    residue.write_bytes(b"half-written")
+    _age(residue)
+
+    _atomic_write(target, "new content\n", encoding="utf-8")
+
+    assert target.read_text(encoding="utf-8") == "new content\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f.py"]
