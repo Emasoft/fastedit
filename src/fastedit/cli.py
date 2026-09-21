@@ -20,6 +20,8 @@ import contextlib
 import sys
 from pathlib import Path
 
+from .file_lock import FileLockedError, acquire_edit_lock
+
 # ---------------------------------------------------------------------------
 # Backend helpers (for model-using subcommands: edit, batch-edit, multi-edit)
 # ---------------------------------------------------------------------------
@@ -51,6 +53,31 @@ def _make_backend_with_overrides(args):
         from .model_download import get_model_path
         model_path = getattr(args, "model_path", None) or get_model_path()
         return backend_kind, MLXEngine(model_path)
+
+
+@contextlib.contextmanager
+def _locked_for_edit(path: Path):
+    """Hold the cross-process edit lock for *path* across this command's
+    read→merge→write window.
+
+    fastedit's writes are individually atomic, but two fastedit PROCESSES
+    editing the same file interleave whole read-merge-write cycles and the
+    second silently destroys the first's change. The lock is a kernel flock
+    on a central lock file (~/.fastedit/locks/<sha256(realpath)>.lock), so
+    the kernel releases it if a holder crashes — no stale locks, ever.
+    Non-blocking: on conflict the command exits 1 naming the holder pid, how
+    long it has held the lock, and the target path, before anything is read
+    or written. ``--force`` deliberately does NOT bypass this — it is a
+    parse/caller-gate opt-out, unrelated to concurrent instances. The B37
+    expected-stat guard stays: it covers content changed by a NON-fastedit
+    writer, a different failure than a lock held by fastedit itself.
+    """
+    try:
+        with acquire_edit_lock(path):
+            yield
+    except FileLockedError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +466,18 @@ def _refuse_if_edit_broke_parse(path, original_code, merged_code, language):
 
 def cmd_edit(args):
     """Apply an edit snippet to a file using the FastEdit model."""
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    # Cross-process lock (both code paths below write this file): held from
+    # here through the final write, released on every exit path.
+    with _locked_for_edit(path):
+        _cmd_edit_locked(args)
+
+
+def _cmd_edit_locked(args):
+    """cmd_edit's body, under the file's cross-process edit lock."""
 
     from .data_gen.ast_analyzer import detect_language
     from .inference.caller_safety import (
@@ -603,6 +642,19 @@ def cmd_edit(args):
 
 def cmd_batch_edit(args):
     """Apply multiple sequential edits to one file."""
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    # Per-file scope (this command has exactly one target): the lock spans
+    # the read→merge→write window, not "the whole batch" — but for a single
+    # file those are the same window.
+    with _locked_for_edit(path):
+        _cmd_batch_edit_locked(args)
+
+
+def _cmd_batch_edit_locked(args):
+    """cmd_batch_edit's body, under the file's cross-process edit lock."""
     import json as json_mod
 
     from .data_gen.ast_analyzer import detect_language
@@ -679,8 +731,35 @@ def cmd_batch_edit(args):
 
 def cmd_multi_edit(args):
     """Apply edits across multiple files, writing nothing unless every file succeeds."""
-    import hashlib
     import json as json_mod
+
+    file_edits_json = sys.stdin.read() if args.file_edits == "-" else args.file_edits
+    try:
+        file_edits_list = json_mod.loads(file_edits_json)
+    except json_mod.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Cross-process edit locks, per target: every existing target is locked
+    # up front, non-blocking, in the caller's list order (a fixed order +
+    # non-blocking acquisition cannot deadlock against another concurrent
+    # multi-edit). Each lock is held from here through PHASE 3's write of
+    # that target — that file's whole read→merge→write window, which is why
+    # the locks must span the phases rather than sit inside one of them. A
+    # conflict exits 1 before anything is read or written.
+    with contextlib.ExitStack() as _target_locks:
+        entries = file_edits_list if isinstance(file_edits_list, list) else []
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("file_path"), str):
+                target = Path(entry["file_path"])
+                if target.exists():
+                    _target_locks.enter_context(_locked_for_edit(target))
+        _cmd_multi_edit_locked(args, file_edits_list)
+
+
+def _cmd_multi_edit_locked(args, file_edits_list):
+    """cmd_multi_edit's phases, under every target's cross-process edit lock."""
+    import hashlib
     import os
 
     from .data_gen.ast_analyzer import detect_language
@@ -695,13 +774,6 @@ def cmd_multi_edit(args):
         ConcurrentModificationError,
         _atomic_write,
     )
-
-    file_edits_json = sys.stdin.read() if args.file_edits == "-" else args.file_edits
-    try:
-        file_edits_list = json_mod.loads(file_edits_json)
-    except json_mod.JSONDecodeError as e:
-        print(f"Error: invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
 
     _backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
@@ -856,6 +928,16 @@ def cmd_multi_edit(args):
 
 def cmd_delete(args):
     """Delete a function, method, or class from a file using AST analysis."""
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    with _locked_for_edit(path):
+        _cmd_delete_locked(args)
+
+
+def _cmd_delete_locked(args):
+    """cmd_delete's body, under the file's cross-process edit lock."""
     from .data_gen.ast_analyzer import detect_language
     from .inference.caller_safety import (
         _find_project_root,
@@ -942,6 +1024,16 @@ def cmd_delete(args):
 
 def cmd_move(args):
     """Move a symbol to after another symbol in the same file."""
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    with _locked_for_edit(path):
+        _cmd_move_locked(args)
+
+
+def _cmd_move_locked(args):
+    """cmd_move's body, under the file's cross-process edit lock."""
     from .data_gen.ast_analyzer import detect_language
     from .inference.chunked_merge import move_symbol
     from .io_utils import UnsupportedEncodingError, read_source
@@ -1011,6 +1103,16 @@ def cmd_rename(args):
     mirroring fast_rename_all's AST-verified behaviour. Substrings inside
     strings, comments, and docstrings are not renamed.
     """
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    with _locked_for_edit(path):
+        _cmd_rename_locked(args)
+
+
+def _cmd_rename_locked(args):
+    """cmd_rename's body, under the file's cross-process edit lock."""
     import difflib
 
     from .inference.rename import do_rename_ast
@@ -1100,7 +1202,12 @@ def cmd_rename_all(args):
 
     backups = BackupStore()
     for path, (new_content, _, _) in plan.items():
-        _atomic_write(path, new_content, backups=backups)
+        # Per-file scope: each target is locked only across its own write
+        # (the reads happened in the plan above), so two concurrent
+        # rename-all runs over overlapping trees serialize per file instead
+        # of deadlocking on cross-file lock order.
+        with _locked_for_edit(path):
+            _atomic_write(path, new_content, backups=backups)
 
     skip_note = f" (skipped {total_skipped} in strings/comments)" if total_skipped else ""
     print(
@@ -1116,6 +1223,28 @@ def cmd_move_to_file(args):
     rewrites in every importer discovered via ``tldr references``. On
     ``--dry-run`` nothing is written — we just print the plan.
     """
+    from_path = Path(args.from_file)
+    to_path = Path(args.to_file)
+
+    if not from_path.exists():
+        print(f"Error: source file not found: {args.from_file}", file=sys.stderr)
+        sys.exit(1)
+    if not to_path.exists():
+        print(f"Error: target file not found: {args.to_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Both endpoints are rewritten by this command, so both are locked for
+    # the whole plan: non-blocking, source then destination — a fixed order
+    # that cannot deadlock against another move-to-file between the same
+    # pair (or any other fastedit command holding one endpoint).
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(_locked_for_edit(from_path))
+        locks.enter_context(_locked_for_edit(to_path))
+        _cmd_move_to_file_locked(args)
+
+
+def _cmd_move_to_file_locked(args):
+    """cmd_move_to_file's body, under both endpoints' cross-process locks."""
     from .inference.caller_safety import _find_project_root
     from .inference.move_to_file import move_to_file
 
@@ -1539,6 +1668,14 @@ def cmd_diff(args):
 
 def cmd_undo(args):
     """Revert the last edit to a file using BackupStore."""
+    # The undo WRITES the target file, so it takes the same cross-process
+    # edit lock as the verbs that created the backup.
+    with _locked_for_edit(Path(args.file)):
+        _cmd_undo_locked(args)
+
+
+def _cmd_undo_locked(args):
+    """cmd_undo's body, under the target file's cross-process edit lock."""
     import difflib
 
     from .io_utils import UnsupportedEncodingError, read_source

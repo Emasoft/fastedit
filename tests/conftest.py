@@ -42,3 +42,22 @@ def _isolated_backup_store(tmp_path_factory):
         del os.environ["FASTEDIT_BACKUP_DIR"]
     else:
         os.environ["FASTEDIT_BACKUP_DIR"] = previous
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_lock_dir(tmp_path_factory):
+    """Point every cross-process edit lock at a session-scoped tmp dir.
+
+    The suite sets FASTEDIT_LOCK_DIR (the BackupStore-style override consumed
+    by fastedit.file_lock) so lock contention tests exercise a real central
+    directory shared with spawned subprocess holders, while the real
+    per-user lock store at ~/.fastedit/locks is never touched.
+    """
+    lock_root = tmp_path_factory.mktemp("fastedit-lockdir")
+    previous = os.environ.get("FASTEDIT_LOCK_DIR")
+    os.environ["FASTEDIT_LOCK_DIR"] = str(lock_root)
+    yield lock_root
+    if previous is None:
+        del os.environ["FASTEDIT_LOCK_DIR"]
+    else:
+        os.environ["FASTEDIT_LOCK_DIR"] = previous

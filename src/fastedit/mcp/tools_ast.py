@@ -6,6 +6,7 @@ import difflib
 from pathlib import Path
 
 from ..data_gen.ast_analyzer import detect_language
+from ..file_lock import edit_lock_or_refusal
 from ..inference.chunked_merge import delete_symbol, move_symbol
 from ..inference.rename import do_rename_ast
 from .server import _atomic_write, mcp
@@ -62,7 +63,11 @@ async def fast_delete(file_path: str, symbol: str, force: bool = False) -> str:
 
     language = detect_language(path)
 
-    async with file_locks[file_path]:
+    # In-process asyncio lock + cross-process flock: a CLI `fastedit delete`
+    # on the same file must be refused while this tool writes it.
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         # M2: cross-file caller-safety check. Skipped on force=True.
         if not force:
             project_root = _find_project_root(path)
@@ -124,7 +129,10 @@ async def fast_move(file_path: str, symbol: str, after: str) -> str:
 
     language = detect_language(path)
 
-    async with file_locks[file_path]:
+    # In-process asyncio lock + cross-process flock (see fast_delete).
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         try:
             result = move_symbol(
                 file_path=file_path,
@@ -183,7 +191,10 @@ async def fast_rename(file_path: str, old_name: str, new_name: str, dry_run: boo
     if not path.exists():
         return f"Error: file not found: {file_path}"
 
-    async with file_locks[file_path]:
+    # In-process asyncio lock + cross-process flock (see fast_delete).
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         original = path.read_text(encoding="utf-8")
 
         renamed, count, skipped = do_rename_ast(path, old_name, new_name)
@@ -280,15 +291,30 @@ async def fast_rename_all(
         return "\n".join(lines)
 
     # Apply. Lock each file individually so concurrent callers on unrelated
-    # files don't serialize through a single global lock.
+    # files don't serialize through a single global lock. A target held by
+    # another fastedit PROCESS is skipped and named, not silently dropped.
+    refused: list[str] = []
     for path, (new_content, _, _) in plan.items():
-        async with file_locks[str(path)]:
+        async with (
+            file_locks[str(path)],
+            edit_lock_or_refusal(path) as _lock_refusal,
+        ):
+            if _lock_refusal:
+                refused.append(f"{path}: {_lock_refusal}")
+                continue
             _atomic_write(path, new_content, backups=backups)
 
     skip_note = f" (skipped {total_skipped} in strings/comments)" if total_skipped else ""
+    refused_note = ""
+    if refused:
+        refused_note = (
+            f"\n{len(refused)} file(s) NOT written — locked by another "
+            f"fastedit instance:\n" + "\n".join(refused)
+        )
     return (
         f"Renamed '{old_name}' -> '{new_name}' in {len(plan)} file(s), "
         f"{total_count} replacement(s).{skip_note} 0 model tokens."
+        f"{refused_note}"
     )
 
 
@@ -312,7 +338,11 @@ async def fast_undo(file_path: str) -> str:
 
     path = Path(file_path)
 
-    async with file_locks[file_path]:
+    # The undo WRITES the file, so it takes the same cross-process lock as
+    # the verbs that created the backup (in-process asyncio lock + flock).
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         # B22/B38: backups are raw bytes; pop returns (and removes) the
         # NEWEST one. The restore below writes them back byte-for-byte
         # (bytes content skips _atomic_write's str/BOM path).
@@ -396,8 +426,18 @@ async def fast_move_to_file(
     project_root = _find_project_root(from_path)
 
     # Hold locks on BOTH files for the duration of the move so a
-    # concurrent edit doesn't interleave with our two-file write.
-    async with file_locks[from_file], file_locks[to_file]:
+    # concurrent edit doesn't interleave with our two-file write — both the
+    # in-process asyncio locks and the cross-process flocks.
+    async with (
+        file_locks[from_file],
+        file_locks[to_file],
+        edit_lock_or_refusal(from_path) as _from_refusal,
+        edit_lock_or_refusal(to_path) as _to_refusal,
+    ):
+        if _from_refusal:
+            return f"Error: {_from_refusal}"
+        if _to_refusal:
+            return f"Error: {_to_refusal}"
         try:
             plan = move_to_file(
                 symbol=symbol,

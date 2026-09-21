@@ -10,6 +10,8 @@ uv run pytest -q
 
 Extras are platform-marked in `pyproject.toml`, so this same command works everywhere: `mlx` resolves on macOS (Apple Silicon) only, `vllm` on Linux only, `mcp` (fastmcp) anywhere, and `all-grammars` adds the offline tree-sitter grammar pack. `uv sync` also installs the `dev` group (pytest, ruff).
 
+Concurrent-instance safety lives in `src/fastedit/file_lock.py` — read its module docstring before touching the edit path: the lock file is never unlinked (release is unlock + close only, dodging the unlink race) and acquisition is reentrant per process, so nested acquires can't self-deadlock.
+
 ## Tests
 
 The suite runs in three runtime tiers (pytest markers; heavy tiers are deselected from the default run so it stays hermetic):

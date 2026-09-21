@@ -70,6 +70,10 @@ Every merge output is validated before anything is written:
 
 A rejected attempt is retried with its failure reason appended to the prompt (retry-until-valid), up to `FASTEDIT_MAX_RETRIES` attempts (default 8). On exhaustion the edit is refused loudly and the file is left unchanged — no partial or guessed output is ever written. When retries were consumed, the result message reports it in the metrics segment: `Applied edit to app.py. latency: 900ms, 44 tok/s, 40 tokens, 2 validation retries`.
 
+## Concurrent instances
+
+FastEdit holds a per-file cross-process lock for the whole read→edit→write window. A second instance (CLI or MCP) exits immediately with `another fastedit instance (pid N, running Xs) is editing <path>; wait for it to finish — file unchanged` — nothing is read, merged, or written. The lock is a kernel `flock` on a central lock file (`~/.fastedit/locks/`), so it is released when the holder dies: crash-safe by construction, never stale. `--force` never bypasses it — it only opts out of the parse/caller gates. The `ConcurrentModificationError` stat guard remains the second line of defense, for files changed by a non-fastedit writer.
+
 ## Install
 
 **Prerequisite:** [tldr](https://github.com/parcadei/tldr-code) must be on PATH (used for AST analysis).

@@ -10,6 +10,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ..data_gen.ast_analyzer import detect_language
+from ..file_lock import edit_lock_or_refusal
 from ..inference.chunked_merge import (
     BatchEdit,
     _validation_retries_metric,
@@ -220,7 +221,13 @@ async def fast_edit(
         or (replace and preserve_siblings)
     )
 
-    async with file_locks[file_path]:
+    # Two lock layers: the in-process asyncio lock (concurrent requests to
+    # THIS server) and the cross-process flock (a CLI run or a second MCP
+    # server instance) — the latter was the audit gap: CLI↔MCP writers were
+    # never serialized. Same wording the CLI exits with.
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         # B21: strict-decode read -- an undecodable byte must never become
         # U+FFFD and get written back as EF BF BD. UTF-16/binary files are
         # refused here, before the merge (and before tree-sitter). B37: the
@@ -465,7 +472,10 @@ async def fast_batch_edit(
             preserve_siblings=bool(entry.get("preserve_siblings", False)),
         ))
 
-    async with file_locks[file_path]:
+    # In-process asyncio lock + cross-process flock (see fast_edit).
+    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+        if _lock_refusal:
+            return f"Error: {_lock_refusal}"
         # B21: strict-decode read; UTF-16/binary refused before the merge.
         # B37: the read-time stat rides along to the write below.
         try:
@@ -636,7 +646,13 @@ async def fast_multi_edit(
             ))
 
         # Lock each file individually as we process it sequentially
-        async with file_locks[fp]:
+        async with file_locks[fp], edit_lock_or_refusal(path) as _lock_refusal:
+            if _lock_refusal:
+                # Another fastedit process holds this target: refuse it like
+                # any other gated target; the remaining targets still write.
+                results.append(f"{fp}: {_lock_refusal}")
+                refused_files += 1
+                continue
             # B21: strict-decode read; UTF-16/binary refused before the merge.
             # B37: the read-time stat rides along to this file's write below.
             try:
