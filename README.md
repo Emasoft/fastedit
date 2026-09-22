@@ -301,6 +301,15 @@ Add to `.claude/settings.json` or your project `.claude.json`:
 
 `fastedit-hook` is installed automatically with `uv tool install fastedits` — no paths, no `python3` vs `python` issues.
 
+## Agent skill
+
+Coding agents can install FastEdit as a skill — it teaches the agent the CLI surface: symbol-addressed edits (write only the change), the three edit modes, snippet idioms, validation/retries, and troubleshooting.
+
+```bash
+npx skills add Emasoft/fastedit                                 # discover + install interactively
+npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y   # non-interactive
+```
+
 ## The model
 
 FastEdit includes a fine-tuned 1.7B parameter model (Qwen2.5-Coder-1.5B architecture) trained specifically for code merging. It takes an original code chunk + edit snippet and produces the merged result.
@@ -340,13 +349,13 @@ Per-language model accuracy (156-example benchmark):
 | **Tokens for location** | 0 | ~50% of output | ~50% of output |
 | **What the model sees** | ~35-line chunk | Entire file context | Entire file context |
 | **Failure mode** | Symbol not found (immediate, clear error) | Can't find old lines (silent misapply) | Can't find SEARCH block |
-| **Languages** | 23 | Any | Any |
+| **Languages** | 26 grammars wired by extension (default); 175 with all-grammars (173 e2e-proven) | Any | Any |
 
 ## Supported languages
 
-**Default install** (hard dependencies, wired by file extension): Python, JavaScript, TypeScript, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#, PHP — plus the core formats HTML, XML/SVG/DTD, Markdown, JSON, YAML, CSS, Bash, TOML, SQL, and Dockerfile.
+**Default install** (hard dependencies, wired by file extension): Python, JavaScript, TypeScript/TSX, Rust, Go, Java, C, C++, Ruby, Swift, Kotlin, C#, PHP, Elixir — plus the core formats HTML, XML/SVG/DTD, Markdown, JSON, YAML, CSS, Bash, TOML, SQL, and Dockerfile (26 grammars wired by extension).
 
-**With the `all-grammars` extra** (`pip install fastedit[all-grammars]`): Scala, Lua, Perl, Julia, Zig, Svelte, GraphQL, HCL/Terraform, Make, Nix, and every language in the bundled tree-sitter pack resolve on explicit `language=` requests (verified against the e2e census in `tests/golden/pack_census.json`).
+**With the `all-grammars` extra** (`pip install fastedits[all-grammars]`): Scala, Lua, Perl, Julia, Zig, Svelte, GraphQL, HCL/Terraform, Make, Nix, and every language in the bundled tree-sitter pack resolve on explicit `language=` requests (verified against the e2e census in `tests/golden/pack_census.json`).
 
 ## Testing
 
