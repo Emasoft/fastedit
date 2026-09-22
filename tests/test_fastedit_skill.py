@@ -10,6 +10,11 @@ Contract (skills/fastedit/SKILL.md):
     guide. Parse-only: nothing is executed or written.
   - The file stays <= 200 lines so the skill stays concise enough for an agent
     to load whole.
+  - DRIFT GUARD: src/fastedit/skill/SKILL.md — the packaged copy that ships in
+    the wheel and that `fastedit init` stages for `npx skills add` — is
+    byte-identical to this repo skill (the single source of truth), is a real
+    file, is readable via importlib.resources, and is listed in pyproject's
+    sdist include whitelist.
 """
 
 from __future__ import annotations
@@ -194,3 +199,58 @@ def test_skill_commands_match_the_real_parser(real_parser, skill_text, tmp_path)
                 f"line {line_no}: {' '.join(argv)!r} rejected (exit {exc.code})"
             )
     assert not failures, "commands the real parser rejects:\n" + "\n".join(failures)
+
+
+# ---------------------------------------------------------------------------
+# Packaged-copy drift guard (`fastedit init` ships the skill inside the wheel)
+# ---------------------------------------------------------------------------
+
+PACKAGED_SKILL_PATH = PROJECT_ROOT / "src" / "fastedit" / "skill" / "SKILL.md"
+
+
+def test_packaged_copy_is_byte_identical_to_the_repo_skill():
+    """DRIFT GUARD. skills/fastedit/SKILL.md is the single source of truth —
+    the local directory the Vercel skills CLI reads (`npx skills add
+    <repo>/skills/fastedit` is the locally-verified install shape).
+    src/fastedit/skill/SKILL.md is the packaged copy that ships in the wheel;
+    `fastedit init` stages it into a temp dir for the skills CLI. Both are
+    real files, never symlinks: a link under skills/ would gamble the
+    measured-good discovery path on the CLI following links. An edit to the
+    skill must land in skills/fastedit/SKILL.md and be re-copied into the
+    package — this test fails until they match again."""
+    assert SKILL_PATH.is_file(), f"missing repo skill: {SKILL_PATH}"
+    assert PACKAGED_SKILL_PATH.is_file(), (
+        f"missing packaged skill: {PACKAGED_SKILL_PATH} — re-copy it from {SKILL_PATH}"
+    )
+    assert not SKILL_PATH.is_symlink(), (
+        "skills/fastedit/SKILL.md must stay a real file: `npx skills add` on this "
+        "path is the measured-good install shape and must not depend on link handling"
+    )
+    assert not PACKAGED_SKILL_PATH.is_symlink(), (
+        "the packaged skill must be a real file, not a symlink"
+    )
+    assert PACKAGED_SKILL_PATH.read_bytes() == SKILL_PATH.read_bytes(), (
+        "the packaged SKILL.md drifted from skills/fastedit/SKILL.md — re-copy "
+        "the repo skill into src/fastedit/skill/SKILL.md"
+    )
+
+
+def test_packaged_skill_is_readable_via_importlib_resources():
+    """The exact seam `fastedit init` uses to load the packaged skill."""
+    import importlib.resources
+
+    resource = importlib.resources.files("fastedit").joinpath("skill", "SKILL.md")
+    assert resource.is_file()
+    assert resource.read_bytes() == SKILL_PATH.read_bytes()
+
+
+def test_sdist_include_lists_the_packaged_skill():
+    """pyproject's sdist include list is an explicit whitelist; without this
+    entry an sdist-built install would ship no skill for `fastedit init` to
+    stage. (The wheel needs no entry: hatchling ships every non-gitignored
+    file under the package dir.)"""
+    import tomllib
+
+    data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    include = data["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    assert "src/fastedit/skill/SKILL.md" in include

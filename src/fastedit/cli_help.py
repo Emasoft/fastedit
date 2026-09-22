@@ -312,9 +312,11 @@ COMMANDS: tuple[Command, ...] = (
             Example(
                 ("init",),
                 (
-                    "Installs the agent skill via the skills CLI (npx): the Emasoft/fastedit",
-                    "shorthand resolves the fork's default branch, so re-running refreshes it.",
-                    "Prints next-step guidance; --skill-agent targets another agent.",
+                    "Stages the skill that SHIPS INSIDE this fastedit package into a",
+                    "temp dir and hands that directory to the skills CLI (npx) — no",
+                    "GitHub source and no branch to resolve, so the skill an agent",
+                    "reads always matches the installed fastedit. Prints next-step",
+                    "guidance; --skill-agent targets another agent.",
                 ),
             ),
         ),

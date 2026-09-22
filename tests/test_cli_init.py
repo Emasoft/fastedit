@@ -1,23 +1,33 @@
 """Behavior tests for `fastedit init` — the one-shot agent-skill installer.
 
 Contract (src/fastedit/cli.py::cmd_init):
-  - Runs the Vercel skills CLI via npx with exactly this argv:
-      npx --yes skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y
-    The `Emasoft/fastedit` shorthand resolves the fork's DEFAULT branch, not a
-    pinned tag (re-running refreshes the skill). The subprocess is bounded
+  - Stages the PACKAGED skill — the wheel's fastedit/skill/SKILL.md, the
+    byte-identical copy of skills/fastedit/SKILL.md (drift-guarded by
+    tests/test_fastedit_skill.py) — into a FRESH temp dir laid out as
+    <tmp>/skills/fastedit/SKILL.md, then runs the Vercel skills CLI via npx
+    with exactly this argv:
+      npx --yes skills add <staged>/skills/fastedit -g -a claude-code -y
+    No GitHub shorthand and no --skill filter — the staged directory IS the
+    skill. The shorthand/tree-URL forms would resolve the fork's default
+    branch (main), which still carries the legacy claude-skill content, and
+    the tree-URL form fails outright in non-TTY mode; staging the packaged
+    copy removes the branch question entirely, so the skill an agent reads
+    always matches the installed fastedit. The subprocess is bounded
     (timeout=300) and un-checked (check=False) so cmd_init owns the failure
     reporting.
   - --skill-agent <agent> (default: claude-code) targets another agent; the
     only argv change is the -a value.
-  - npx missing: exit 1 with a clean message carrying the manual command —
-    an init that did nothing must say so.
-  - skills-CLI failure (nonzero exit or timeout): exit 1 with the tool's own
-    output shown, plus the manual command. Never a silent no-op.
-  - Success: prints the skills-CLI output tail, then
+  - Success: removes the staging dir, prints the skills-CLI output tail, then
       "Agent skill installed (global, Claude Code). Next: fastedit pull
        --model mlx-8bit (Apple Silicon) · fastedit doctor"
     and points at `fastedit mcp-install` for the optional MCP entry without
     running it.
+  - npx missing: exit 1 with guidance to install Node.js and re-run init —
+    an init that did nothing must say so.
+  - skills-CLI failure (nonzero exit, timeout, OSError) or a staging
+    failure: exit 1 with the tool's own output shown, plus a manual command
+    whose staged path is LEFT IN PLACE so the command is directly runnable.
+    Never a silent no-op.
 
 subprocess.run and shutil.which are stubbed (monkeypatch) throughout — no
 test touches npx, the network, or the user's global agent config.
@@ -30,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,15 +49,11 @@ import pytest
 from fastedit import cli as cli_module
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-EXPECTED_ARGV = [
-    "npx", "--yes", "skills", "add", "Emasoft/fastedit",
-    "--skill", "fastedit", "-g", "-a", "claude-code", "-y",
-]
-MANUAL_COMMAND = " ".join(EXPECTED_ARGV)
+REPO_SKILL = PROJECT_ROOT / "skills" / "fastedit" / "SKILL.md"
+STAGING_PREFIX = "fastedit-init-skill-"
 
 SKILLS_STDOUT = (
-    "sSkills: resolving Emasoft/fastedit (default branch)\n"
+    "sSkills: resolving <staged>/skills/fastedit\n"
     "  installed fastedit (skill) -> ~/.claude/skills\n"
 )
 
@@ -83,6 +90,25 @@ def _stub_run(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
+
+
+def _staged_dir(argv: list[str]) -> Path:
+    """The staged skills/fastedit directory cmd_init passed to npx."""
+    assert argv[0:4] == ["npx", "--yes", "skills", "add"]
+    staged_dir = Path(argv[4])
+    assert staged_dir.name == "fastedit"
+    assert staged_dir.parent.name == "skills"
+    return staged_dir
+
+
+def _staging_root(argv: list[str]) -> Path:
+    """The fresh temp dir the run staged its skill into."""
+    return _staged_dir(argv).parent.parent
+
+
+def _cleanup_staging(argv: list[str]) -> None:
+    """Remove the staging dir a failed run deliberately left in place."""
+    shutil.rmtree(_staging_root(argv), ignore_errors=True)
 
 
 def _run_init_inprocess(monkeypatch, *extra_args: str) -> None:
@@ -163,7 +189,7 @@ class TestInitArgparse:
 # ---------------------------------------------------------------------------
 
 class TestInitInstallsTheSkill:
-    def test_runs_the_skills_cli_with_the_documented_argv(self, monkeypatch, capsys):
+    def test_runs_the_skills_cli_against_a_staged_local_tree(self, monkeypatch, capsys):
         looked_up = _stub_which(monkeypatch)
         calls = _stub_run(monkeypatch, stdout=SKILLS_STDOUT)
 
@@ -172,15 +198,46 @@ class TestInitInstallsTheSkill:
         assert "npx" in looked_up
         assert len(calls) == 1
         argv, kwargs = calls[0]
-        assert argv == EXPECTED_ARGV
-        assert "-g" in argv and "-y" in argv
-        assert "--skill" in argv and "fastedit" in argv
-        assert argv[argv.index("-a") + 1] == "claude-code"
+        assert argv[0:4] == ["npx", "--yes", "skills", "add"]
+        staged_dir = _staged_dir(argv)
+        # A FRESH temp dir under the system temp root, laid out skills/fastedit.
+        staging_root = staged_dir.parent.parent
+        assert staging_root.name.startswith(STAGING_PREFIX)
+        assert staging_root.parent == Path(tempfile.gettempdir())
+        # NO --skill filter and no GitHub source: the staged path IS the skill.
+        assert "--skill" not in argv
+        assert not any("github.com" in part or "/" == part for part in argv)
+        assert not any(part.startswith(("http://", "https://")) for part in argv)
+        assert argv[5:] == ["-g", "-a", "claude-code", "-y"]
         # Bounded, un-checked: cmd_init owns the failure reporting.
         assert kwargs["timeout"] == 300
         assert kwargs["check"] is False
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
+        # Success cleaned the staging dir up.
+        assert not staging_root.exists()
+
+    def test_staged_skill_is_the_packaged_resource(self, monkeypatch, capsys):
+        """The staged SKILL.md is the packaged copy — byte-identical to the
+        repo skill (the single source of truth)."""
+        _stub_which(monkeypatch)
+        staged_bytes: dict[str, bytes] = {}
+        calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(argv, **kwargs):
+            staged = _staged_dir(argv) / "SKILL.md"
+            staged_bytes["data"] = staged.read_bytes()
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout=SKILLS_STDOUT, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        _run_init_inprocess(monkeypatch)
+
+        assert staged_bytes["data"] == REPO_SKILL.read_bytes()
+        assert len(calls) == 1
+        # Success cleaned the staging dir up.
+        assert not _staging_root(calls[0][0]).exists()
 
     def test_success_prints_output_tail_and_next_steps(self, monkeypatch, capsys):
         _stub_which(monkeypatch)
@@ -205,19 +262,18 @@ class TestInitInstallsTheSkill:
 
         out = capsys.readouterr().out
         argv, _kwargs = calls[0]
-        assert argv == [
-            "npx", "--yes", "skills", "add", "Emasoft/fastedit",
-            "--skill", "fastedit", "-g", "-a", "codex", "-y",
-        ]
+        assert argv[0:4] == ["npx", "--yes", "skills", "add"]
+        assert "--skill" not in argv
+        assert argv[5:] == ["-g", "-a", "codex", "-y"]
         assert "Agent skill installed (global, codex)" in out, out
 
 
 # ---------------------------------------------------------------------------
-# Failure paths — both fail loud with exit 1
+# Failure paths — all fail loud with exit 1
 # ---------------------------------------------------------------------------
 
 class TestInitFailurePaths:
-    def test_npx_missing_exits_1_with_the_manual_command(self, monkeypatch, capsys):
+    def test_npx_missing_exits_1_with_guidance_and_stages_nothing(self, monkeypatch, capsys):
         _stub_which(monkeypatch, result=None)
         calls = _stub_run(monkeypatch)
 
@@ -228,12 +284,15 @@ class TestInitFailurePaths:
         err = capsys.readouterr().err
         assert "npx" in err
         assert "NOT installed" in err
-        assert MANUAL_COMMAND in err
+        assert "Install Node.js" in err
+        assert "fastedit init" in err  # re-run guidance
         assert calls == []  # nothing was executed
 
-    def test_skills_cli_failure_exits_1_and_shows_the_output(self, monkeypatch, capsys):
+    def test_skills_cli_failure_exits_1_shows_output_and_keeps_the_staged_dir(
+        self, monkeypatch, capsys
+    ):
         _stub_which(monkeypatch)
-        _stub_run(
+        calls = _stub_run(
             monkeypatch,
             returncode=1,
             stdout="npm ERR! missing peer dependency",
@@ -248,12 +307,19 @@ class TestInitFailurePaths:
         assert "npm ERR! missing peer dependency" in err, err  # output shown
         assert "npm ERR! code ELIFECYCLE" in err, err
         assert "NOT installed" in err
-        assert MANUAL_COMMAND in err
+        # The manual command is the exact invocation, staged path included.
+        argv, _kwargs = calls[0]
+        assert " ".join(argv) in err
+        # The staged dir is LEFT IN PLACE so the manual command is runnable.
+        assert (_staged_dir(argv) / "SKILL.md").is_file()
+        _cleanup_staging(argv)
 
     def test_skills_cli_timeout_exits_1_with_guidance(self, monkeypatch, capsys):
         _stub_which(monkeypatch)
+        seen: dict = {}
 
         def fake_run(argv, **kwargs):
+            seen["argv"] = argv
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
 
         monkeypatch.setattr(subprocess, "run", fake_run)
@@ -265,4 +331,45 @@ class TestInitFailurePaths:
         err = capsys.readouterr().err
         assert "timed out" in err
         assert "NOT installed" in err
-        assert MANUAL_COMMAND in err
+        assert " ".join(seen["argv"]) in err
+        # The staged dir is LEFT IN PLACE so the manual command is runnable.
+        assert (_staged_dir(seen["argv"]) / "SKILL.md").is_file()
+        _cleanup_staging(seen["argv"])
+
+    def test_npx_spawn_failure_exits_1_with_guidance(self, monkeypatch, capsys):
+        _stub_which(monkeypatch)
+        seen: dict = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            raise OSError("exec format error")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as excinfo:
+            _run_init_inprocess(monkeypatch)
+
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "could not run npx" in err
+        assert " ".join(seen["argv"]) in err
+        _cleanup_staging(seen["argv"])
+
+    def test_staging_failure_exits_1_without_running_npx(self, monkeypatch, capsys):
+        """A missing/broken packaged skill fails loud instead of a traceback."""
+        _stub_which(monkeypatch)
+        calls = _stub_run(monkeypatch)
+
+        def broken_packaged_bytes():
+            raise FileNotFoundError("skill/SKILL.md missing from this install")
+
+        monkeypatch.setattr(cli_module, "_packaged_skill_bytes", broken_packaged_bytes)
+
+        with pytest.raises(SystemExit) as excinfo:
+            _run_init_inprocess(monkeypatch)
+
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "stage" in err
+        assert "NOT installed" in err
+        assert calls == []  # npx was never invoked

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.resources
 import sys
 from pathlib import Path
 
@@ -1736,7 +1737,6 @@ def cmd_pull(args):
 # Agent-skill installer (init)
 # ---------------------------------------------------------------------------
 
-_SKILL_REPO = "Emasoft/fastedit"
 _SKILL_NAME = "fastedit"
 _SKILL_TIMEOUT_S = 300  # generous: npx's first run may download the skills CLI
 _SKILL_TAIL_LINES = 15
@@ -1745,15 +1745,43 @@ _SKILL_TAIL_LINES = 15
 _AGENT_DISPLAY_NAMES = {"claude-code": "Claude Code"}
 
 
-def _skills_add_argv(agent: str) -> list[str]:
+def _packaged_skill_bytes() -> bytes:
+    """The agent skill content shipped inside the installed fastedit package.
+
+    The wheel carries the repo's skills/fastedit/SKILL.md as package data at
+    fastedit/skill/SKILL.md (byte-identity is drift-guarded by
+    tests/test_fastedit_skill.py), so init never has to resolve a GitHub
+    branch to know which skill content matches this install.
+    """
+    return (importlib.resources.files("fastedit") / "skill" / "SKILL.md").read_bytes()
+
+
+def _stage_skill_tree(staging_root: Path) -> Path:
+    """Write the packaged SKILL.md to <staging_root>/skills/fastedit/SKILL.md.
+
+    Returns the staged skills/fastedit directory — the path handed to
+    `npx skills add`. The directory form (a folder holding SKILL.md, named
+    after the skill's frontmatter name) is the locally-verified install
+    shape, and the skills/ level mirrors the repo layout the skills CLI
+    discovers.
+    """
+    skill_dir = staging_root / "skills" / _SKILL_NAME
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_bytes(_packaged_skill_bytes())
+    return skill_dir
+
+
+def _skills_add_argv(skill_dir: Path, agent: str) -> list[str]:
     """The exact skills-CLI invocation `fastedit init` runs.
 
-    The ``Emasoft/fastedit`` shorthand resolves the fork's DEFAULT branch —
-    not a pinned tag — so re-running the command refreshes the skill.
+    The source is a STAGED LOCAL directory, never a GitHub shorthand: the
+    shorthand resolves the fork's default branch (main), which still carries
+    the legacy claude-skill content, and the tree-URL form fails outright in
+    non-TTY mode. No --skill filter — the staged directory IS the skill.
     """
     return [
-        "npx", "--yes", "skills", "add", _SKILL_REPO,
-        "--skill", _SKILL_NAME, "-g", "-a", agent, "-y",
+        "npx", "--yes", "skills", "add", str(skill_dir),
+        "-g", "-a", agent, "-y",
     ]
 
 
@@ -1769,18 +1797,33 @@ def _skills_output_tail(*streams: str) -> str:
 def cmd_init(args):
     """One-shot environment setup: install the fastedit agent skill.
 
-    Drives the Vercel skills CLI through npx to install the skill globally
-    for the target coding agent (--skill-agent, default claude-code), then
-    prints next-step guidance. Failures are loud: npx missing and a failing
-    or timing-out skills-CLI run both exit 1 with the manual command, because
-    an init that did nothing must say so.
+    The skill content SHIPS with the installed fastedit package: the wheel
+    carries skills/fastedit/SKILL.md as package data at
+    fastedit/skill/SKILL.md, byte-identical to the repo skill (drift-guarded
+    by tests/test_fastedit_skill.py). cmd_init stages that packaged file into
+    a FRESH temp directory laid out as <tmp>/skills/fastedit/SKILL.md and
+    points the Vercel skills CLI (npx) at the staged directory, installing
+    globally for the target coding agent (--skill-agent, default claude-code),
+    then prints next-step guidance.
+
+    Nothing is fetched from GitHub. The repo shorthand and tree-URL forms of
+    `npx skills add` resolve the fork's DEFAULT branch (main), which still
+    carries the legacy claude-skill content, so what an agent reads would not
+    match the installed fastedit — and the tree-URL form fails outright in
+    non-TTY mode. Staging the packaged copy removes the branch question
+    entirely: the skill always matches the fastedit that ships it. The
+    staging directory is removed on success and LEFT IN PLACE on failure, so
+    the printed manual command is directly runnable.
+
+    Failures are loud: npx missing, a staging failure, and a failing or
+    timing-out skills-CLI run all exit 1 with guidance — an init that did
+    nothing must say so.
     """
     import shutil
     import subprocess
+    import tempfile
 
     agent = args.skill_agent
-    argv = _skills_add_argv(agent)
-    manual = " ".join(argv)
     display = _AGENT_DISPLAY_NAMES.get(agent, agent)
 
     if shutil.which("npx") is None:
@@ -1788,8 +1831,31 @@ def cmd_init(args):
             "Error: npx (Node.js) not found on PATH — the agent skill was NOT installed.",
             file=sys.stderr,
         )
-        print(f"Install Node.js, then run the installer manually: {manual}", file=sys.stderr)
+        print(
+            "Install Node.js (https://nodejs.org), then re-run: fastedit init",
+            file=sys.stderr,
+        )
         sys.exit(1)
+
+    staging_root = Path(tempfile.mkdtemp(prefix="fastedit-init-skill-"))
+    try:
+        skill_dir = _stage_skill_tree(staging_root)
+    except OSError as e:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        print(
+            f"Error: could not stage the packaged agent skill: {e} — "
+            "the agent skill was NOT installed.",
+            file=sys.stderr,
+        )
+        print(
+            "The skill ships inside the fastedit package (fastedit/skill/SKILL.md); "
+            "reinstall fastedits, then re-run: fastedit init",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    argv = _skills_add_argv(skill_dir, agent)
+    manual = " ".join(argv)
 
     try:
         result = subprocess.run(
@@ -1802,10 +1868,12 @@ def cmd_init(args):
             file=sys.stderr,
         )
         print(f"Retry, or run the installer manually: {manual}", file=sys.stderr)
+        print(f"(the staged skill directory was left in place: {skill_dir})", file=sys.stderr)
         sys.exit(1)
     except OSError as e:
         print(f"Error: could not run npx: {e}", file=sys.stderr)
         print(f"Run the installer manually: {manual}", file=sys.stderr)
+        print(f"(the staged skill directory was left in place: {skill_dir})", file=sys.stderr)
         sys.exit(1)
 
     tail = _skills_output_tail(result.stdout, result.stderr)
@@ -1822,7 +1890,10 @@ def cmd_init(args):
             f"Run the installer manually to see the live output: {manual}",
             file=sys.stderr,
         )
+        print(f"(the staged skill directory was left in place: {skill_dir})", file=sys.stderr)
         sys.exit(1)
+
+    shutil.rmtree(staging_root, ignore_errors=True)
 
     if tail:
         print(tail)

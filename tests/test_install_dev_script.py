@@ -3,8 +3,10 @@
 Covers both forward modes (fork install pinned to a git ref, --dev editable
 install from the working tree), the interactive source menu, branch
 autodetect, the model-cache preflight (VALID kept / STALE removed), the
-all-grammars prompt/flag, the agent-skill install (Vercel skills CLI, pinned
-to the same branch as the package), the revert path, and the dry-run
+all-grammars prompt/flag, the agent-skill install (Vercel skills CLI, sourced
+from this clone's local tree — never a GitHub URL or the repo shorthand,
+which would resolve the fork's default branch and its legacy claude-skill
+content), the revert path, and the dry-run
 transcript, all through the script's real CLI.
 """
 
@@ -83,7 +85,7 @@ def _npx_lines(stdout: str) -> list[list[str]]:
     """Every "+ npx ..." transcript line, shell-split into tokens.
 
     The skill add/remove lines are printed through the same quote_argv as the
-    uv lines, so the same shlex round-trip applies: the skill tree URL must
+    uv lines, so the same shlex round-trip applies: the skill SOURCE PATH must
     survive as ONE token (it holds no spaces or quotes, so quote_argv leaves
     it bare).
     """
@@ -700,37 +702,46 @@ class TestInstallDevRevert:
 
 
 class TestAgentSkillInstall:
-    """The agent-skill axis: installed with the Vercel skills CLI, pinned to
-    the SAME branch as the package, and failure-tolerant exactly like the
+    """The agent-skill axis: installed with the Vercel skills CLI from THIS
+    clone's local tree (REPO_ROOT/skills/fastedit) — never from a GitHub tree
+    URL or the repo shorthand. Both GitHub forms resolve the fork's DEFAULT
+    branch (main), which still carries the legacy claude-skill content, and
+    the tree-URL form fails outright in non-TTY mode; the local tree is the
+    locally-verified install shape and removes the branch question entirely
+    (--ref stays a package-only concern). Failure-tolerant exactly like the
     optional backend install -- a skill failure must never leave this machine
     without fastedit, and the postflight reports what actually happened.
     """
 
-    SKILL_TREE_URL = "https://github.com/Emasoft/fastedit/tree/{ref}/skills/fastedit"
+    SKILL_SOURCE_DIR = f"{REPO_ROOT}/skills/fastedit"
 
     def _add_tokens(self, result: subprocess.CompletedProcess[str]) -> list[str]:
         add = [t for t in _npx_lines(result.stdout) if "add" in t]
         assert len(add) == 1, f"expected exactly one skills-add line in:\n{result.stdout}"
         return add[0]
 
-    def test_dry_run_prints_the_add_command_with_the_autodetected_branch(self) -> None:
-        """Default dry run: the skill add names the AUTODETECTED branch in the tree URL,
-        global and non-interactive with the Claude Code target."""
-        branch = _autodetected_branch()
+    def test_dry_run_prints_the_add_command_from_the_local_tree(self) -> None:
+        """Default dry run: the skill add points at THIS clone's skills/fastedit,
+        global and non-interactive with the Claude Code target, no --skill filter."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
         tokens = self._add_tokens(result)
-        assert tokens[1:6] == [
-            "npx", "--yes", "skills", "add", self.SKILL_TREE_URL.format(ref=branch),
-        ]
-        assert tokens[6:] == ["--skill", "fastedit", "-g", "-a", "claude-code", "-y"]
+        assert tokens[1:6] == ["npx", "--yes", "skills", "add", self.SKILL_SOURCE_DIR]
+        assert tokens[6:] == ["-g", "-a", "claude-code", "-y"]
+        # The path IS the skill: no --skill filter and no GitHub URL anywhere.
+        assert "--skill" not in tokens
+        assert not any("github.com" in token for token in tokens)
+        # The source is the repo skill the packaged-copy drift guard keeps in sync.
+        assert (REPO_ROOT / "skills" / "fastedit" / "SKILL.md").is_file()
 
-    def test_skill_url_branch_follows_an_explicit_ref(self) -> None:
-        """--ref pins BOTH the package spec and the skill source URL to the same branch."""
+    def test_ref_pins_the_package_but_never_the_skill(self) -> None:
+        """--ref pins the package spec only: the skill always comes from the
+        local tree, so no ref appears anywhere in the add command."""
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
         tokens = self._add_tokens(result)
-        assert tokens[5] == self.SKILL_TREE_URL.format(ref="v1.2.3")
+        assert self.SKILL_SOURCE_DIR in tokens
+        assert not any("v1.2.3" in token for token in tokens)
         assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
             _with_all_grammars(_platform_extras()), ref="v1.2.3"
         )
@@ -762,12 +773,15 @@ class TestAgentSkillInstall:
         assert result.returncode == 0, result.stderr
         assert "npx" not in result.stdout
 
-    def test_help_documents_no_skill(self) -> None:
-        """-h documents --no-skill and the automatic skill install."""
+    def test_help_documents_the_local_tree_source(self) -> None:
+        """-h documents --no-skill, the automatic skill install, and the LOCAL
+        tree source — the GitHub tree-URL form is gone."""
         result = run("-h")
         assert result.returncode == 0, result.stderr
         assert "--no-skill" in result.stdout
         assert "agent skill" in result.stdout
+        assert "skills/fastedit" in result.stdout
+        assert "/tree/" not in result.stdout
 
     def test_real_run_installs_and_reports_the_skill(self, tmp_path: Path) -> None:
         """Real run with a stubbed toolchain: the add runs, the postflight reports installed."""
@@ -780,8 +794,9 @@ class TestAgentSkillInstall:
         assert "agent skill: installed (Claude Code, global)" in result.stdout
 
     def test_npx_missing_skips_the_skill_and_says_so(self, tmp_path: Path) -> None:
-        """No npx on PATH: the install prints the manual-install note, the postflight
-        says skipped -- and the run still exits 0 with the package installed."""
+        """No npx on PATH: the install prints the manual-install note (the LOCAL
+        tree command), the postflight says skipped -- and the run still exits 0
+        with the package installed."""
         home = tmp_path / "nonpx-home"
         home.mkdir()
         env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
@@ -789,7 +804,7 @@ class TestAgentSkillInstall:
         assert result.returncode == 0, result.stderr
         assert (
             "npx not found — skipping the agent skill; install manually: "
-            "npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y"
+            f"npx --yes skills add {self.SKILL_SOURCE_DIR} -g -a claude-code -y"
         ) in result.stdout
         assert "agent skill: skipped (npx not found)" in result.stdout
         assert "verified: fastedit at" in result.stdout
@@ -804,6 +819,8 @@ class TestAgentSkillInstall:
         assert result.returncode == 0, result.stderr
         assert "warning: the agent skill could not be installed" in result.stderr
         assert "agent skill: NOT FOUND (see warnings above)" in result.stdout
+        # The manual-install warning names the local tree source.
+        assert self.SKILL_SOURCE_DIR in result.stderr
         # The package itself still landed: the fork postflight passed.
         assert "verified: fastedit at" in result.stdout
 

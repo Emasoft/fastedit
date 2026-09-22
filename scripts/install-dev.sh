@@ -44,11 +44,13 @@
 # touches model weights (existing contract).
 #
 # After the package is in place, the installer also installs the repo's agent
-# skill (skills/fastedit) with the Vercel skills CLI, from the same branch of
-# the fork the package itself was pinned to — one source, one branch. The
-# skill is an add-on, not the product: a missing npx or a failed skill
-# install only warns (--no-skill skips the axis entirely; --revert removes
-# the skill best-effort).
+# skill (skills/fastedit) with the Vercel skills CLI, FROM THIS CLONE'S
+# WORKING TREE — the same skill content the package ships. GitHub sources
+# (the repo shorthand and tree URLs) would resolve the fork's default branch
+# (main), which still carries the legacy claude-skill content, so the local
+# tree is the only correct source. The skill is an add-on, not the product: a
+# missing npx or a failed skill install only warns (--no-skill skips the axis
+# entirely; --revert removes the skill best-effort).
 set -euo pipefail
 
 FORK_URL="https://github.com/Emasoft/fastedit"
@@ -170,10 +172,13 @@ asked on a terminal [Y/n], removed by default without one, printed as
 "would remove" by --dry-run. --revert keeps every cache.
 
 Agent skill: after the package install, the script also installs the agent
-skill with the Vercel skills CLI, from the same branch of the fork the
-package was pinned to (one source, one branch):
-  npx --yes skills add <fork>/tree/<ref>/skills/fastedit --skill fastedit -g -a claude-code -y
-(global, non-interactive, Claude Code target). A missing npx prints a
+skill with the Vercel skills CLI, from THIS clone's working tree — the same
+skills/fastedit directory the package is built from:
+  npx --yes skills add <repo_root>/skills/fastedit -g -a claude-code -y
+(global, non-interactive, Claude Code target; the path IS the skill, and
+--ref never affects it — no GitHub source is involved, because the repo
+shorthand and tree URLs would resolve the fork's default branch (main),
+which still carries the legacy claude-skill content). A missing npx prints a
 one-line manual-install note and a failed install only warns — neither ever
 fails the installer. The postflight reports the axis truthfully:
 "agent skill: installed (Claude Code, global)" / "agent skill: NOT FOUND
@@ -773,40 +778,47 @@ pull_model() {
 }
 
 # The agent skill ships in this repo under skills/fastedit and is installed
-# with the Vercel skills CLI (`npx skills`). Its source URL is pinned to the
-# SAME branch the package spec above is pinned to (REF: the autodetected
-# branch, an explicit --ref, or the built-in default) — one source, one
-# branch, so the skill an agent reads always matches the fastedit that was
-# just installed. The whole axis is optional by contract, exactly like the
-# optional backend install: a missing npx prints a one-line manual-install
-# note, a failed install only warns, and neither ever aborts the run — a
-# skill must never be the reason this machine ends up without fastedit.
-skill_tree_url() {
-  printf '%s' "https://github.com/${FORK_URL#https://github.com/}/tree/${REF}/skills/fastedit"
+# with the Vercel skills CLI (`npx skills`) FROM THE LOCAL TREE — never from
+# a GitHub source. The fork's default branch (main) still carries the legacy
+# claude-skill/SKILL.md, so the repo shorthand installs the WRONG content,
+# and the tree-URL form fails outright in non-TTY mode (both measured). The
+# installer always runs from a clone, and skills/fastedit is the very skill
+# the package is built from, so the local tree needs no branch pin at all
+# (--ref stays a package-only concern). The whole axis is optional by
+# contract, exactly like the optional backend install: a missing npx, a
+# missing local tree, or a failed install only warns, and none of them ever
+# aborts the run — a skill must never be the reason this machine ends up
+# without fastedit.
+skill_source_dir() {
+  printf '%s' "${REPO_ROOT}/skills/fastedit"
 }
 
 install_agent_skill() {
   if [[ "$NO_SKILL" -eq 1 ]]; then
     return 0
   fi
+  local skill_dir
+  skill_dir="$(skill_source_dir)"
   if ! command -v npx >/dev/null 2>&1; then
-    echo "note: npx not found — skipping the agent skill; install manually: npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y"
+    echo "note: npx not found — skipping the agent skill; install manually: npx --yes skills add ${skill_dir} -g -a claude-code -y"
     return 0
   fi
-  local url
-  url="$(skill_tree_url)"
-  echo "+ npx --yes skills add $(quote_argv "$url") --skill fastedit -g -a claude-code -y"
+  if [[ ! -f "${skill_dir}/SKILL.md" ]]; then
+    echo "note: no agent skill at ${skill_dir}/SKILL.md (standalone run?) — skipping; run this installer from a fastedit clone, or use 'fastedit init' to install the skill shipped with the package"
+    return 0
+  fi
+  echo "+ npx --yes skills add $(quote_argv "$skill_dir") -g -a claude-code -y"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
   local out status=0
-  out=$(npx --yes skills add "$url" --skill fastedit -g -a claude-code -y 2>&1) || status=$?
+  out=$(npx --yes skills add "$skill_dir" -g -a claude-code -y 2>&1) || status=$?
   if [[ -n "$out" ]]; then
     echo "$out"
   fi
   if [[ "$status" -ne 0 ]]; then
     echo "warning: the agent skill could not be installed (npx skills add exited ${status}) — fastedit itself is unaffected." >&2
-    echo "warning: install it manually later: npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y" >&2
+    echo "warning: install it manually later: npx --yes skills add ${skill_dir} -g -a claude-code -y" >&2
     return 0
   fi
   echo "installed: agent skill 'fastedit' (Claude Code, global)"

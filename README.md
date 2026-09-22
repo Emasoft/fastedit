@@ -306,11 +306,11 @@ Add to `.claude/settings.json` or your project `.claude.json`:
 Coding agents can install FastEdit as a skill — it teaches the agent the CLI surface: symbol-addressed edits (write only the change), the three edit modes, snippet idioms, validation/retries, and troubleshooting.
 
 ```bash
-npx skills add Emasoft/fastedit                                 # discover + install interactively
-npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y   # non-interactive
+fastedit init                                                     # preferred: ships with the installed CLI — global + yes, no branch ambiguity
+npx --yes skills add "<repo>/skills/fastedit" -g -a claude-code -y      # contributors working from a clone of this repo
 ```
 
-Installed automatically by `scripts/install-dev.sh` (pinned to the same branch as the package); pass `--no-skill` to skip, and `--revert` removes it again.
+Installed automatically by `scripts/install-dev.sh` from the repo's working tree (`skills/fastedit` — no GitHub fetch, so no branch question); pass `--no-skill` to skip, and `--revert` removes it again.
 
 ## The model
 
