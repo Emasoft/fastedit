@@ -502,7 +502,8 @@ def test_crashed_residue_for_this_target_is_swept_on_the_next_write(
 ):
     """A SIGKILL mid-``_atomic_write`` leaves ``.{name}.{random}.tmp`` behind;
     the next write to the SAME target removes it before creating its own
-    temp, logging the sweep (count + names) at INFO."""
+    temp, logging the sweep (count + names) at WARNING — the deletion happened
+    in a directory the USER owns."""
     target = tmp_path / "f.py"
     target.write_text("old\n", encoding="utf-8")
     residue = tmp_path / ".f.py.ab12cd34.tmp"
@@ -518,6 +519,53 @@ def test_crashed_residue_for_this_target_is_swept_on_the_next_write(
         "Swept 1" in message and ".f.py.ab12cd34.tmp" in message
         for message in messages
     ), messages
+
+
+def test_user_tree_sweep_summary_is_warning_cli_visible(tmp_path, caplog):
+    """Site A deletes a file in a directory the USER owns: the summary is a
+    WARNING. A CLI run configures no logging, so WARNING is the first level
+    that reaches stderr (logging.lastResort) — at INFO the deletion of a
+    user-tree file would be invisible exactly where it matters most."""
+    target = tmp_path / "f.py"
+    target.write_text("old\n", encoding="utf-8")
+    residue = tmp_path / ".f.py.ab12cd34.tmp"
+    residue.write_bytes(b"half-written by a killed run")
+    _age(residue)
+
+    with caplog.at_level(logging.INFO, logger="fastedit.backup"):
+        _atomic_write(target, "new\n")
+
+    assert not residue.exists()
+    swept = [r for r in caplog.records if "Swept 1" in r.getMessage()]
+    assert swept, [r.getMessage() for r in caplog.records]
+    assert swept[0].levelno == logging.WARNING
+
+
+def test_store_dir_sweep_summary_stays_info_internal_housekeeping(
+    tmp_path, monkeypatch, caplog,
+):
+    """Site B sweeps fastedit's OWN backup store — internal housekeeping in a
+    fastedit-owned directory: the summary stays INFO (observable on the MCP
+    server's DEBUG stderr) and no WARNING is emitted for it."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(backup_dir))
+    stale = backup_dir / "ab12cd34.tmp"
+    stale.write_bytes(b"crashed backup temp")
+    _age(stale)
+
+    with caplog.at_level(logging.INFO, logger="fastedit.backup"):
+        BackupStore()
+
+    assert not stale.exists()
+    swept = [r for r in caplog.records if "Swept 1" in r.getMessage()]
+    assert swept, [r.getMessage() for r in caplog.records]
+    assert swept[0].levelno == logging.INFO
+    assert all(
+        r.levelno < logging.WARNING
+        for r in caplog.records
+        if r.name == "fastedit.backup"
+    )
 
 
 def test_fresh_same_shape_temp_survives_the_sweep(tmp_path):

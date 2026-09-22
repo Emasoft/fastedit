@@ -31,7 +31,13 @@ REENTRANCY REGISTRY
     CLI sharing one process) would deadlock against itself. A process-level
     registry maps realpath → held record: a same-process re-acquire is a
     no-op returning the existing record, and only the OUTERMOST release
-    unlocks.
+    unlocks. The whole check→flock→insert (and delete→unlock) sequence runs
+    under one threading lock, atomically: fastedit both runs MCP tools on
+    the event loop and drives merges through asyncio.to_thread workers, so
+    two THREADS can race on one path — a racer that missed another's
+    registry insert would open its OWN fd, fail the non-blocking flock
+    against itself, and raise a false cross-process refusal naming its own
+    pid.
 """
 
 from __future__ import annotations
@@ -97,24 +103,34 @@ class EditFileLock:
         would let a waiter on the old inode and a fresh creator both
         believe they hold the lock). The kernel drops the flock when this
         process dies, so a leaked record is self-healing.
+
+        The FINAL release — depth reset, registry removal, unlock, close —
+        runs under ``_REGISTRY_LOCK``, the same lock :func:`_acquire_record`
+        holds across its check→flock→insert. Split it, and an acquirer
+        could observe the record already deleted while the kernel lock is
+        still held (flock excludes per open-file-description even within
+        one process) and false-refuse against its own pid. Every depth
+        mutation is under the lock too, so concurrent acquire/release
+        threads cannot lose an increment or double-unlock. The unlock is a
+        non-blocking syscall, so the mutex is never held on a wait.
         """
-        if self._depth > 1:
-            self._depth -= 1
-            return
-        if self._depth <= 0:  # pragma: no cover — double-release guard
-            return
-        self._depth = 0
         with _REGISTRY_LOCK:
+            if self._depth > 1:
+                self._depth -= 1
+                return
+            if self._depth <= 0:  # pragma: no cover — double-release guard
+                return
+            self._depth = 0
             if _REGISTRY.get(self.target) is self:
                 del _REGISTRY[self.target]
-        try:
-            if fcntl is not None:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            elif msvcrt is not None:
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-        finally:
-            os.close(self._fd)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            finally:
+                os.close(self._fd)
 
 
 # Process-level registry: realpath -> held record. Guarded by a threading
@@ -168,6 +184,15 @@ def _open_and_lock(lock_file: Path) -> int:
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt is not None:
+            # Windows byte-range locks refuse to lock a region the file does
+            # not have, and a freshly created lock file is 0 bytes here (the
+            # full holder stamp is only written AFTER the lock is taken).
+            # Give the file its first byte BEFORE LK_NBLCK — and only when
+            # it has none, so a conflicted acquirer never tramples the
+            # holder's stamp. POSIX flock is per-fd and needs no bytes, so
+            # the fcntl branch stays write-free.
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\n")
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:  # pragma: no cover — neither primitive exists
@@ -183,10 +208,17 @@ def _stamp_holder(fd: int) -> None:
     payload = f"pid={os.getpid()}\nstarted={time.time():.6f}\n".encode()
     try:
         os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
         view = memoryview(payload)
         while view:
             view = view[os.write(fd, view):]
+        # Truncate AFTER the write, to exactly the payload length: a longer
+        # stamp left by a previous holder loses its tail, and — the Windows
+        # shape — the truncation never removes byte 0, where the msvcrt
+        # byte-range lock lives. The old ftruncate(0)-first order would
+        # delete the locked byte itself (a _chsize over a locked region can
+        # fail or drop the lock; untestable on macOS, so the order that is
+        # safe on both platforms runs unconditionally).
+        os.ftruncate(fd, len(payload))
     except OSError:
         # The stamp is informational; the flock is the lock. A read-only
         # lock file must not fail an otherwise-successful acquisition.
@@ -232,6 +264,38 @@ def _conflict_message(target: str, lock_file: Path) -> str:
     )
 
 
+def _acquire_record(target: str, path: Path | str) -> EditFileLock:
+    """Check-then-insert the reentrancy registry for *target*, ATOMICALLY.
+
+    Everything — the registry check, the depth bump of an existing record,
+    the open+flock of a fresh one, the insert, and the courtesy stamp —
+    runs under ``_REGISTRY_LOCK``. It must: flock excludes per
+    open-file-description even WITHIN one process, so a thread that missed
+    another thread's insert would open its OWN fd, fail the non-blocking
+    flock, and raise a false cross-process ``FileLockedError`` naming its
+    own pid; two racers that both inserted would each hold a record whose
+    release unlocks while a sibling still "holds". The critical section is
+    microseconds (the kernel acquisition is non-blocking — it never waits),
+    so the mutex never queues in practice.
+    """
+    with _REGISTRY_LOCK:
+        held = _REGISTRY.get(target)
+        if held is not None:
+            held._depth += 1
+            return held
+        lock_file = lock_file_for(path)
+        try:
+            fd = _open_and_lock(lock_file)
+        except OSError as e:
+            raise FileLockedError(
+                _conflict_message(str(path), lock_file),
+            ) from e
+        record = EditFileLock(target, lock_file, fd)
+        _REGISTRY[target] = record
+        _stamp_holder(fd)
+        return record
+
+
 @contextlib.contextmanager
 def acquire_edit_lock(path: Path | str):
     """Hold *path*'s cross-process edit lock for a read→merge→write window.
@@ -244,29 +308,14 @@ def acquire_edit_lock(path: Path | str):
     Reentrant per process: acquiring the same path again in the SAME
     process returns the existing record (a no-op) — required because flock
     excludes per open-file-description and would otherwise make nested
-    acquires self-conflict. Only the outermost release unlocks.
+    acquires self-conflict. Only the outermost release unlocks. The
+    registry check→flock→insert is atomic across threads
+    (:func:`_acquire_record`), so same-process threads racing on one path
+    share ONE record with correct depth accounting instead of a racer
+    falsely refusing against its own pid.
     """
     target = os.path.realpath(str(path))
-    with _REGISTRY_LOCK:
-        held = _REGISTRY.get(target)
-        if held is not None:
-            held._depth += 1
-    if held is not None:
-        try:
-            yield held
-        finally:
-            held.release()
-        return
-
-    lock_file = lock_file_for(path)
-    try:
-        fd = _open_and_lock(lock_file)
-    except OSError as e:
-        raise FileLockedError(_conflict_message(str(path), lock_file)) from e
-    record = EditFileLock(target, lock_file, fd)
-    with _REGISTRY_LOCK:
-        _REGISTRY[target] = record
-    _stamp_holder(fd)
+    record = _acquire_record(target, path)
     try:
         yield record
     finally:

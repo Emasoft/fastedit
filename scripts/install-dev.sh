@@ -69,6 +69,11 @@ NO_MODEL=0
 # NO_SKILL=1 (--no-skill) skips the whole agent-skill axis: nothing is
 # installed in the forward modes and --revert does not try to remove it.
 NO_SKILL=0
+# The ONE agent the skills CLI is pointed at, spelled in the agent-id
+# vocabulary `fastedit init --skill-agent` takes. Every `-a` flag and every
+# success line derives from this variable, so what ran and what is reported
+# cannot disagree.
+SKILL_AGENT="claude-code"
 # DEV=1 installs editable from this repo's working tree instead of the fork's
 # git URL. It is set by --dev, or by picking [1] in the source menu. REPO_ROOT
 # is resolved unconditionally (this script's parent directory) because the
@@ -175,13 +180,13 @@ Agent skill: after the package install, the script also installs the agent
 skill with the Vercel skills CLI, from THIS clone's working tree — the same
 skills/fastedit directory the package is built from:
   npx --yes skills add <repo_root>/skills/fastedit -g -a claude-code -y
-(global, non-interactive, Claude Code target; the path IS the skill, and
+(global, non-interactive, claude-code target; the path IS the skill, and
 --ref never affects it — no GitHub source is involved, because the repo
 shorthand and tree URLs would resolve the fork's default branch (main),
 which still carries the legacy claude-skill content). A missing npx prints a
 one-line manual-install note and a failed install only warns — neither ever
 fails the installer. The postflight reports the axis truthfully:
-"agent skill: installed (Claude Code, global)" / "agent skill: NOT FOUND
+"agent skill: installed (claude-code, global)" / "agent skill: NOT FOUND
 (see warnings above)" / "agent skill: skipped (...)". --revert removes the
 skill best-effort with "npx --yes skills remove fastedit -g -y".
 EOF
@@ -800,28 +805,28 @@ install_agent_skill() {
   local skill_dir
   skill_dir="$(skill_source_dir)"
   if ! command -v npx >/dev/null 2>&1; then
-    echo "note: npx not found — skipping the agent skill; install manually: npx --yes skills add ${skill_dir} -g -a claude-code -y"
+    echo "note: npx not found — skipping the agent skill; install manually: npx --yes skills add ${skill_dir} -g -a ${SKILL_AGENT} -y"
     return 0
   fi
   if [[ ! -f "${skill_dir}/SKILL.md" ]]; then
     echo "note: no agent skill at ${skill_dir}/SKILL.md (standalone run?) — skipping; run this installer from a fastedit clone, or use 'fastedit init' to install the skill shipped with the package"
     return 0
   fi
-  echo "+ npx --yes skills add $(quote_argv "$skill_dir") -g -a claude-code -y"
+  echo "+ npx --yes skills add $(quote_argv "$skill_dir") -g -a ${SKILL_AGENT} -y"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
   local out status=0
-  out=$(npx --yes skills add "$skill_dir" -g -a claude-code -y 2>&1) || status=$?
+  out=$(npx --yes skills add "$skill_dir" -g -a "$SKILL_AGENT" -y 2>&1) || status=$?
   if [[ -n "$out" ]]; then
     echo "$out"
   fi
   if [[ "$status" -ne 0 ]]; then
     echo "warning: the agent skill could not be installed (npx skills add exited ${status}) — fastedit itself is unaffected." >&2
-    echo "warning: install it manually later: npx --yes skills add ${skill_dir} -g -a claude-code -y" >&2
+    echo "warning: install it manually later: npx --yes skills add ${skill_dir} -g -a ${SKILL_AGENT} -y" >&2
     return 0
   fi
-  echo "installed: agent skill 'fastedit' (Claude Code, global)"
+  echo "installed: agent skill 'fastedit' (${SKILL_AGENT}, global)"
 }
 
 # --revert's counterpart: undo the global skill install. Tolerated-absent on
@@ -972,7 +977,7 @@ verify_agent_skill() {
     echo "agent skill: NOT FOUND (see warnings above)"
     return 0
   fi
-  echo "agent skill: installed (Claude Code, global)"
+  echo "agent skill: installed (${SKILL_AGENT}, global)"
 }
 
 # ---------------------------------------------------------------------------

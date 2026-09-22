@@ -48,6 +48,7 @@ import contextlib
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -508,3 +509,189 @@ class TestCliLockedFileExitPath:
         assert "file unchanged" in stderr, stderr
         assert "Traceback" not in stderr, stderr
         assert target.read_text(encoding="utf-8") == PY_ORIGINAL
+
+
+# ---------------------------------------------------------------------------
+# (i) platform branch contract: POSIX selects fcntl; the Windows branch's
+#     observable shape (a byte-range lock needs a byte to lock)
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformBranchContract:
+    def test_posix_branch_selects_fcntl(self):
+        """On POSIX the module must import with fcntl present and msvcrt
+        absent — exactly one locking primitive per platform."""
+        from fastedit import file_lock
+
+        if sys.platform == "win32":  # pragma: no cover — POSIX dev machines
+            pytest.skip("asserts the POSIX branch selection")
+        assert file_lock.fcntl is not None
+        assert file_lock.msvcrt is None
+
+    def test_held_lock_file_holds_at_least_one_byte(self, tmp_path):
+        """While the lock is held the lock file is never empty: the
+        byte-range branch (Windows msvcrt.locking) needs an existing byte to
+        lock, and release() must unlock exactly the range it locked."""
+        target = tmp_path / "sized.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        with acquire_edit_lock(target) as lock:
+            assert lock.lock_file.stat().st_size >= 1
+
+
+class TestWindowsBranchShape:
+    """The msvcrt branch cannot run on POSIX; its CONTRACT can. Driven with a
+    fake msvcrt so the real branch code runs:
+
+    1. a freshly created 0-byte lock file gains its first byte BEFORE
+       LK_NBLCK (Windows refuses to lock a region the file does not have);
+    2. a non-empty lock file is untouched before the lock (a conflicted
+       acquirer must not trample the holder's stamp);
+    3. lock and unlock are exactly (offset 0, 1 byte) — the range release()
+       later unlocks;
+    4. a conflicted acquire closes the fd exactly once.
+    """
+
+    class _FakeMsvcrt:
+        LK_NBLCK = 2
+        LK_UNLCK = 0
+
+        def __init__(self, conflict: bool = False):
+            self.calls: list[tuple[int, int, int]] = []
+            self.conflict = conflict
+
+        def locking(self, fd, mode, nbytes):
+            if self.conflict and mode == self.LK_NBLCK:
+                self.calls.append((fd, mode, nbytes))
+                raise OSError(36, "Resource deadlock avoided")
+            self.calls.append((fd, mode, nbytes))
+
+    def _fake_branch(self, monkeypatch, conflict: bool = False):
+        from fastedit import file_lock
+
+        fake = self._FakeMsvcrt(conflict=conflict)
+        monkeypatch.setattr(file_lock, "fcntl", None)
+        monkeypatch.setattr(file_lock, "msvcrt", fake)
+        return file_lock, fake
+
+    def test_zero_byte_lock_file_gets_a_byte_before_locking(
+        self, tmp_path, monkeypatch,
+    ):
+        file_lock, fake = self._fake_branch(monkeypatch)
+        lock_file = tmp_path / "fresh.lock"
+
+        fd = file_lock._open_and_lock(lock_file)
+        record = file_lock.EditFileLock(str(tmp_path / "t.py"), lock_file, fd)
+        record.release()
+
+        # Lock then unlock, each exactly (fd, 1 byte); the file had a byte
+        # before the FIRST locking call (it is non-empty from creation on).
+        assert [(mode, nbytes) for _fd, mode, nbytes in fake.calls] == [
+            (fake.LK_NBLCK, 1), (fake.LK_UNLCK, 1),
+        ]
+        assert lock_file.stat().st_size >= 1
+        with pytest.raises(OSError):
+            os.fstat(fd)  # release() closed the fd
+
+    def test_non_empty_lock_file_is_untouched_before_the_lock(
+        self, tmp_path, monkeypatch,
+    ):
+        """A pre-stamped lock file (another process's courtesy record) must
+        reach the locking call byte-for-byte: the placeholder write only
+        fires when the file has no bytes at all."""
+        file_lock, _fake = self._fake_branch(monkeypatch)
+        lock_file = tmp_path / "stamped.lock"
+        lock_file.write_bytes(b"pid=999\nstarted=1.000000\n")
+
+        fd = file_lock._open_and_lock(lock_file)
+        assert lock_file.read_bytes() == b"pid=999\nstarted=1.000000\n"
+        os.close(fd)
+
+    def test_conflicted_acquire_closes_the_fd(self, tmp_path, monkeypatch):
+        file_lock, fake = self._fake_branch(monkeypatch, conflict=True)
+        lock_file = tmp_path / "conflicted.lock"
+
+        with pytest.raises(OSError):
+            file_lock._open_and_lock(lock_file)
+
+        (conflict_fd, _mode, _nbytes) = fake.calls[0]
+        with pytest.raises(OSError):
+            os.fstat(conflict_fd)  # the error path closed it (exactly once:
+        #                              a second close would also raise here)
+
+
+# ---------------------------------------------------------------------------
+# (j) reentrancy registry: exceptions inside the body, and thread races
+# ---------------------------------------------------------------------------
+
+
+class TestReentrancyUnderExceptionsAndThreads:
+    def test_inner_body_exception_releases_one_level_outer_still_holds(
+        self, tmp_path,
+    ):
+        """An exception raised inside a NESTED acquire consumes only that
+        acquire's depth: the outer acquire still holds the file."""
+        target = tmp_path / "depth_exc.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+
+        with acquire_edit_lock(target):
+            with (
+                pytest.raises(RuntimeError, match="inner body failed"),
+                acquire_edit_lock(target),
+            ):
+                raise RuntimeError("inner body failed")
+            # The inner release ran; the outer lock is still held.
+            assert _probe_acquire_elsewhere(target) is False
+        assert _probe_acquire_elsewhere(target) is True
+
+    def test_registry_is_cleaned_when_the_outer_body_raises(self, tmp_path):
+        """An exception unwinding the OUTERMOST acquire unlocks the file and
+        removes the registry record — no leaked entry, no stale hold."""
+        from fastedit import file_lock
+
+        target = tmp_path / "outer_exc.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        key = os.path.realpath(str(target))
+
+        with (
+            pytest.raises(RuntimeError, match="outer body failed"),
+            acquire_edit_lock(target),
+        ):
+            raise RuntimeError("outer body failed")
+
+        assert key not in file_lock._REGISTRY
+        assert _probe_acquire_elsewhere(target) is True
+
+    def test_threads_racing_on_one_path_share_one_record(self, tmp_path):
+        """Same-process threads acquiring the same path at the same instant
+        must never fall through to their own flock: flock excludes per
+        open-file-description, so a racer that misses the registry insert
+        would surface as a false CROSS-PROCESS refusal. Barrier-synced
+        cycles maximize the check-then-insert race the registry must be
+        atomic against."""
+        from fastedit import file_lock
+
+        target = tmp_path / "raced.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        key = os.path.realpath(str(target))
+        errors: list[Exception] = []
+        barrier = threading.Barrier(8, timeout=30)
+
+        def worker():
+            try:
+                for _cycle in range(25):
+                    barrier.wait()  # all threads acquire simultaneously
+                    with acquire_edit_lock(target):
+                        assert file_lock._REGISTRY.get(key) is not None
+            except BaseException as e:  # noqa: BLE001 — the failure IS the test
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == [], errors
+        # Every thread released its outermost acquire: nothing is left held.
+        assert key not in file_lock._REGISTRY
+        assert _probe_acquire_elsewhere(target) is True

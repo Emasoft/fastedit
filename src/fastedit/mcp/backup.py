@@ -120,12 +120,25 @@ def _stale_temp_files(
 
 def _sweep_stale_temps(directory: Path, prefix: str | None = None) -> None:
     """Remove every stale fastedit temp :func:`_stale_temp_files` yields in
-    *directory*, logging the sweep (count + names) at INFO.
+    *directory*, logging the sweep (count + names).
+
+    The summary's level follows the SITE. The prefixed form (``_atomic_write``
+    sweeping next to a real target) deletes files in a directory the USER
+    owns, so it logs at WARNING -- the first level a CLI run with no logging
+    configuration emits (``logging.lastResort``), keeping the deletion visible
+    exactly where it matters most. The bare form (``BackupStore.__init__``
+    sweeping its own store dir) is internal housekeeping in a fastedit-owned
+    directory and stays at INFO.
 
     Best-effort by contract: an unlink failure (permissions, a concurrent
     removal) is logged and swallowed -- a cleanup sweep must never be the
     thing that fails an otherwise good write.
     """
+    # The level is DERIVED from the site, not passed in: prefix is None
+    # exactly when the sweep is the store dir's own housekeeping (the bare
+    # mkstemp shape only ever occurs there), so the level cannot drift from
+    # what is actually being swept.
+    level = logging.INFO if prefix is None else logging.WARNING
     removed: list[str] = []
     for path in _stale_temp_files(directory, prefix=prefix):
         try:
@@ -137,7 +150,8 @@ def _sweep_stale_temps(directory: Path, prefix: str | None = None) -> None:
             continue
         removed.append(path.name)
     if removed:
-        logger.info(
+        logger.log(
+            level,
             "Swept %d stale temp file(s) left by crashed run(s) in %s: %s",
             len(removed), directory, ", ".join(sorted(removed)),
         )

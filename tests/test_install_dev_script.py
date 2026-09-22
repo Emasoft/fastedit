@@ -722,7 +722,7 @@ class TestAgentSkillInstall:
 
     def test_dry_run_prints_the_add_command_from_the_local_tree(self) -> None:
         """Default dry run: the skill add points at THIS clone's skills/fastedit,
-        global and non-interactive with the Claude Code target, no --skill filter."""
+        global and non-interactive with the claude-code target, no --skill filter."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
         tokens = self._add_tokens(result)
@@ -791,7 +791,24 @@ class TestAgentSkillInstall:
         result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
         assert result.returncode == 0, result.stderr
         assert "installed: agent skill" in result.stdout
-        assert "agent skill: installed (Claude Code, global)" in result.stdout
+        assert "agent skill: installed (claude-code, global)" in result.stdout
+
+    def test_postflight_reports_the_targeted_agent_id(self) -> None:
+        """The installer targets exactly ONE agent, spelled in the agent-id
+        vocabulary `fastedit init --skill-agent` takes (claude-code), and its
+        self-report derives from that same SKILL_AGENT variable — not from a
+        second, driftable 'Claude Code' display brand: the `-a` value, both
+        success lines, and the usage prose cannot disagree with what ran."""
+        script = SCRIPT.read_text(encoding="utf-8")
+        assert 'SKILL_AGENT="claude-code"' in script
+        # The invocation and every report line derive from the variable.
+        assert '-a "$SKILL_AGENT"' in script
+        assert "agent skill: installed (${SKILL_AGENT}, global)" in script
+        assert "installed: agent skill 'fastedit' (${SKILL_AGENT}, global)" in script
+        assert "Claude Code" not in script, (
+            "the installer reports the targeted agent id (claude-code, the "
+            "--skill-agent vocabulary), not a hardcoded display brand"
+        )
 
     def test_npx_missing_skips_the_skill_and_says_so(self, tmp_path: Path) -> None:
         """No npx on PATH: the install prints the manual-install note (the LOCAL
