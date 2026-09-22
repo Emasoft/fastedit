@@ -1749,7 +1749,8 @@ def _packaged_skill_bytes() -> bytes:
     """The agent skill content shipped inside the installed fastedit package.
 
     The wheel carries the repo's skills/fastedit/SKILL.md as package data at
-    fastedit/skill/SKILL.md (byte-identity is drift-guarded by
+    fastedit/skill/SKILL.md (auto-synced one-way from the source of truth by
+    tests/conftest.py at every test-session start; byte-identity asserted by
     tests/test_fastedit_skill.py), so init never has to resolve a GitHub
     branch to know which skill content matches this install.
     """
@@ -1799,8 +1800,10 @@ def cmd_init(args):
 
     The skill content SHIPS with the installed fastedit package: the wheel
     carries skills/fastedit/SKILL.md as package data at
-    fastedit/skill/SKILL.md, byte-identical to the repo skill (drift-guarded
-    by tests/test_fastedit_skill.py). cmd_init stages that packaged file into
+    fastedit/skill/SKILL.md, auto-synced from the repo skill (single source
+    of truth; tests/conftest.py re-copies it every test session, and
+    tests/test_fastedit_skill.py asserts byte-identity). cmd_init stages that
+    packaged file into
     a FRESH temp directory laid out as <tmp>/skills/fastedit/SKILL.md and
     points the Vercel skills CLI (npx) at the staged directory, installing
     globally for the target coding agent (--skill-agent, default claude-code),

@@ -123,16 +123,21 @@ extend-exclude = ["tests/golden"]
 [tool.hatch.build.targets.wheel]
 # Hatchling ships every non-gitignored file under the package dir, including
 # the packaged agent skill at src/fastedit/skill/SKILL.md — the copy
-# `fastedit init` stages for `npx skills add` (drift guard:
-# tests/test_fastedit_skill.py).
+# `fastedit init` stages for `npx skills add`. It is auto-synced (one-way,
+# skills/ -> src/) from the single source of truth skills/fastedit/SKILL.md
+# by tests/conftest.py at every test-session start — a build-time
+# force-include cannot replace the copy because editable installs anchor
+# importlib.resources at src/ (why two copies: the skill files' headers) —
+# and byte-identity is asserted in tests/test_fastedit_skill.py.
 packages = ["src/fastedit"]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/fastedit/**/*.py",
-    # The packaged agent skill: a real file synced (byte-identical, drift
-    # guard in tests/test_fastedit_skill.py) from the single source of truth,
-    # skills/fastedit/SKILL.md. The sdist include list is an explicit
+    # The packaged agent skill: a real file auto-synced (one-way) from the
+    # single source of truth skills/fastedit/SKILL.md by tests/conftest.py at
+    # every test-session start (byte-identity asserted in
+    # tests/test_fastedit_skill.py). The sdist include list is an explicit
     # whitelist, so without this entry an sdist-built install would ship no
     # skill for `fastedit init` to stage.
     "src/fastedit/skill/SKILL.md",

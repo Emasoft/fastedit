@@ -1,4 +1,11 @@
 ---
+# ONE SKILL, TWO LOCATIONS (why this copy exists): skills/fastedit/SKILL.md
+# is the single source of truth (the directory `npx skills add` reads);
+# src/fastedit/skill/SKILL.md is package data shipped in the wheel and
+# staged by `fastedit init`. A build-time force-include cannot replace the
+# copy: editable installs (uv sync / uv run) anchor importlib.resources at
+# src/, so tests/conftest.py re-copies skills/ -> src/ at every test
+# session instead. EDIT THE skills/ COPY ONLY.
 name: fastedit
 description: >-
   AST-verified code editing via the `fastedit` CLI: edit, insert, replace, rename, move or delete a symbol in a

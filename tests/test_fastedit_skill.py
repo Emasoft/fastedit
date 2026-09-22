@@ -10,11 +10,13 @@ Contract (skills/fastedit/SKILL.md):
     guide. Parse-only: nothing is executed or written.
   - The file stays <= 200 lines so the skill stays concise enough for an agent
     to load whole.
-  - DRIFT GUARD: src/fastedit/skill/SKILL.md — the packaged copy that ships in
-    the wheel and that `fastedit init` stages for `npx skills add` — is
-    byte-identical to this repo skill (the single source of truth), is a real
-    file, is readable via importlib.resources, and is listed in pyproject's
-    sdist include whitelist.
+  - AUTO-SYNCED PACKAGED COPY: src/fastedit/skill/SKILL.md — the packaged copy
+    that ships in the wheel and that `fastedit init` stages for `npx skills
+    add` — is re-copied one-way from this repo skill (the single source of
+    truth) by tests/conftest.py at every session start, so a desync can never
+    survive a session. These tests assert the copy is byte-identical, is a
+    real file, is readable via importlib.resources, and is listed in
+    pyproject's sdist include whitelist.
 """
 
 from __future__ import annotations
@@ -88,6 +90,14 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     index = 0
     while index < len(lines):
         line = lines[index]
+        if line.lstrip().startswith("#"):
+            # Full-line YAML comment (the header notes in both SKILL.md
+            # copies) — not a key/value pair. Skipped at key level only:
+            # inside a folded scalar a '#' line is block-scalar CONTENT per
+            # YAML, and the folded branch below already collects indented
+            # lines as content.
+            index += 1
+            continue
         key, sep, value = line.partition(":")
         assert sep, f"malformed frontmatter line: {line!r}"
         key, value = key.strip(), value.strip()
@@ -209,15 +219,17 @@ PACKAGED_SKILL_PATH = PROJECT_ROOT / "src" / "fastedit" / "skill" / "SKILL.md"
 
 
 def test_packaged_copy_is_byte_identical_to_the_repo_skill():
-    """DRIFT GUARD. skills/fastedit/SKILL.md is the single source of truth —
-    the local directory the Vercel skills CLI reads (`npx skills add
-    <repo>/skills/fastedit` is the locally-verified install shape).
+    """AUTO-SYNC VERIFICATION. skills/fastedit/SKILL.md is the single source
+    of truth — the local directory the Vercel skills CLI reads (`npx skills
+    add <repo>/skills/fastedit` is the locally-verified install shape).
     src/fastedit/skill/SKILL.md is the packaged copy that ships in the wheel;
     `fastedit init` stages it into a temp dir for the skills CLI. Both are
     real files, never symlinks: a link under skills/ would gamble the
     measured-good discovery path on the CLI following links. An edit to the
-    skill must land in skills/fastedit/SKILL.md and be re-copied into the
-    package — this test fails until they match again."""
+    skill lands in skills/fastedit/SKILL.md and tests/conftest.py re-copies
+    it into the package before any test runs — this test verifies the sync
+    landed (it failing means the sync did not run or the source of truth is
+    missing)."""
     assert SKILL_PATH.is_file(), f"missing repo skill: {SKILL_PATH}"
     assert PACKAGED_SKILL_PATH.is_file(), (
         f"missing packaged skill: {PACKAGED_SKILL_PATH} — re-copy it from {SKILL_PATH}"
