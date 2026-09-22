@@ -42,6 +42,13 @@
 # removed (asked on a terminal [Y/n]; removed by default without one) so
 # the next pull reinstalls cleanly. --revert keeps every cache: it never
 # touches model weights (existing contract).
+#
+# After the package is in place, the installer also installs the repo's agent
+# skill (skills/fastedit) with the Vercel skills CLI, from the same branch of
+# the fork the package itself was pinned to — one source, one branch. The
+# skill is an add-on, not the product: a missing npx or a failed skill
+# install only warns (--no-skill skips the axis entirely; --revert removes
+# the skill best-effort).
 set -euo pipefail
 
 FORK_URL="https://github.com/Emasoft/fastedit"
@@ -57,6 +64,9 @@ EXTRAS_SET=0
 REVERT=0
 DRY_RUN=0
 NO_MODEL=0
+# NO_SKILL=1 (--no-skill) skips the whole agent-skill axis: nothing is
+# installed in the forward modes and --revert does not try to remove it.
+NO_SKILL=0
 # DEV=1 installs editable from this repo's working tree instead of the fork's
 # git URL. It is set by --dev, or by picking [1] in the source menu. REPO_ROOT
 # is resolved unconditionally (this script's parent directory) because the
@@ -104,7 +114,7 @@ platform_line() {
 usage() {
   cat <<'EOF'
 Usage: install-dev.sh [--dev] [--ref REF] [--extras LIST] [--all-grammars yes|no]
-                      [--revert] [--no-model] [--dry-run]
+                      [--no-skill] [--revert] [--no-model] [--dry-run]
 
   --dev          Development install: EDITABLE, from this repo's working tree
                  (the directory the script lives in). Your local changes are
@@ -124,10 +134,15 @@ Usage: install-dev.sh [--dev] [--ref REF] [--extras LIST] [--all-grammars yes|no
                  pack (the `all-grammars` extra) without being asked. When the
                  flag is not passed the script ASKS (Enter = yes); with no
                  terminal on stdin it defaults to yes and says so.
+  --no-skill     Skip the agent skill entirely: nothing is installed by the
+                 forward modes, and --revert does not try to remove it.
   --revert       Uninstall the fork and reinstall upstream fastedits
                  from PyPI (undoes the swap; leaves downloaded model
                  weights in place — they're shared with the fork).
-                 Never asks about grammars and never installs them.
+                 Also removes the globally installed agent skill
+                 (best-effort; skipped when npx is missing or --no-skill
+                 was passed). Never asks about grammars and never
+                 installs them.
   --no-model     Skip downloading the merge model (~3 GB). The stale
                  model-cache cleanup below still runs. Ignored with
                  --revert, which never touches the model.
@@ -153,6 +168,17 @@ every model cache under ~/.cache/fastedit/models (VALID = holds
 STALE (partial) caches are removed so the next pull reinstalls cleanly:
 asked on a terminal [Y/n], removed by default without one, printed as
 "would remove" by --dry-run. --revert keeps every cache.
+
+Agent skill: after the package install, the script also installs the agent
+skill with the Vercel skills CLI, from the same branch of the fork the
+package was pinned to (one source, one branch):
+  npx --yes skills add <fork>/tree/<ref>/skills/fastedit --skill fastedit -g -a claude-code -y
+(global, non-interactive, Claude Code target). A missing npx prints a
+one-line manual-install note and a failed install only warns — neither ever
+fails the installer. The postflight reports the axis truthfully:
+"agent skill: installed (Claude Code, global)" / "agent skill: NOT FOUND
+(see warnings above)" / "agent skill: skipped (...)". --revert removes the
+skill best-effort with "npx --yes skills remove fastedit -g -y".
 EOF
 }
 
@@ -195,6 +221,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-model)
       NO_MODEL=1
+      shift
+      ;;
+    --no-skill)
+      NO_SKILL=1
       shift
       ;;
     --dry-run)
@@ -742,6 +772,74 @@ pull_model() {
   fastedit pull --model "$model"
 }
 
+# The agent skill ships in this repo under skills/fastedit and is installed
+# with the Vercel skills CLI (`npx skills`). Its source URL is pinned to the
+# SAME branch the package spec above is pinned to (REF: the autodetected
+# branch, an explicit --ref, or the built-in default) — one source, one
+# branch, so the skill an agent reads always matches the fastedit that was
+# just installed. The whole axis is optional by contract, exactly like the
+# optional backend install: a missing npx prints a one-line manual-install
+# note, a failed install only warns, and neither ever aborts the run — a
+# skill must never be the reason this machine ends up without fastedit.
+skill_tree_url() {
+  printf '%s' "https://github.com/${FORK_URL#https://github.com/}/tree/${REF}/skills/fastedit"
+}
+
+install_agent_skill() {
+  if [[ "$NO_SKILL" -eq 1 ]]; then
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    echo "note: npx not found — skipping the agent skill; install manually: npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y"
+    return 0
+  fi
+  local url
+  url="$(skill_tree_url)"
+  echo "+ npx --yes skills add $(quote_argv "$url") --skill fastedit -g -a claude-code -y"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  local out status=0
+  out=$(npx --yes skills add "$url" --skill fastedit -g -a claude-code -y 2>&1) || status=$?
+  if [[ -n "$out" ]]; then
+    echo "$out"
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    echo "warning: the agent skill could not be installed (npx skills add exited ${status}) — fastedit itself is unaffected." >&2
+    echo "warning: install it manually later: npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y" >&2
+    return 0
+  fi
+  echo "installed: agent skill 'fastedit' (Claude Code, global)"
+}
+
+# --revert's counterpart: undo the global skill install. Tolerated-absent on
+# purpose — no npx, or "nothing to remove", is a fine outcome on a machine
+# that never had the skill — and best-effort like the install: upstream's
+# PyPI package is the thing that matters on a revert.
+remove_agent_skill() {
+  if [[ "$NO_SKILL" -eq 1 ]]; then
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    echo "note: npx not found — skipping agent-skill removal (nothing was installed by this run)"
+    return 0
+  fi
+  echo "+ npx --yes skills remove fastedit -g -y"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+  local out status=0
+  out=$(npx --yes skills remove fastedit -g -y 2>&1) || status=$?
+  if [[ -n "$out" ]]; then
+    echo "$out"
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    echo "note: agent-skill removal reported nothing to remove (exit ${status}) — continuing"
+    return 0
+  fi
+  echo "removed: agent skill 'fastedit' (global)"
+}
+
 # A failed postflight is only useful if it tells the user how to fix it,
 # not just what's wrong -- otherwise it gets shrugged off as noise ("it
 # always says that") and the safety check it guards stops being trusted.
@@ -835,6 +933,36 @@ verify_grammars() {
   fi
 }
 
+# The skill axis of the postflight, reported as honestly as the grammar axis:
+# what was actually verified on this machine, never what we hope happened.
+# The listing is bounded (npx can be slow cold) and digested to ONE line
+# either way — a full `skills list` dump would bury the one fact the reader
+# needs. Real runs only: the listing is a live npx call and a dry run must
+# stay hermetic.
+verify_agent_skill() {
+  if [[ "$NO_SKILL" -eq 1 ]]; then
+    echo "agent skill: skipped (--no-skill)"
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    echo "agent skill: skipped (npx not found)"
+    return 0
+  fi
+  local list_out status=0
+  list_out=$(run_bounded 60 npx --yes skills list -g 2>&1) || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "warning: could not list installed agent skills ('npx skills list -g' exited ${status})." >&2
+    echo "agent skill: NOT FOUND (see warnings above)"
+    return 0
+  fi
+  if ! grep -qw fastedit <<<"$list_out"; then
+    echo "warning: the agent skill install reported success, but 'npx skills list -g' does not list fastedit." >&2
+    echo "agent skill: NOT FOUND (see warnings above)"
+    return 0
+  fi
+  echo "agent skill: installed (Claude Code, global)"
+}
+
 # ---------------------------------------------------------------------------
 # Mode resolution, branch autodetect, preflight detection
 # ---------------------------------------------------------------------------
@@ -883,6 +1011,7 @@ if [[ "$REVERT" -eq 1 ]]; then
   handle_model_caches
   sweep_uninstall "$PACKAGE"
   do_install "$PKG_SPEC"
+  remove_agent_skill
   if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "reverted: ${PACKAGE} is now upstream (no create/duplicate/split/join — that's expected)"
   fi
@@ -1015,5 +1144,15 @@ else
       echo "note: no known model for this platform ($(uname -s)/$(uname -m)) — skipping model pull."
       echo "note: run 'fastedit pull --model mlx-8bit' (Apple Silicon) or 'fastedit pull --model bf16' (Linux GPU) manually if needed."
     fi
+  fi
+
+  # The agent skill goes last: the package is in place and the model question
+  # is settled, so a tolerated skill failure is reported against an install
+  # that already succeeded. The postflight line for it prints right after —
+  # real runs only, since the listing is a live npx call and a dry run must
+  # stay hermetic.
+  install_agent_skill
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    verify_agent_skill
   fi
 fi

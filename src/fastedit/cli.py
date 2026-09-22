@@ -1733,6 +1733,107 @@ def cmd_pull(args):
 
 
 # ---------------------------------------------------------------------------
+# Agent-skill installer (init)
+# ---------------------------------------------------------------------------
+
+_SKILL_REPO = "Emasoft/fastedit"
+_SKILL_NAME = "fastedit"
+_SKILL_TIMEOUT_S = 300  # generous: npx's first run may download the skills CLI
+_SKILL_TAIL_LINES = 15
+# Presentation names for the success line; the raw agent id is used when the
+# agent has no entry here (e.g. --skill-agent codex).
+_AGENT_DISPLAY_NAMES = {"claude-code": "Claude Code"}
+
+
+def _skills_add_argv(agent: str) -> list[str]:
+    """The exact skills-CLI invocation `fastedit init` runs.
+
+    The ``Emasoft/fastedit`` shorthand resolves the fork's DEFAULT branch —
+    not a pinned tag — so re-running the command refreshes the skill.
+    """
+    return [
+        "npx", "--yes", "skills", "add", _SKILL_REPO,
+        "--skill", _SKILL_NAME, "-g", "-a", agent, "-y",
+    ]
+
+
+def _skills_output_tail(*streams: str) -> str:
+    """Last meaningful lines of the skills-CLI output, for the init report."""
+    lines: list[str] = []
+    for stream in streams:
+        lines.extend((stream or "").splitlines())
+    meaningful = [line for line in lines if line.strip()]
+    return "\n".join(meaningful[-_SKILL_TAIL_LINES:])
+
+
+def cmd_init(args):
+    """One-shot environment setup: install the fastedit agent skill.
+
+    Drives the Vercel skills CLI through npx to install the skill globally
+    for the target coding agent (--skill-agent, default claude-code), then
+    prints next-step guidance. Failures are loud: npx missing and a failing
+    or timing-out skills-CLI run both exit 1 with the manual command, because
+    an init that did nothing must say so.
+    """
+    import shutil
+    import subprocess
+
+    agent = args.skill_agent
+    argv = _skills_add_argv(agent)
+    manual = " ".join(argv)
+    display = _AGENT_DISPLAY_NAMES.get(agent, agent)
+
+    if shutil.which("npx") is None:
+        print(
+            "Error: npx (Node.js) not found on PATH — the agent skill was NOT installed.",
+            file=sys.stderr,
+        )
+        print(f"Install Node.js, then run the installer manually: {manual}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_SKILL_TIMEOUT_S, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Error: the skills CLI timed out after {_SKILL_TIMEOUT_S}s — "
+            "the agent skill was NOT installed.",
+            file=sys.stderr,
+        )
+        print(f"Retry, or run the installer manually: {manual}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: could not run npx: {e}", file=sys.stderr)
+        print(f"Run the installer manually: {manual}", file=sys.stderr)
+        sys.exit(1)
+
+    tail = _skills_output_tail(result.stdout, result.stderr)
+    if result.returncode != 0:
+        # Fail loud with the tool's own output so the user sees what happened.
+        if tail:
+            print(tail, file=sys.stderr)
+        print(
+            f"Error: the skills CLI exited with code {result.returncode} — "
+            "the agent skill was NOT installed.",
+            file=sys.stderr,
+        )
+        print(
+            f"Run the installer manually to see the live output: {manual}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if tail:
+        print(tail)
+    print(
+        f"Agent skill installed (global, {display}). "
+        "Next: fastedit pull --model mlx-8bit (Apple Silicon) · fastedit doctor"
+    )
+    print("Optional MCP entry: fastedit mcp-install")
+
+
+# ---------------------------------------------------------------------------
 # Argparse setup and main dispatch
 # ---------------------------------------------------------------------------
 
@@ -1745,8 +1846,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG,
     )
-    # metavar: the 19-command choices token is unbreakable for argparse and
-    # renders as a single 147-character line in usage; "command" keeps the
+    # metavar: the 20-command choices token is unbreakable for argparse and
+    # renders as a single long line in usage; "command" keeps the
     # usage lines short (the epilog's COMMANDS section lists every command).
     sub = parser.add_subparsers(dest="command", metavar="command")
 
@@ -1971,6 +2072,17 @@ def main():
     undo_p = sub.add_parser("undo", help="Revert the last edit to a file")
     undo_p.add_argument("file", help="Path to source file")
 
+    # init (one-shot setup: installs the agent skill via the skills CLI)
+    init_p = sub.add_parser(
+        "init",
+        help="Install the fastedit agent skill for your coding agent (npx skills CLI)",
+    )
+    init_p.add_argument(
+        "--skill-agent",
+        default="claude-code",
+        help="Coding agent to install the skill for (default: claude-code)",
+    )
+
     # pull
     pull_p = sub.add_parser("pull", help="Pull the merge model from HuggingFace (~3GB)")
     pull_p.add_argument("--model", required=True, choices=["mlx-8bit", "bf16"],
@@ -2023,6 +2135,8 @@ def main():
         cmd_join(args)
     elif args.command == "undo":
         cmd_undo(args)
+    elif args.command == "init":
+        cmd_init(args)
     elif args.command == "pull":
         cmd_pull(args)
     elif args.command == "doctor":

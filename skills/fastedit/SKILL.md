@@ -11,6 +11,7 @@ description: >-
   code. Use when the user asks to edit, insert, replace, rename, move or delete a symbol in a source file; when
   asked to fix or modify functions in place; when byte-level safety, concurrent-instance protection and undo
   matter.
+license: MIT
 ---
 
 # fastedit — write only the change

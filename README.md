@@ -310,6 +310,8 @@ npx skills add Emasoft/fastedit                                 # discover + ins
 npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y   # non-interactive
 ```
 
+Installed automatically by `scripts/install-dev.sh` (pinned to the same branch as the package); pass `--no-skill` to skip, and `--revert` removes it again.
+
 ## The model
 
 FastEdit includes a fine-tuned 1.7B parameter model (Qwen2.5-Coder-1.5B architecture) trained specifically for code merging. It takes an original code chunk + edit snippet and produces the merged result.

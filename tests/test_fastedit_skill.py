@@ -110,6 +110,13 @@ def test_frontmatter_name_and_description(skill_text):
     )
 
 
+def test_frontmatter_license_is_mit(skill_text):
+    """`license` is an optional frontmatter field (agentskills spec); fastedit
+    is MIT (pyproject.toml)."""
+    fields = _parse_frontmatter(skill_text)
+    assert fields.get("license") == "MIT"
+
+
 def test_skill_stays_concise(skill_text):
     line_count = len(skill_text.splitlines())
     assert line_count <= MAX_SKILL_LINES, (

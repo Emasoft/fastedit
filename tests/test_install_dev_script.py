@@ -3,8 +3,9 @@
 Covers both forward modes (fork install pinned to a git ref, --dev editable
 install from the working tree), the interactive source menu, branch
 autodetect, the model-cache preflight (VALID kept / STALE removed), the
-all-grammars prompt/flag, the revert path, and the dry-run transcript, all
-through the script's real CLI.
+all-grammars prompt/flag, the agent-skill install (Vercel skills CLI, pinned
+to the same branch as the package), the revert path, and the dry-run
+transcript, all through the script's real CLI.
 """
 
 from __future__ import annotations
@@ -78,6 +79,21 @@ def spec_argv(stdout: str, prefix: str) -> str:
     raise AssertionError(f"no dry-run line starting with +{prefix!r} in:\n{stdout}")
 
 
+def _npx_lines(stdout: str) -> list[list[str]]:
+    """Every "+ npx ..." transcript line, shell-split into tokens.
+
+    The skill add/remove lines are printed through the same quote_argv as the
+    uv lines, so the same shlex round-trip applies: the skill tree URL must
+    survive as ONE token (it holds no spaces or quotes, so quote_argv leaves
+    it bare).
+    """
+    lines = []
+    for line in stdout.splitlines():
+        if line.startswith("+ npx "):
+            lines.append(shlex.split(line))
+    return lines
+
+
 def _platform_extras() -> str:
     """The bare platform extras install-dev.sh auto-selects for THIS platform.
 
@@ -124,7 +140,13 @@ def _fork_spec(extras: str, ref: str | None = None) -> str:
 
 
 def _run_with_pty_stdin(feed: bytes, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run --dry-run with a pty as stdin, write `feed` as the answers.
+    """Run the installer with a pty as stdin, write `feed` as the answers.
+
+    These are REAL full-installer runs (no --dry-run) with a hard 30s
+    subprocess budget, so they opt out of the agent-skill axis (--no-skill):
+    two live npx calls measure ~7s+ each on this machine and would blow the
+    budget for tests whose subject is the source menu and the grammar prompt.
+    The skill axis is covered hermetically by TestAgentSkillInstall instead.
 
     Extra args go through to the script. On a TTY the script asks up to two
     questions IN ORDER -- first the source menu ("Install from: [1/2]", only
@@ -139,7 +161,7 @@ def _run_with_pty_stdin(feed: bytes, *args: str) -> subprocess.CompletedProcess[
     master, slave = pty.openpty()
     try:
         proc = subprocess.Popen(
-            [str(SCRIPT), *args],
+            [str(SCRIPT), "--no-skill", *args],
             stdin=slave,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -163,16 +185,24 @@ def _run_with_pty_stdin(feed: bytes, *args: str) -> subprocess.CompletedProcess[
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
-def _stub_toolchain(tmp_path: Path) -> dict[str, str]:
-    """A fake uv/pipx/pip3/fastedit PATH so a REAL (non-dry-run) installer run
-    can be exercised hermetically.
+def _stub_toolchain(
+    tmp_path: Path, with_npx: bool = True, npx_add_fails: bool = False
+) -> dict[str, str]:
+    """A fake uv/pipx/pip3/fastedit/npx PATH so a REAL (non-dry-run) installer
+    run can be exercised hermetically.
 
     Every mutating tool is a no-op stub and every reporting tool reports
     nothing installed, so a real run touches nothing outside the HOME the test
     hands it (where the model-cache dirs live). The fastedit stub prints the
-    fork subcommand names on --help so the postflight verification passes. PATH
-    is restricted to the stubs plus /usr/bin:/bin so the real uv (and the
-    venv's real fastedit) on this machine can never be reached.
+    fork subcommand names on --help so the postflight verification passes. The
+    npx stub answers `skills add` with success and `skills list -g` with an
+    installed fastedit skill, so the agent-skill axis is hermetic too;
+    with_npx=False drops it entirely to test the npx-missing path (PATH keeps
+    only /usr/bin:/bin beyond the stubs, where no node lives on this machine),
+    and npx_add_fails makes `skills add` exit non-zero with `skills list -g`
+    reporting nothing, to test the failure-tolerant path. PATH is restricted
+    to the stubs plus /usr/bin:/bin so the real uv (and the venv's real
+    fastedit) on this machine can never be reached.
     """
     fake = tmp_path / "stub-bin"
     fake.mkdir()
@@ -200,6 +230,25 @@ def _stub_toolchain(tmp_path: Path) -> dict[str, str]:
         "fi\n"
         "exit 0\n"
     )
+    if with_npx:
+        # npx args reach the stub as `npx --yes skills <add|list> ...`, so the
+        # subcommand is $3, not $1 -- the same --yes the installer passes.
+        if npx_add_fails:
+            add_body = "  echo 'error: skills add failed (stub)' >&2\n  exit 1\n"
+            list_body = "  exit 0\n"
+        else:
+            add_body = "  exit 0\n"
+            list_body = '  echo "  fastedit   (agent skill, global)"\n  exit 0\n'
+        (fake / "npx").write_text(
+            "#!/bin/bash\n"
+            'if [[ "$2" == "skills" && "$3" == "add" ]]; then\n'
+            + add_body +
+            "fi\n"
+            'if [[ "$2" == "skills" && "$3" == "list" ]]; then\n'
+            + list_body +
+            "fi\n"
+            "exit 0\n"
+        )
     for stub in fake.iterdir():
         stub.chmod(0o755)
     return {"PATH": f"{fake}:/usr/bin:/bin"}
@@ -648,6 +697,115 @@ class TestInstallDevRevert:
         assert "Install all grammars?" not in result.stdout + result.stderr
         assert "all-grammars" not in result.stdout + result.stderr
         assert "non-interactive" not in result.stdout + result.stderr
+
+
+class TestAgentSkillInstall:
+    """The agent-skill axis: installed with the Vercel skills CLI, pinned to
+    the SAME branch as the package, and failure-tolerant exactly like the
+    optional backend install -- a skill failure must never leave this machine
+    without fastedit, and the postflight reports what actually happened.
+    """
+
+    SKILL_TREE_URL = "https://github.com/Emasoft/fastedit/tree/{ref}/skills/fastedit"
+
+    def _add_tokens(self, result: subprocess.CompletedProcess[str]) -> list[str]:
+        add = [t for t in _npx_lines(result.stdout) if "add" in t]
+        assert len(add) == 1, f"expected exactly one skills-add line in:\n{result.stdout}"
+        return add[0]
+
+    def test_dry_run_prints_the_add_command_with_the_autodetected_branch(self) -> None:
+        """Default dry run: the skill add names the AUTODETECTED branch in the tree URL,
+        global and non-interactive with the Claude Code target."""
+        branch = _autodetected_branch()
+        result = run("--dry-run")
+        assert result.returncode == 0, result.stderr
+        tokens = self._add_tokens(result)
+        assert tokens[1:6] == [
+            "npx", "--yes", "skills", "add", self.SKILL_TREE_URL.format(ref=branch),
+        ]
+        assert tokens[6:] == ["--skill", "fastedit", "-g", "-a", "claude-code", "-y"]
+
+    def test_skill_url_branch_follows_an_explicit_ref(self) -> None:
+        """--ref pins BOTH the package spec and the skill source URL to the same branch."""
+        result = run("--ref", "v1.2.3", "--dry-run")
+        assert result.returncode == 0, result.stderr
+        tokens = self._add_tokens(result)
+        assert tokens[5] == self.SKILL_TREE_URL.format(ref="v1.2.3")
+        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+            _with_all_grammars(_platform_extras()), ref="v1.2.3"
+        )
+
+    def test_no_skill_flag_omits_every_skill_command(self) -> None:
+        """--no-skill skips the whole axis: no npx invocation is printed at all."""
+        result = run("--no-skill", "--dry-run")
+        assert result.returncode == 0, result.stderr
+        assert "npx" not in result.stdout
+
+    def test_forward_run_never_prints_the_remove_command(self) -> None:
+        """The remove command belongs to --revert only."""
+        result = run("--dry-run")
+        assert result.returncode == 0, result.stderr
+        assert "skills remove" not in result.stdout + result.stderr
+
+    def test_revert_prints_the_skill_remove_command(self) -> None:
+        """--revert additionally removes the globally installed skill, best-effort shape."""
+        result = run("--revert", "--dry-run")
+        assert result.returncode == 0, result.stderr
+        remove = [t for t in _npx_lines(result.stdout) if "remove" in t]
+        assert len(remove) == 1, f"expected exactly one skills-remove line in:\n{result.stdout}"
+        assert remove[0][1:] == ["npx", "--yes", "skills", "remove", "fastedit", "-g", "-y"]
+        assert "skills add" not in result.stdout
+
+    def test_revert_with_no_skill_skips_the_remove(self) -> None:
+        """--no-skill skips the whole axis in revert mode too."""
+        result = run("--revert", "--no-skill", "--dry-run")
+        assert result.returncode == 0, result.stderr
+        assert "npx" not in result.stdout
+
+    def test_help_documents_no_skill(self) -> None:
+        """-h documents --no-skill and the automatic skill install."""
+        result = run("-h")
+        assert result.returncode == 0, result.stderr
+        assert "--no-skill" in result.stdout
+        assert "agent skill" in result.stdout
+
+    def test_real_run_installs_and_reports_the_skill(self, tmp_path: Path) -> None:
+        """Real run with a stubbed toolchain: the add runs, the postflight reports installed."""
+        home = tmp_path / "skill-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "installed: agent skill" in result.stdout
+        assert "agent skill: installed (Claude Code, global)" in result.stdout
+
+    def test_npx_missing_skips_the_skill_and_says_so(self, tmp_path: Path) -> None:
+        """No npx on PATH: the install prints the manual-install note, the postflight
+        says skipped -- and the run still exits 0 with the package installed."""
+        home = tmp_path / "nonpx-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert (
+            "npx not found — skipping the agent skill; install manually: "
+            "npx skills add Emasoft/fastedit --skill fastedit -g -a claude-code -y"
+        ) in result.stdout
+        assert "agent skill: skipped (npx not found)" in result.stdout
+        assert "verified: fastedit at" in result.stdout
+
+    def test_failed_skill_install_warns_and_the_install_survives(self, tmp_path: Path) -> None:
+        """A failed skill install must never fail the installer, and the postflight
+        must report NOT FOUND rather than pretend the skill is there."""
+        home = tmp_path / "failskill-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, npx_add_fails=True), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "warning: the agent skill could not be installed" in result.stderr
+        assert "agent skill: NOT FOUND (see warnings above)" in result.stdout
+        # The package itself still landed: the fork postflight passed.
+        assert "verified: fastedit at" in result.stdout
 
 
 class TestInstallDevArgumentValidation:

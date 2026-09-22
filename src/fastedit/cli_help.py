@@ -306,6 +306,20 @@ COMMANDS: tuple[Command, ...] = (
         ),
     ),
     Command(
+        "init",
+        "One-shot setup: install the fastedit agent skill for your coding agent.",
+        (
+            Example(
+                ("init",),
+                (
+                    "Installs the agent skill via the skills CLI (npx): the Emasoft/fastedit",
+                    "shorthand resolves the fork's default branch, so re-running refreshes it.",
+                    "Prints next-step guidance; --skill-agent targets another agent.",
+                ),
+            ),
+        ),
+    ),
+    Command(
         "pull",
         "Download the merge model from HuggingFace (~3 GB, one-time, cached).",
         (
@@ -525,6 +539,8 @@ _INSTALL_UPDATE = Section(
         "  pack (Enter = yes; --all-grammars no to skip).",
         "  Agents (MCP): fastedit mcp-install — user scope, or fastedit mcp-install",
         "  --scope project.",
+        "  Agent skill: fastedit init installs the agent skill (npx skills add, global,",
+        "  claude-code by default; --skill-agent targets another agent).",
         "  Verify or repair: fastedit doctor. Upgrade: uv tool upgrade fastedits, or",
         "  re-run scripts/install-dev.sh.",
     ),
