@@ -176,7 +176,8 @@ The fork ships under the same PyPI name and console-script names as upstream, so
 ### Pointing at an external LLM server
 
 ```bash
-FASTEDIT_BACKEND=llm FASTEDIT_LLM_API_BASE=http://localhost:1234/v1 fastedit edit ...
+fastedit edit ... --backend vllm --api-base http://localhost:1234/v1
+# or via env: FASTEDIT_BACKEND=vllm FASTEDIT_VLLM_API_BASE=http://localhost:1234/v1
 ```
 
 Works with LM Studio, llama.cpp, Ollama (via OpenAI-compatible endpoint), vLLM, TGI, any OpenAI-API-compatible server.
@@ -379,10 +380,10 @@ FASTEDIT_RUN_STRESS=1 uv run pytest -m "llm and stress" -q  # stress tier: adds 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FASTEDIT_MODEL_PATH` | `~/.cache/fastedit/models/...` | Path to model |
-| `FASTEDIT_BACKEND` | `mlx` | Backend: `mlx` or `llm` |
-| `FASTEDIT_LLM_API_BASE` | `http://127.0.0.1:8000/v1` | LLM server URL (any OpenAI-compatible) |
-| `FASTEDIT_LLM_MODEL` | `fastedit` | Model name to send in API requests |
-| `FASTEDIT_LLM_API_KEY` | `not-needed` | API key (if server requires one) |
+| `FASTEDIT_BACKEND` | `mlx` | Backend: `mlx` or `vllm` |
+| `FASTEDIT_VLLM_API_BASE` | `http://127.0.0.1:8000/v1` | vLLM server URL (any OpenAI-compatible) |
+| `FASTEDIT_VLLM_MODEL` | `/root/fastedit-merged` | Model name to send in API requests |
+| `FASTEDIT_VLLM_API_KEY` | `not-needed` | API key (if server requires one) |
 | `FASTEDIT_BACKUP_DIR` | `~/.fastedit/backups` | Directory for undo/diff backups; must be an absolute path (a leading `~` is expanded). `fastedit undo` and `diff` only see backups stored in this directory. |
 | `FASTEDIT_MAX_RETRIES` | `8` | Validation-retry budget per merge site for the retry-until-valid loop (see "Validation & retries" above). Malformed or negative values fail loudly. |
 | `FASTEDIT_RUN_STRESS` | unset | Set to `1` to enable the 100MB stress tests (see "Testing" above). |

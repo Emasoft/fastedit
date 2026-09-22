@@ -40,7 +40,8 @@ fastedit doctor
 `install-dev.sh` is the fork's one installer (extras, grammars, model; `--dev`
 for editable). `pull` downloads the ~3 GB merge model once — `mlx-8bit` on
 Apple Silicon, `bf16` on Linux/GPU. External server instead of a local model:
-`FASTEDIT_BACKEND=llm FASTEDIT_LLM_API_BASE=http://localhost:1234/v1 fastedit edit ...`
+`fastedit edit ... --backend vllm --api-base http://localhost:1234/v1` (or env:
+`FASTEDIT_BACKEND=vllm FASTEDIT_VLLM_API_BASE=http://localhost:1234/v1`).
 
 ## The three edit modes
 
