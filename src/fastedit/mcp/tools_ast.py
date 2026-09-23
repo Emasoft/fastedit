@@ -2,14 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
+import os
 from pathlib import Path
 
 from ..data_gen.ast_analyzer import detect_language
 from ..file_lock import edit_lock_or_refusal
 from ..inference.chunked_merge import delete_symbol, move_symbol
 from ..inference.rename import do_rename_ast
-from .server import _atomic_write, mcp
+from ..io_utils import UnsupportedEncodingError, read_source
+from .server import ConcurrentModificationError, _atomic_write, mcp
+
+_CONCURRENT_REFUSAL = (
+    "file changed on disk since it was read; "
+    "re-read and retry — file unchanged."
+)
+
+
+def _persist_ast(
+    path: Path, content: str, *, backups, expected_stat: os.stat_result,
+) -> str | None:
+    """Write an AST verb's result with the B37 lost-update guard armed.
+
+    Returns ``None`` on success, else the same clean refusal string the
+    edit tools return (B37: nothing was written; the file on disk is
+    exactly as the external writer left it).
+    """
+    try:
+        _atomic_write(
+            path, content, backups=backups, expected_stat=expected_stat,
+        )
+    except ConcurrentModificationError:
+        return _CONCURRENT_REFUSAL
+    return None
 
 _UNDO_DIFF_LINE_BUDGET = 50_000
 """The embedded undo diff's input budget (lines per side).
@@ -68,10 +94,13 @@ async def fast_delete(file_path: str, symbol: str, force: bool = False) -> str:
     async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
         if _lock_refusal:
             return f"Error: {_lock_refusal}"
-        # M2: cross-file caller-safety check. Skipped on force=True.
+        # M2: cross-file caller-safety check. Skipped on force=True. The
+        # tldr subprocess (its own timeout) runs on a worker thread so the
+        # event loop keeps serving other requests while it runs.
         if not force:
             project_root = _find_project_root(path)
-            refs = check_cross_file_callers(
+            refs = await asyncio.to_thread(
+                check_cross_file_callers,
                 file_path=path, symbol=symbol, project_root=project_root,
             )
             if refs:
@@ -82,8 +111,16 @@ async def fast_delete(file_path: str, symbol: str, force: bool = False) -> str:
                     "anyway, or run fast_rename_all to migrate callers first.",
                 )
 
+        # B37: stat captured immediately before the verb's own read of the
+        # file, so the write below refuses when the file changed on disk in
+        # the read-to-write window (fast_edit/batch/multi arm the same guard).
         try:
-            result = delete_symbol(
+            read_stat = os.stat(path)
+        except FileNotFoundError:
+            return f"Error: file not found: {file_path}"
+        try:
+            result = await asyncio.to_thread(
+                delete_symbol,
                 file_path=file_path,
                 symbol=symbol,
                 language=language,
@@ -92,7 +129,12 @@ async def fast_delete(file_path: str, symbol: str, force: bool = False) -> str:
             return f"Error: {e}"
 
         if language and not result.parse_valid:
-            _atomic_write(path, result.merged_code, backups=backups)
+            error = _persist_ast(
+                path, result.merged_code, backups=backups,
+                expected_stat=read_stat,
+            )
+            if error:
+                return error
             return (
                 f"Warning: parse errors after deleting {result.deleted_kind} "
                 f"'{result.deleted_symbol}' from {file_path}. "
@@ -100,7 +142,12 @@ async def fast_delete(file_path: str, symbol: str, force: bool = False) -> str:
                 f"({result.lines_removed} lines). Wrote anyway. 0 model tokens."
             )
 
-        _atomic_write(path, result.merged_code, backups=backups)
+        error = _persist_ast(
+            path, result.merged_code, backups=backups,
+            expected_stat=read_stat,
+        )
+        if error:
+            return error
         return (
             f"Deleted {result.deleted_kind} '{result.deleted_symbol}' "
             f"from {file_path}. "
@@ -133,8 +180,15 @@ async def fast_move(file_path: str, symbol: str, after: str) -> str:
     async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
         if _lock_refusal:
             return f"Error: {_lock_refusal}"
+        # B37: stat captured immediately before the verb's own read of the
+        # file (same guard as fast_delete/fast_edit).
         try:
-            result = move_symbol(
+            read_stat = os.stat(path)
+        except FileNotFoundError:
+            return f"Error: file not found: {file_path}"
+        try:
+            result = await asyncio.to_thread(
+                move_symbol,
                 file_path=file_path,
                 symbol=symbol,
                 after=after,
@@ -144,14 +198,24 @@ async def fast_move(file_path: str, symbol: str, after: str) -> str:
             return f"Error: {e}"
 
         if language and not result.parse_valid:
-            _atomic_write(path, result.merged_code, backups=backups)
+            error = _persist_ast(
+                path, result.merged_code, backups=backups,
+                expected_stat=read_stat,
+            )
+            if error:
+                return error
             return (
                 f"Warning: parse errors after moving {result.moved_kind} "
                 f"'{result.moved_symbol}' after '{result.after_symbol}' "
                 f"in {file_path}. Wrote anyway. 0 model tokens."
             )
 
-        _atomic_write(path, result.merged_code, backups=backups)
+        error = _persist_ast(
+            path, result.merged_code, backups=backups,
+            expected_stat=read_stat,
+        )
+        if error:
+            return error
         return (
             f"Moved {result.moved_kind} '{result.moved_symbol}' "
             f"from L{result.from_lines[0]}-{result.from_lines[1]} "
@@ -195,9 +259,22 @@ async def fast_rename(file_path: str, old_name: str, new_name: str, dry_run: boo
     async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
         if _lock_refusal:
             return f"Error: {_lock_refusal}"
-        original = path.read_text(encoding="utf-8")
+        # B21: strict-decode read via read_source — a bare utf-8 read_text
+        # raised an uncaught UnicodeDecodeError on a latin-1 (or UTF-16)
+        # file instead of a clean refusal; read_source refuses those with
+        # UnsupportedEncodingError. B37: the read-time stat guards the
+        # write below. do_rename_ast re-reads the file itself with a
+        # strict utf-8 decode, so a non-UTF-8 file yields count=0 (the
+        # "no code references" response) and is never written.
+        try:
+            original, _encoding, read_stat = read_source(path, return_stat=True)
+        except UnsupportedEncodingError as e:
+            return f"Error: {e}"
 
-        renamed, count, skipped = do_rename_ast(path, old_name, new_name)
+        # tldr subprocess + tree walk: worker thread, off the event loop.
+        renamed, count, skipped = await asyncio.to_thread(
+            do_rename_ast, path, old_name, new_name,
+        )
 
         if count == 0:
             return (
@@ -215,7 +292,14 @@ async def fast_rename(file_path: str, old_name: str, new_name: str, dry_run: boo
                 f"1 file, {count} replacement(s){skip_note}: {file_path}"
             )
 
-        _atomic_write(path, renamed, backups=backups)
+        # renamed is do_rename_ast's strict-utf-8 decode of the file
+        # (a UTF-8 BOM rides on it and _atomic_write keeps it exact);
+        # the default utf-8 codec is therefore the correct write codec.
+        error = _persist_ast(
+            path, renamed, backups=backups, expected_stat=read_stat,
+        )
+        if error:
+            return error
 
         diff = difflib.unified_diff(
             original.splitlines(keepends=True),
@@ -266,7 +350,9 @@ async def fast_rename_all(
     if not root.is_dir():
         return f"Error: directory not found: {root_dir}"
 
-    plan = do_cross_file_rename(
+    # Directory walk + tldr subprocess: worker thread, off the event loop.
+    plan = await asyncio.to_thread(
+        do_cross_file_rename,
         root, old_name, new_name, kind_filter=kind_filter,
     )
     if not plan:
@@ -275,8 +361,8 @@ async def fast_rename_all(
             f"(AST-verified via tldr — strings/comments/vendor dirs excluded)."
         )
 
-    total_count = sum(count for _, count, _ in plan.values())
-    total_skipped = sum(skipped for _, _, skipped in plan.values())
+    total_count = sum(count for _new_content, count, _skipped, _stat in plan.values())
+    total_skipped = sum(skipped for _new_content, _count, skipped, _stat in plan.values())
 
     if dry_run:
         lines = [
@@ -285,7 +371,7 @@ async def fast_rename_all(
             + f"{f' (skipping {total_skipped} in strings/comments)' if total_skipped else ''}:",
             "",
         ]
-        for path, (_, count, skipped) in sorted(plan.items()):
+        for path, (_new_content, count, skipped, _stat) in sorted(plan.items()):
             skip_note = f" ({skipped} skipped)" if skipped else ""
             lines.append(f"  {path} — {count} replacement(s){skip_note}")
         return "\n".join(lines)
@@ -294,7 +380,7 @@ async def fast_rename_all(
     # files don't serialize through a single global lock. A target held by
     # another fastedit PROCESS is skipped and named, not silently dropped.
     refused: list[str] = []
-    for path, (new_content, _, _) in plan.items():
+    for path, (new_content, _count, _skipped, _read_stat) in plan.items():
         async with (
             file_locks[str(path)],
             edit_lock_or_refusal(path) as _lock_refusal,
@@ -302,14 +388,27 @@ async def fast_rename_all(
             if _lock_refusal:
                 refused.append(f"{path}: {_lock_refusal}")
                 continue
-            _atomic_write(path, new_content, backups=backups)
+            # B37: _read_stat is the stat do_cross_file_rename captured when
+            # it read this file for the plan. A non-fastedit write landing
+            # between that read and this write is REFUSED here (not silently
+            # overwritten from the plan's stale bytes); files already written
+            # stay written, matching the verb's partial per-file semantics.
+            # Same guard + refusal string as the other AST verbs.
+            error = _persist_ast(
+                path, new_content, backups=backups, expected_stat=_read_stat,
+            )
+            if error:
+                refused.append(f"{path}: {error}")
+                continue
 
     skip_note = f" (skipped {total_skipped} in strings/comments)" if total_skipped else ""
     refused_note = ""
     if refused:
+        # Reason-neutral header: each entry below carries its own refusal —
+        # a cross-process lock ("another fastedit instance (pid ...)") or a
+        # B37 lost-update refusal ("file changed on disk since it was read").
         refused_note = (
-            f"\n{len(refused)} file(s) NOT written — locked by another "
-            f"fastedit instance:\n" + "\n".join(refused)
+            f"\n{len(refused)} file(s) NOT written:\n" + "\n".join(refused)
         )
     return (
         f"Renamed '{old_name}' -> '{new_name}' in {len(plan)} file(s), "
@@ -439,7 +538,11 @@ async def fast_move_to_file(
         if _to_refusal:
             return f"Error: {_to_refusal}"
         try:
-            plan = move_to_file(
+            # Importer discovery runs tldr subprocesses per consumer file:
+            # worker thread, off the event loop (locks are held across the
+            # await, exactly as they were held across the sync call).
+            plan = await asyncio.to_thread(
+                move_to_file,
                 symbol=symbol,
                 from_file=str(from_path),
                 to_file=str(to_path),

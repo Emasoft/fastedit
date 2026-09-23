@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from ..io_utils import UnsupportedEncodingError, read_source
 from .server import mcp
 
 
@@ -197,7 +198,15 @@ def fast_diff(file_path: str) -> str:
         return f"No prior edit recorded for {file_path}. Call fast_edit first."
 
     original = snapshots[file_path]
-    current = path.read_text(encoding="utf-8", errors="replace")
+    # The snapshot holds read_source's STRICT decode of the file (B21/B23);
+    # the old read_text(errors="replace") compared a different decode model,
+    # so a latin-1 file's diff was a full-file wall of U+FFFD and a .docx
+    # container diffed binary garbage. read_source gives the same model the
+    # snapshot was captured with and refuses what it must (utf-16/binary).
+    try:
+        current = read_source(path)[0]
+    except UnsupportedEncodingError as e:
+        return f"Error: {e}"
 
     if original == current:
         return f"No changes detected in {file_path}."

@@ -1050,3 +1050,38 @@ class TestWholeFileMergeContentValidation:
         assert result.chunks_used == 1
         assert result.parse_valid is False
         assert result.merged_code == WHOLE3_ORIGINAL
+
+
+class TestFastEditEngineNullContent:
+    """A server that returns ``content=None`` must not crash the engine.
+
+    OpenAI-compatible servers return ``choices[0].message.content = null``
+    for refusals, tool-call turns and some error shapes. The adapter
+    engines (LLMEngine/VLLMEngine) guard with ``or ""`` — FastEditEngine
+    drifted from that contract and handed ``None`` straight into
+    ``_extract_output``, where ``re.sub`` raised an opaque TypeError.
+    """
+
+    def test_merge_null_content_returns_empty_result(self):
+        engine = FastEditEngine()
+        engine._client = _fake_openai_client(None)
+        result = engine.merge("def foo():\n    pass", "# ... existing code ...")
+        assert result.merged_code == ""
+        assert result.truncated is False
+
+    def test_merge_async_null_content_returns_empty_result(self, monkeypatch):
+        class _FakeAsyncOpenAI:
+            def __init__(self, **kwargs):
+                self.chat = SimpleNamespace(
+                    completions=SimpleNamespace(
+                        create=_fake_async_create(None),
+                    ),
+                )
+
+        monkeypatch.setattr("openai.AsyncOpenAI", _FakeAsyncOpenAI)
+        engine = FastEditEngine()
+        result = asyncio.run(
+            engine.merge_async("def foo():\n    pass", "# ... existing code ...")
+        )
+        assert result.merged_code == ""
+        assert result.truncated is False

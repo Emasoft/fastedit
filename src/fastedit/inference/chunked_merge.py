@@ -1650,7 +1650,10 @@ def _merge_preserve_siblings(
     # Race-free in-memory AST parse. `original_code` may differ from what
     # the tldr daemon has cached on disk; parsing in-memory is the only
     # way to guarantee correct line coordinates under chained edits.
-    ast_nodes = get_ast_map_from_source(original_code, file_path) or []
+    # B3: the caller's `language` rides along as an explicit hint, exactly
+    # like the after=/replace= fast paths — an extension-unwired language
+    # (all-grammars extra) or a suffix-less path must still resolve.
+    ast_nodes = get_ast_map_from_source(original_code, file_path, language) or []
     target = _resolve_symbol(replace, ast_nodes)
     if target is None:
         available = _qualified_symbol_names(ast_nodes)
@@ -1702,9 +1705,14 @@ def _merge_preserve_siblings(
                 new_snippet_lines.append(line)
         snippet_lines = new_snippet_lines
 
-    # Strip ellipsis marker lines from the snippet — preserve_siblings
-    # subsumes their role.
-    snippet_lines = [ln for ln in snippet_lines if not _MARKER_RE.match(ln)]
+    # Strip marker lines from the snippet — preserve_siblings subsumes
+    # their role. Judged with the shared LINE-ANCHORED predicate
+    # (markers.is_marker_line, B15 single source of truth): this IS a
+    # merge-semantic decision, and the loose legacy ``_MARKER_RE`` regex
+    # (kept importable for backward compatibility only) also swallowed
+    # real comment lines like ``// ... rest of the class stays ...`` that
+    # are content per the unified contract.
+    snippet_lines = [ln for ln in snippet_lines if not _is_marker_line(ln)]
 
     # Build preserved blocks from the original (in original source order).
     preserved_blocks: list[str] = []

@@ -200,8 +200,18 @@ class BackupStore:
         self._prune_old()
 
     def _hash(self, file_path: str) -> str:
-        """Stable hash prefix from the original file path."""
-        return hashlib.sha256(file_path.encode()).hexdigest()[:16]
+        """Stable hash prefix from the original file path.
+
+        ``surrogateescape`` mirrors ``file_lock.lock_file_for``: a POSIX
+        filename that is not valid UTF-8 arrives as a str carrying
+        surrogates, and the old strict ``encode()`` raised
+        UnicodeEncodeError mid-write (the backup could never be stored).
+        Identical to the strict encoding for every valid-UTF-8 path, so
+        existing backup hashes are unchanged.
+        """
+        return hashlib.sha256(
+            file_path.encode("utf-8", "surrogateescape"),
+        ).hexdigest()[:16]
 
     def _key_paths(self, file_path: str) -> list[Path]:
         """All backup files for *file_path*, NEWEST first. Timestamps are
@@ -259,10 +269,15 @@ class BackupStore:
             raise
         # Metadata (original path) so undo/diff can display it. Funneled
         # through _atomic_write (B39) so the meta is fsync'd too: same
-        # content and encoding as the old
-        # ``write_text(file_path, encoding="utf-8")``, plus a temp+replace
-        # write so a crash cannot leave a half-written meta.
-        _atomic_write(self._meta_path(file_path), file_path, encoding="utf-8")
+        # content as the old ``write_text(file_path, encoding="utf-8")``,
+        # plus a temp+replace write so a crash cannot leave a half-written
+        # meta. Written as PRE-ENCODED bytes with surrogateescape (the
+        # _hash convention): a non-UTF-8 path must not fail the edit AFTER
+        # its backup has already been stored.
+        _atomic_write(
+            self._meta_path(file_path),
+            file_path.encode("utf-8", "surrogateescape"),
+        )
         self._prune_per_file(file_path)
 
     def __contains__(self, file_path: str) -> bool:

@@ -226,7 +226,7 @@ class FastEditEngine:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        raw_output = response.choices[0].message.content
+        raw_output = response.choices[0].message.content or ""
         merged_code, truncated = _extract_output_or_flag(raw_output)
         # B12: compose the API-level finish-reason signal with the
         # extraction signal — a length-capped response is truncated even
@@ -286,7 +286,7 @@ class FastEditEngine:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        raw_output = response.choices[0].message.content
+        raw_output = response.choices[0].message.content or ""
         merged_code, truncated = _extract_output_or_flag(raw_output)
         # B12: same finish-reason composition as merge().
         if _response_truncated(response):

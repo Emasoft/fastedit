@@ -146,6 +146,13 @@ class TestCLIRead:
         assert result.returncode == 1
         assert "error" in result.stderr.lower() or "Error" in result.stderr
 
+    def test_read_directory_exits_with_clean_error(self, tmp_path: Path):
+        """Reading a directory is a clean exit-1, not an IsADirectoryError traceback."""
+        result = run_cli("read", str(tmp_path))
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "not a regular file" in result.stderr
+
     def test_read_subcommand_exists(self):
         """The 'read' subcommand should be recognized by argparse."""
         result = run_cli("read", "--help")
@@ -508,6 +515,177 @@ class TestCLIRename:
 
 
 # ===================================================================
+# 5b. fastedit rename / rename-all — B37 concurrent-modification guard
+# ===================================================================
+
+class TestCLIRenameConcurrentWrite:
+    """B37 lost-update guard for the rename verbs.
+
+    Mirrors the multi-edit race tests (section 13): a deterministic seam (a
+    wrapper around the rename engine or the per-file lock) interposes a
+    NON-fastedit write between the verb's read and its write, because a real
+    concurrent writer would be timing-dependent and flaky, while this
+    reproduces "the file changed between being read and being written" on
+    every run. Runs cli.main() IN-PROCESS (`cli.main()` with a patched
+    `sys.argv`) rather than via subprocess, because the monkeypatched spy
+    cannot reach across a `subprocess.run` process boundary. Nothing is
+    stubbed — every test drives the real tldr-backed rename engine.
+    """
+
+    def test_rename_refuses_when_file_changed_after_read(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """A non-fastedit write between rename's read and its write is refused:
+        exit 1, and the EXTERNAL content — not the rename — stays on disk."""
+        from fastedit import cli as cli_module
+        from fastedit.inference import rename as rename_module
+
+        target = tmp_path / "mod.py"
+        target.write_text("def old_name():\n    return 1\n\nx = old_name()\n")
+        external_bytes = b"# rewritten by a non-fastedit writer\n"
+
+        real_do_rename_ast = rename_module.do_rename_ast
+        engine_counts: list[int] = []
+
+        def spy_do_rename_ast(path, old_name, new_name):
+            renamed, count, skipped = real_do_rename_ast(path, old_name, new_name)
+            engine_counts.append(count)
+            # The external writer lands AFTER the engine's read of the file
+            # (and after the CLI's own read), BEFORE the CLI's write.
+            target.write_bytes(external_bytes)
+            return renamed, count, skipped
+
+        monkeypatch.setattr(rename_module, "do_rename_ast", spy_do_rename_ast)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["fastedit", "rename", str(target), "old_name", "new_name"],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.main()
+
+        # Checked FIRST: the rename engine really ran and really found
+        # references, so the fault was injected mid-run — not short-circuited
+        # by an early "no code references" exit (which would make the refusal
+        # below the wrong refusal and the setup itself broken).
+        assert engine_counts and engine_counts[0] >= 1
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "file changed on disk" in captured.err
+        assert "Nothing was written" in captured.err
+        # The external content is what's on disk — the rename was NOT applied.
+        assert target.read_bytes() == external_bytes
+
+    def test_rename_all_refuses_changed_file_but_still_renames_the_rest(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """rename-all: the file changed after the plan read it is refused; the
+        other file still renames (the verb's partial per-file semantics)."""
+        from fastedit import cli as cli_module
+        from fastedit.inference import rename as rename_module
+
+        body = "def old_sym():\n    return 1\n\nx = old_sym()\n"
+        root = tmp_path / "proj"
+        root.mkdir()
+        survivor = root / "survivor.py"
+        victim = root / "victim.py"
+        survivor.write_text(body)
+        victim.write_text(body)
+        external_bytes = b"# rewritten by a non-fastedit writer\n"
+
+        real_do_cross_file_rename = rename_module.do_cross_file_rename
+        planned: dict = {}
+
+        def ordered_do_cross_file_rename(root_dir, old_name, new_name, **kwargs):
+            plan = real_do_cross_file_rename(root_dir, old_name, new_name, **kwargs)
+            planned.update(plan)
+            # Deterministic write order: survivor first, victim last (False
+            # sorts before True), so the survivor's rename lands before the
+            # victim's refusal.
+            return {p: plan[p] for p in sorted(plan, key=lambda p: p == victim)}
+
+        monkeypatch.setattr(
+            rename_module, "do_cross_file_rename", ordered_do_cross_file_rename,
+        )
+
+        real_locked_for_edit = cli_module._locked_for_edit
+        interposed: list[Path] = []
+
+        def spy_locked_for_edit(path):
+            if path == victim and not interposed:
+                # The non-fastedit writer clobbers the victim after the plan
+                # read it, before this file's locked write.
+                interposed.append(path)
+                victim.write_bytes(external_bytes)
+            return real_locked_for_edit(path)
+
+        monkeypatch.setattr(cli_module, "_locked_for_edit", spy_locked_for_edit)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["fastedit", "rename-all", str(root), "old_sym", "new_sym"],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.main()
+
+        # Checked FIRST: both files were really planned (tldr found references
+        # in each) and the external write really landed mid-run — not
+        # short-circuited by an early no-plan exit.
+        assert set(planned) == {survivor, victim}
+        assert interposed == [victim]
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "file changed on disk" in captured.err
+        assert "Nothing was written" in captured.err
+        # The changed file keeps the EXTERNAL content — no rename applied to it.
+        assert victim.read_bytes() == external_bytes
+        # The other file still renamed: partial semantics consistent with the verb.
+        survivor_text = survivor.read_text()
+        assert "def new_sym" in survivor_text
+        assert "def old_sym" not in survivor_text
+
+    def test_rename_happy_path_still_writes(self, tmp_path: Path, monkeypatch):
+        """With no concurrent writer, rename still applies and succeeds."""
+        from fastedit import cli as cli_module
+
+        target = tmp_path / "mod.py"
+        target.write_text("def old_name():\n    return 1\n\nx = old_name()\n")
+        monkeypatch.setattr(
+            sys, "argv",
+            ["fastedit", "rename", str(target), "old_name", "new_name"],
+        )
+
+        cli_module.main()  # no SystemExit: the command succeeded
+
+        content = target.read_text()
+        assert "def new_name" in content
+        assert "def old_name" not in content
+
+    def test_rename_all_happy_path_still_writes_every_planned_file(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """With no concurrent writer, rename-all still renames every planned file."""
+        from fastedit import cli as cli_module
+
+        body = "def old_sym():\n    return 1\n\nx = old_sym()\n"
+        root = tmp_path / "proj"
+        root.mkdir()
+        (root / "a.py").write_text(body)
+        (root / "b.py").write_text(body)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["fastedit", "rename-all", str(root), "old_sym", "new_sym"],
+        )
+
+        cli_module.main()  # no SystemExit: the command succeeded
+
+        for name in ("a.py", "b.py"):
+            content = (root / name).read_text()
+            assert "def new_sym" in content
+            assert "def old_sym" not in content
+
+
+# ===================================================================
 # 6. fastedit search
 # ===================================================================
 
@@ -830,6 +1008,26 @@ class TestCLIBatchEdit:
         """Invalid JSON should exit with code 1."""
         result = run_cli("batch-edit", str(small_py), "--edits", "not-json{[")
         assert result.returncode == 1
+
+    def test_batch_edit_rejects_non_list_edits_cleanly(self, small_py: Path):
+        """A JSON object (not a list) is a clean exit-1, not a traceback."""
+        result = run_cli("batch-edit", str(small_py), "--edits", '{"snippet": "x = 1"}')
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "'snippet'" in result.stderr
+
+    def test_batch_edit_rejects_item_missing_snippet_cleanly(self, small_py: Path):
+        """An edit item without 'snippet' is a clean exit-1, not a KeyError."""
+        result = run_cli("batch-edit", str(small_py), "--edits", '[{"after": "greet"}]')
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "'snippet'" in result.stderr
+
+    def test_batch_edit_rejects_non_object_item_cleanly(self, small_py: Path):
+        """A bare string inside the edits list is a clean exit-1."""
+        result = run_cli("batch-edit", str(small_py), "--edits", '["just a string"]')
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
 
 
 # ===================================================================

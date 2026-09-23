@@ -735,3 +735,34 @@ def test_write_still_lands_end_to_end_after_sweeping(tmp_path):
 
     assert target.read_text(encoding="utf-8") == "new content\n"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["f.py"]
+
+
+def test_non_utf8_path_backs_up_instead_of_crashing(tmp_path, monkeypatch):
+    """A POSIX filename that is not valid UTF-8 (created on e.g. ext4, then
+    handed to fastedit) arrives as a str carrying surrogates; the store must
+    hash it (surrogateescape, like file_lock.lock_file_for) and store the
+    backup + meta instead of raising UnicodeEncodeError mid-__setitem__ —
+    which used to fail the caller's edit after the temp file was already
+    created, and again via the meta write AFTER the backup had landed.
+
+    The surrogate path is never created on disk here: APFS (macOS) refuses
+    such filenames outright, but the STORE must not crash on the str
+    regardless of which filesystem produced it.
+    """
+    monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "store"))
+    store = BackupStore()
+
+    surrogate_path = str(tmp_path / "caf\udce9.py")  # \udce9 = raw byte 0xE9
+    store[surrogate_path] = b"two\n"
+
+    # Backup stored and keyed by the surrogate path (the old _hash raised).
+    assert surrogate_path in store
+    assert store.pop(surrogate_path) == b"two\n"
+    assert store._meta_path(surrogate_path).exists() is False  # consumed by pop
+
+    store[surrogate_path] = b"four\n"
+    # Meta content: the surrogateescape encoding of the original path —
+    # written as pre-encoded bytes so the strict-utf-8 meta encode can no
+    # longer fail after the backup is durable.
+    meta = store._meta_path(surrogate_path)
+    assert meta.read_bytes() == surrogate_path.encode("utf-8", "surrogateescape")

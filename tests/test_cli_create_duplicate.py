@@ -105,6 +105,22 @@ class TestCLICreate:
         assert "mutually exclusive" in result.stderr
         assert not new_file.exists()
 
+    def test_create_flag_error_precedes_existence_check(self, tmp_path: Path) -> None:
+        """The --content/--content-file conflict is reported even when the
+        target file also exists: an argv-only error must not be masked by a
+        state error the user could 'fix' while the real problem stays."""
+        new_file = tmp_path / "hello.py"
+        new_file.write_text("old\n", encoding="utf-8")
+        content_file = tmp_path / "content.txt"
+        content_file.write_text("x = 1\n", encoding="utf-8")
+        result = run_cli(
+            "create", str(new_file), "--content", "y = 2\n", "--content-file", str(content_file),
+        )
+        assert result.returncode == 1
+        assert "mutually exclusive" in result.stderr
+        assert "already exists" not in result.stderr
+        assert new_file.read_text(encoding="utf-8") == "old\n"
+
     def test_create_reads_content_from_file(self, tmp_path: Path) -> None:
         """--content-file <path> reads the file's bytes as the new content."""
         new_file = tmp_path / "hello.py"
@@ -197,6 +213,18 @@ class TestCLIDuplicate:
         result = run_cli("duplicate", str(source), str(dest))
         assert result.returncode == 1
         assert "source file not found" in result.stderr
+        assert not dest.exists()
+
+    def test_duplicate_refuses_directory_source_cleanly(self, tmp_path: Path) -> None:
+        """A directory source is a clean exit-1 refusal, not an
+        IsADirectoryError traceback from read_bytes()."""
+        source = tmp_path / "srcdir"
+        source.mkdir()
+        dest = tmp_path / "b.py"
+        result = run_cli("duplicate", str(source), str(dest))
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "not a regular file" in result.stderr
         assert not dest.exists()
 
     def test_duplicate_copies_binary_source_bytes_exactly(self, tmp_path: Path) -> None:

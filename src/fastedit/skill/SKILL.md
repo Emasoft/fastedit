@@ -125,6 +125,7 @@ fastedit edit src/app.py --replace handle_request --snippet '
 | `pull --model M` | Download the merge model: `mlx-8bit` (Apple Silicon) or `bf16` (Linux/GPU) |
 | `doctor` | Self-diagnostics: binaries, extras, model cache, MCP config, tldr |
 | `mcp-install` | Write the MCP entry for Claude Code (`--scope user` or `project`) |
+| `init` | One-shot setup: install the fastedit agent skill for your coding agent |
 
 Workflow: `fastedit read` before writing, `--dry-run` where offered, then `fastedit diff` / `fastedit undo` to verify or step back.
 

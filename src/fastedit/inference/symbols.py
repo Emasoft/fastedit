@@ -224,6 +224,15 @@ def move_symbol(
     if target_node.line_start > source_node.line_end:
         tgt_end_0 -= shift
 
+    # Terminate the line preceding the insertion point when it lacks a
+    # terminator: only the file's LAST line can be unterminated
+    # (splitlines(keepends=True) keeps every other line terminated), and
+    # splicing after it would concatenate that line with the moved block's
+    # first line — silent corruption, exit 0 (a file whose final symbol
+    # line carries no newline, then moving a symbol to EOF).
+    if tgt_end_0 > 0 and not remaining[tgt_end_0 - 1].endswith(("\n", "\r")):
+        remaining[tgt_end_0 - 1] += line_ending
+
     # Ensure blank line separator before inserted code
     if tgt_end_0 < len(remaining) and remaining[tgt_end_0 - 1].strip() != "" and extracted[0].strip() != "":
             extracted = [line_ending] + extracted

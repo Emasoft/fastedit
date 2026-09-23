@@ -420,11 +420,16 @@ def do_cross_file_rename(
             without the filter or pick a different kind.
 
     Returns:
-        Dict mapping Path -> (new_content, replacement_count, skipped_count)
-        for every file where replacement_count > 0. Files with zero matches
-        are omitted. Binary / unreadable files are silently skipped. An
-        empty dict is returned when old_name == new_name (no-op guard), when
-        tldr is unavailable, or when kind_filter does not match.
+        Dict mapping Path -> (new_content, replacement_count, skipped_count,
+        read_stat) for every file where replacement_count > 0. read_stat is
+        the os.stat_result captured when this file's bytes were read (B37
+        lost-update guard): callers that apply the plan through
+        ``_atomic_write(expected_stat=read_stat)`` refuse — instead of
+        clobbering — when a non-fastedit writer changed the file between
+        planning and writing. Files with zero matches are omitted. Binary /
+        unreadable files are silently skipped. An empty dict is returned
+        when old_name == new_name (no-op guard), when tldr is unavailable,
+        or when kind_filter does not match.
     """
     from pathlib import Path
 
@@ -489,12 +494,22 @@ def do_cross_file_rename(
             continue
         refs_by_file.setdefault(resolved, []).append(ref)
 
+    import os
+
     word_pattern = re.compile(r"\b" + re.escape(old_name) + r"\b")
     plan: dict = {}
     for resolved, refs in refs_by_file.items():
         original_path = resolved_to_original[resolved]
         try:
             original = original_path.read_bytes().decode("utf-8")
+            # B37: capture the read-time stat alongside the bytes so callers
+            # that apply the plan through _atomic_write(expected_stat=...)
+            # can refuse a non-fastedit change that lands in the plan-to-
+            # write window. Captured after the read: a write landing between
+            # the two makes the write-time stat differ, which is exactly the
+            # refusal the guard exists for. A file that vanishes here is
+            # skipped like any other unreadable file.
+            read_stat = os.stat(original_path)
         except (OSError, UnicodeDecodeError):
             continue
         new_content, count = _apply_refs_to_content(
@@ -508,7 +523,7 @@ def do_cross_file_rename(
         # tldr's output does not carry a per-file skip count.
         raw_hits = len(word_pattern.findall(original))
         skipped = max(0, raw_hits - count)
-        plan[original_path] = (new_content, count, skipped)
+        plan[original_path] = (new_content, count, skipped, read_stat)
     return plan
 
 

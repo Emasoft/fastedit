@@ -153,6 +153,9 @@ def cmd_read(args):
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
+    if not path.is_file():
+        print(f"Error: not a regular file: {args.file}", file=sys.stderr)
+        sys.exit(1)
 
     content = path.read_text(encoding="utf-8", errors="replace")
     total_lines = content.count("\n") + (
@@ -679,6 +682,21 @@ def _cmd_batch_edit_locked(args):
         print(f"Error: invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Shape errors are knowable before anything is read or merged, so they
+    # are reported the same way multi-edit reports its own phase-1 problems:
+    # a clean exit 1, never a KeyError/AttributeError traceback from the
+    # BatchEdit construction below (a JSON object, a bare string, or an item
+    # without 'snippet' all used to crash here).
+    if not isinstance(edits_list, list) or not all(
+        isinstance(e, dict) and "snippet" in e for e in edits_list
+    ):
+        print(
+            "Error: --edits must be a JSON list of objects each with 'snippet' "
+            '(plus optional "after"/"replace")',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     batch = [
         BatchEdit(
             snippet=e["snippet"],
@@ -1116,16 +1134,35 @@ def cmd_rename(args):
 def _cmd_rename_locked(args):
     """cmd_rename's body, under the file's cross-process edit lock."""
     import difflib
+    import os
 
     from .inference.rename import do_rename_ast
-    from .mcp.backup import BackupStore, _atomic_write
+    from .mcp.backup import BackupStore, ConcurrentModificationError, _atomic_write
 
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
 
-    original = path.read_text(encoding="utf-8")
+    try:
+        original = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        # B21: an undecodable file must fail as a clean refusal, not as a
+        # bare traceback from the display-diff read.
+        print(f"Error: {args.file} is not valid UTF-8 text ({e})", file=sys.stderr)
+        sys.exit(1)
+
+    # B37: the read-time stat guards the write below against an external
+    # change in the read-to-write window (same guard the edit/batch/multi/
+    # delete/move verbs arm). do_rename_ast re-reads the file itself; a
+    # non-fastedit write landing between this stat and the write makes the
+    # write refuse, so the external writer's content stays on disk instead
+    # of being silently overwritten by a rename computed from stale bytes.
+    try:
+        read_stat = os.stat(path)
+    except FileNotFoundError:
+        print(f"Error: file not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
 
     renamed, count, skipped = do_rename_ast(path, args.old_name, args.new_name)
 
@@ -1149,7 +1186,11 @@ def _cmd_rename_locked(args):
         return
 
     backups = BackupStore()
-    _atomic_write(path, renamed, backups=backups)
+    try:
+        _atomic_write(path, renamed, backups=backups, expected_stat=read_stat)
+    except ConcurrentModificationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     skip_note = f" (skipped {skipped} in strings/comments)" if skipped else ""
 
@@ -1168,7 +1209,7 @@ def _cmd_rename_locked(args):
 def cmd_rename_all(args):
     """Rename a symbol across every supported file in a directory tree."""
     from .inference.rename import do_cross_file_rename
-    from .mcp.backup import BackupStore, _atomic_write
+    from .mcp.backup import BackupStore, ConcurrentModificationError, _atomic_write
 
     root = Path(args.root)
     if not root.is_dir():
@@ -1187,8 +1228,8 @@ def cmd_rename_all(args):
         )
         sys.exit(1)
 
-    total_count = sum(count for _, count, _ in plan.values())
-    total_skipped = sum(skipped for _, _, skipped in plan.values())
+    total_count = sum(count for _new_content, count, _skipped, _stat in plan.values())
+    total_skipped = sum(skipped for _new_content, _count, skipped, _stat in plan.values())
 
     if args.dry_run:
         print(
@@ -1197,19 +1238,28 @@ def cmd_rename_all(args):
             + (f" (skipping {total_skipped} in strings/comments)" if total_skipped else "")
             + ":"
         )
-        for path, (_, count, skipped) in sorted(plan.items()):
+        for path, (_new_content, count, skipped, _stat) in sorted(plan.items()):
             skip_note = f" ({skipped} skipped)" if skipped else ""
             print(f"  {path} — {count} replacement(s){skip_note}")
         return
 
     backups = BackupStore()
-    for path, (new_content, _, _) in plan.items():
+    for path, (new_content, _count, _skipped, read_stat) in plan.items():
         # Per-file scope: each target is locked only across its own write
         # (the reads happened in the plan above), so two concurrent
         # rename-all runs over overlapping trees serialize per file instead
         # of deadlocking on cross-file lock order.
         with _locked_for_edit(path):
-            _atomic_write(path, new_content, backups=backups)
+            # B37: read_stat is the stat do_cross_file_rename captured when
+            # it read this file for the plan. A non-fastedit write landing
+            # between that read and this write is REFUSED here (not silently
+            # overwritten from the plan's stale bytes); files already written
+            # stay written, matching the verb's partial per-file semantics.
+            try:
+                _atomic_write(path, new_content, backups=backups, expected_stat=read_stat)
+            except ConcurrentModificationError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
 
     skip_note = f" (skipped {total_skipped} in strings/comments)" if total_skipped else ""
     print(
@@ -1333,6 +1383,13 @@ def cmd_create(args):
     from .filetype import is_text_file
     from .mcp.backup import BackupStore, _atomic_write
 
+    # Flag-conflict first: it is knowable from argv alone and must not be
+    # masked by a state error (an existing file or missing parent) that the
+    # user might fix while the real problem -- two content sources -- stays.
+    if args.content is not None and args.content_file is not None:
+        print("Error: --content and --content-file are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
     path = Path(args.file)
     if path.exists() and not args.force:
         print(f"Error: file already exists: {args.file} (use --force to overwrite)", file=sys.stderr)
@@ -1343,9 +1400,6 @@ def cmd_create(args):
             sys.exit(1)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.content is not None and args.content_file is not None:
-        print("Error: --content and --content-file are mutually exclusive", file=sys.stderr)
-        sys.exit(1)
     if args.content is not None:
         raw = args.content.encode("utf-8")
     elif args.content_file is not None:
@@ -1387,6 +1441,9 @@ def cmd_duplicate(args):
     src = Path(args.src)
     if not src.exists():
         print(f"Error: source file not found: {args.src}", file=sys.stderr)
+        sys.exit(1)
+    if not src.is_file():
+        print(f"Error: not a regular file: {args.src}", file=sys.stderr)
         sys.exit(1)
 
     raw = src.read_bytes()
@@ -1972,9 +2029,9 @@ def main():
         ),
     )
     be_p.add_argument("--backend", choices=["mlx", "vllm"], default=None)
-    be_p.add_argument("--model-path", default=None)
-    be_p.add_argument("--api-base", default=None)
-    be_p.add_argument("--api-model", default=None)
+    be_p.add_argument("--model-path", default=None, help="MLX model path (overrides FASTEDIT_MODEL_PATH)")
+    be_p.add_argument("--api-base", default=None, help="vLLM API base URL")
+    be_p.add_argument("--api-model", default=None, help="vLLM model name")
 
     # --- multi-edit (model) ---
     me_p = sub.add_parser("multi-edit", help="Apply edits across multiple files")
@@ -1986,9 +2043,9 @@ def main():
         ),
     )
     me_p.add_argument("--backend", choices=["mlx", "vllm"], default=None)
-    me_p.add_argument("--model-path", default=None)
-    me_p.add_argument("--api-base", default=None)
-    me_p.add_argument("--api-model", default=None)
+    me_p.add_argument("--model-path", default=None, help="MLX model path (overrides FASTEDIT_MODEL_PATH)")
+    me_p.add_argument("--api-base", default=None, help="vLLM API base URL")
+    me_p.add_argument("--api-model", default=None, help="vLLM model name")
 
     # --- delete (no model) ---
     del_p = sub.add_parser(

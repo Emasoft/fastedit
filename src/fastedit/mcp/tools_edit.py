@@ -275,7 +275,13 @@ async def fast_edit(
             if needs_model:
                 if backend_kind == "mlx":
                     async with backend.acquire() as engine:
-                        result = chunked_merge(
+                        # The merge (tree-sitter + MLX inference) is seconds
+                        # of synchronous work; run it on a worker thread so
+                        # the event loop keeps serving other requests. Same
+                        # shape as the LLM branch below (and the only way a
+                        # multi-engine pool actually parallelizes, B40).
+                        result = await asyncio.to_thread(
+                            chunked_merge,
                             original_code=original_code,
                             snippet=edit_snippet,
                             file_path=file_path,
@@ -299,8 +305,11 @@ async def fast_edit(
                     )
             else:
                 # Zero-model fast path (after= insert, or replace= with
-                # preserve_siblings=True): no engine needed.
-                result = chunked_merge(
+                # preserve_siblings=True): no engine needed. Still pure-Python
+                # AST work over the whole file — thread it like the model paths
+                # so a huge file cannot stall the loop.
+                result = await asyncio.to_thread(
+                    chunked_merge,
                     original_code=original_code,
                     snippet=edit_snippet,
                     file_path=file_path,
@@ -389,7 +398,10 @@ async def fast_edit(
                     compute_signature_impact_note,
                 )
                 project_root = _find_project_root(path)
-                note = compute_signature_impact_note(
+                # May invoke tldr (a subprocess with its own timeout);
+                # thread it so the event loop is not blocked for its run.
+                note = await asyncio.to_thread(
+                    compute_signature_impact_note,
                     old_code=original_code,
                     new_code=result.merged_code,
                     symbol=replace,
@@ -491,7 +503,9 @@ async def fast_batch_edit(
         try:
             if backend_kind == "mlx":
                 async with backend.acquire() as engine:
-                    result = batch_chunked_merge(
+                    # Off-loop merge: same rationale as fast_edit's mlx branch.
+                    result = await asyncio.to_thread(
+                        batch_chunked_merge,
                         original_code=original_code,
                         edits=batch,
                         file_path=file_path,
@@ -668,7 +682,9 @@ async def fast_multi_edit(
             try:
                 if backend_kind == "mlx":
                     async with backend.acquire() as engine:
-                        result = batch_chunked_merge(
+                        # Off-loop merge: same rationale as fast_edit's mlx branch.
+                        result = await asyncio.to_thread(
+                            batch_chunked_merge,
                             original_code=original_code,
                             edits=batch,
                             file_path=fp,

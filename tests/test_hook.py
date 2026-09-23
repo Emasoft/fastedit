@@ -25,6 +25,17 @@ def run_hook(payload: dict) -> subprocess.CompletedProcess:
     )
 
 
+def run_hook_raw(input_text: str) -> subprocess.CompletedProcess:
+    """Run the hook with arbitrary (possibly unparsable) stdin."""
+    return subprocess.run(
+        [sys.executable, "-m", "fastedit.hook"],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 @pytest.mark.parametrize(
     "ext",
     [".py", ".js", ".jsx", ".ts", ".tsx", ".rs", ".go",
@@ -64,6 +75,19 @@ def test_unsupported_extensions_fall_through(ext):
                                       "new_string": "b"}})
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "bad_input",
+    ["not-json{[", "", "[]", '"just a string"', '{"tool_input": "not-a-dict"}'],
+)
+def test_unparsable_input_falls_through_silently(bad_input):
+    """An unparsable or non-object stdin payload falls open (exit 0, no
+    output) instead of crashing the hook with a traceback."""
+    result = run_hook_raw(bad_input)
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
 
 @pytest.mark.parametrize(
     "file_name",

@@ -45,7 +45,7 @@ dependencies = [
 [project.optional-dependencies]
 # Platform-marked (G2 audit): mlx/mlx-lm are macOS (Apple silicon) only --
 # their wheels carry no Linux/Windows builds and the sdist cannot build
-# there (Metal). The marker keeps `pip install fastedit[mlx]` resolvable
+# there (Metal). The marker keeps `pip install fastedits[mlx]` resolvable
 # everywhere: identical on macOS, a no-op instead of a build failure
 # elsewhere. Plain `pip install fastedit` never installs extras, so the
 # default install was always safe.

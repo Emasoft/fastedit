@@ -132,7 +132,8 @@ def get_update_notice() -> str | None:
 
     return (
         f"[fastedit {latest} available — you're on {current}. "
-        f"Run: pip install -U fastedits  (restart the MCP server after)]"
+        f"Run: uv tool upgrade fastedits (or pip install -U fastedits)"
+        f"  (restart the MCP server after)]"
     )
 
 

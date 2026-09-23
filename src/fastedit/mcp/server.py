@@ -65,10 +65,15 @@ class ModelPool:
         async with self._lock:
             if self._loaded:
                 return
-            from ..inference.mlx_engine import MLXEngine
-            for _ in range(self._size):
-                engine = MLXEngine(self._model_path)
-                self._engines.append(engine)
+
+            def _build_engines() -> list[Any]:
+                from ..inference.mlx_engine import MLXEngine
+                return [MLXEngine(self._model_path) for _ in range(self._size)]
+
+            # Constructing an MLXEngine loads model weights: seconds of
+            # synchronous disk + MLX work. Run it on a worker thread so the
+            # event loop keeps serving other requests during the load.
+            self._engines = await asyncio.to_thread(_build_engines)
             self._loaded = True
             logger.info("MLX pool loaded: %d engine(s) from %s", self._size, self._model_path)
 

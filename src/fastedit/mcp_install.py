@@ -34,7 +34,7 @@ def install_mcp_config(scope: str = "user") -> int:
 
     if path.exists():
         try:
-            config = json.loads(path.read_text())
+            config = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             print(f"error: {path} is not valid JSON: {e}", file=sys.stderr)
             return 1
@@ -75,7 +75,7 @@ def install_mcp_config(scope: str = "user") -> int:
         print(f"backup: {backup}")
 
     servers["fastedit"] = FASTEDIT_ENTRY
-    path.write_text(json.dumps(config, indent=2) + "\n")
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     print(f"{path} — fastedit MCP entry installed")
     print("\nRestart Claude Code for the change to take effect.")
     return 0

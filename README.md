@@ -384,6 +384,8 @@ FASTEDIT_RUN_STRESS=1 uv run pytest -m "llm and stress" -q  # stress tier: adds 
 | `FASTEDIT_VLLM_API_BASE` | `http://127.0.0.1:8000/v1` | vLLM server URL (any OpenAI-compatible) |
 | `FASTEDIT_VLLM_MODEL` | `/root/fastedit-merged` | Model name to send in API requests |
 | `FASTEDIT_VLLM_API_KEY` | `not-needed` | API key (if server requires one) |
+| `FASTEDIT_VLLM_MAX_TOKENS` | `16384` | Max tokens the vLLM backend requests per merge |
+| `FASTEDIT_NO_UPDATE_CHECK` | unset | Set to `1` to disable the PyPI update check (CLI notice + MCP banner) |
 | `FASTEDIT_BACKUP_DIR` | `~/.fastedit/backups` | Directory for undo/diff backups; must be an absolute path (a leading `~` is expanded). `fastedit undo` and `diff` only see backups stored in this directory. |
 | `FASTEDIT_MAX_RETRIES` | `8` | Validation-retry budget per merge site for the retry-until-valid loop (see "Validation & retries" above). Malformed or negative values fail loudly. |
 | `FASTEDIT_RUN_STRESS` | unset | Set to `1` to enable the 100MB stress tests (see "Testing" above). |

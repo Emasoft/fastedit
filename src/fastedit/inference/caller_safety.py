@@ -259,7 +259,6 @@ def _extract_declaration_block(text: str, symbol: str) -> str | None:
         if idx >= len(lines):
             break
         line = lines[idx]
-        stopped_mid_line = False
         for j, ch in enumerate(line):
             if ch == "(":
                 paren += 1
@@ -279,8 +278,6 @@ def _extract_declaration_block(text: str, symbol: str) -> str | None:
             elif (ch == ":" or ch == ";") and paren == 0 and bracket == 0 and brace == 0:
                 collected.append(line[: j + 1])
                 return "\n".join(collected)
-        if stopped_mid_line:
-            break
         collected.append(line)
         # End-of-line stop: signature line has closed all brackets and
         # didn't hit a body-opener. Ruby's ``def foo(a)`` terminates
