@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import pytest
@@ -1258,3 +1259,107 @@ class TestDiffAfterEdits:
         assert result.returncode == 0, f"Diff failed: {result.stderr}"
         assert "---" in result.stdout
         assert "greet" in result.stdout or "welcome" in result.stdout
+
+
+# ===================================================================
+# 17. fastedit --version / -V
+# ===================================================================
+
+class TestCLIVersion:
+    """`fastedit --version` / `-V`: the first thing anyone tries after installing.
+
+    Contract: exits 0, prints ONLY the version line to stdout (so it can be
+    captured by scripts), and reports the installed fastedits metadata version
+    — with a "0.0.0+unknown" fallback for a source checkout without install.
+    `--version` / `-V` are MAIN-parser flags: they print before any command
+    dispatch, so `fastedit --version` needs no subcommand at all.
+    """
+
+    def _expected_version(self) -> str:
+        """The version a correct `--version` line reports.
+
+        importlib.metadata.version('fastedits') when the package is installed
+        in this interpreter (the fastedit running under the test venv), else
+        the same "0.0.0+unknown" fallback the CLI itself uses. Kept in lockstep
+        with the CLI on purpose: the flag's whole job is to report this.
+        """
+        try:
+            return importlib_metadata.version("fastedits")
+        except importlib_metadata.PackageNotFoundError:
+            return "0.0.0+unknown"
+
+    def test_version_exits_zero_and_prints_the_metadata_version(self):
+        result = run_cli("--version")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == f"fastedit {self._expected_version()}\n"
+
+    def test_uppercase_v_alias_prints_the_same_line(self):
+        short = run_cli("-V")
+        assert short.returncode == 0, short.stderr
+        assert short.stdout == f"fastedit {self._expected_version()}\n"
+
+    def test_version_goes_to_stdout_not_stderr(self):
+        """Scripts capture stdout; the version line must be there."""
+        result = run_cli("--version")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.startswith("fastedit ")
+        assert result.stderr == ""
+
+    def test_version_prints_nothing_else(self):
+        """Exactly one line — no help text, no update notice, no banner."""
+        result = run_cli("--version")
+        assert result.returncode == 0, result.stderr
+        assert len(result.stdout.strip().splitlines()) == 1
+        assert result.stdout.strip().splitlines()[0].startswith("fastedit ")
+
+    def test_version_works_without_a_subcommand(self):
+        """`fastedit --version` alone is valid argv — no 'the following arguments are required' error.
+
+        The flag sits on the MAIN parser and argparse resolves it during
+        parse_args, before the subparser's required-action check runs.
+        """
+        result = run_cli("--version")
+        assert result.returncode == 0, result.stderr
+        assert "required" not in result.stderr.lower()
+
+    def test_version_takes_precedence_over_the_subcommand(self):
+        """`fastedit --version read x.py` still prints the version and never touches the filesystem."""
+        result = run_cli("--version", "read", "nonexistent-file-for-version-test.py")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == f"fastedit {self._expected_version()}\n"
+        assert not (Path.cwd() / "nonexistent-file-for-version-test.py").exists()
+
+    def test_version_is_absent_from_the_subcommand_parsers(self):
+        """No subparser gains a --version: it stays a top-level flag, so
+        `fastedit doctor --version` is NOT the version printer."""
+        import argparse as argparse_mod
+
+        from fastedit import cli as cli_mod
+
+        original_parse = argparse_mod.ArgumentParser.parse_args
+        captured: dict = {}
+        sentinel = type("_Stop", (Exception,), {})
+
+        def _capture(self, *a, **kw):
+            captured["parser"] = self
+            raise sentinel
+
+        argparse_mod.ArgumentParser.parse_args = _capture
+        try:
+            try:
+                cli_mod.main()
+            except sentinel:
+                pass
+        finally:
+            argparse_mod.ArgumentParser.parse_args = original_parse
+
+        parser = captured["parser"]
+        assert any(
+            isinstance(a, argparse_mod._VersionAction) for a in parser._actions
+        ), "the main parser must carry a version action"
+        for action in parser._actions:
+            if isinstance(action, argparse_mod._SubParsersAction):
+                for name, sub in action.choices.items():
+                    assert not any(
+                        isinstance(a, argparse_mod._VersionAction) for a in sub._actions
+                    ), f"subcommand '{name}' must not carry a --version flag"

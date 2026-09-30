@@ -1968,6 +1968,23 @@ def cmd_init(args):
 # Argparse setup and main dispatch
 # ---------------------------------------------------------------------------
 
+def _cli_version() -> str:
+    """The version `fastedit --version` reports.
+
+    The installed ``fastedits`` distribution version via importlib.metadata —
+    the same lookup update_check and doctor use, so the three surfaces cannot
+    disagree. A source checkout without an install reports "0.0.0+unknown"
+    instead of crashing: the flag exists to answer a question, never to be
+    the command that fails.
+    """
+    from importlib import metadata
+
+    try:
+        return metadata.version("fastedits")
+    except metadata.PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="fastedit",
@@ -1976,6 +1993,17 @@ def main():
         # printing the guide (cli_help.EPILOG) verbatim, un-wrapped.
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG,
+    )
+    # --version / -V: the first thing anyone tries after installing. A
+    # main-parser flag (not a subcommand) so `fastedit --version` alone is
+    # valid argv: argparse's version action prints and exits during
+    # parse_args, before the subparser's required-command check runs. Prints
+    # to stdout, exit 0, nothing else on the line — capturable by scripts.
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"fastedit {_cli_version()}",
+        help="Show the fastedit version and exit",
     )
     # metavar: the 20-command choices token is unbreakable for argparse and
     # renders as a single long line in usage; "command" keeps the

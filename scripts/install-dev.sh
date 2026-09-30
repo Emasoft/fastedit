@@ -15,6 +15,14 @@
 #   non-interactive: no menu; --dev decides, otherwise the remote fork.
 #   --revert never shows the menu.
 #
+# --check is the READ-ONLY axis: it prints the resolved state of this
+# machine (installed fastedits per method, the fastedit binary that wins on
+# PATH and what `fastedit --version` reports, VALID/STALE model caches, the
+# grammar pack, the local clone) plus the fork's branch state — whether the
+# ref exists on the remote, and the stale-default-branch pin note — and
+# exits. It installs nothing, removes nothing, and needs neither npx nor a
+# working network (an unreachable remote downgrades to a warning).
+#
 # In fork mode, run from inside a clone, the ref defaults to THAT CLONE's
 # current branch (`git rev-parse --abbrev-ref HEAD`) and — on a real run —
 # is verified to exist on the fork remote (`git ls-remote --heads`, bounded)
@@ -56,6 +64,12 @@ set -euo pipefail
 FORK_URL="https://github.com/Emasoft/fastedit"
 PACKAGE="fastedits"
 REF="feat/create-file"
+# The branch people should install and land on, spelled once. The GitHub
+# DEFAULT branch (main) is stale — the repo's landing page shows old code —
+# so every user-facing one-liner (raw.githubusercontent script URL, uvx
+# direct-ref) and every pin note names THIS branch, never "main".
+INSTALLABLE_BRANCH="feat/create-file"
+RAW_BASE_URL="https://raw.githubusercontent.com/Emasoft/fastedit"
 EXTRAS=""
 # Whether --extras was PASSED, tracked separately from its value. `--extras ""`
 # is a deliberate opt-out and must be distinguishable from never passing the
@@ -65,6 +79,10 @@ EXTRAS=""
 EXTRAS_SET=0
 REVERT=0
 DRY_RUN=0
+# CHECK_ONLY=1 (--check) turns the whole run into a read-only state report.
+# Declared before the flag loop, like every other mode, because the flag loop
+# references it and the loop runs before any other statement.
+CHECK_ONLY=0
 NO_MODEL=0
 # NO_SKILL=1 (--no-skill) skips the whole agent-skill axis: nothing is
 # installed in the forward modes and --revert does not try to remove it.
@@ -121,7 +139,16 @@ platform_line() {
 usage() {
   cat <<'EOF'
 Usage: install-dev.sh [--dev] [--ref REF] [--extras LIST] [--all-grammars yes|no]
-                      [--no-skill] [--revert] [--no-model] [--dry-run]
+                      [--no-skill] [--revert] [--no-model] [--dry-run] [--check]
+
+  --check        Read-only state report, then exit: installs nothing, removes
+                 nothing. Prints the installed fastedits (uv tool / pipx / pip),
+                 the fastedit binary that wins on PATH and what its
+                 `fastedit --version` reports, the model caches (VALID/STALE),
+                 the grammar pack, and — from the fork remote — whether the
+                 installable branch exists and the pin note for the stale
+                 default branch. Needs no npx; works offline (an unreachable
+                 remote is a warning, not a failure).
 
   --dev          Development install: EDITABLE, from this repo's working tree
                  (the directory the script lives in). Your local changes are
@@ -186,9 +213,15 @@ shorthand and tree URLs would resolve the fork's default branch (main),
 which still carries the legacy claude-skill content). A missing npx prints a
 one-line manual-install note and a failed install only warns — neither ever
 fails the installer. The postflight reports the axis truthfully:
-"agent skill: installed (claude-code, global)" / "agent skill: NOT FOUND
+ "agent skill: installed (claude-code, global)" / "agent skill: NOT FOUND
 (see warnings above)" / "agent skill: skipped (...)". --revert removes the
 skill best-effort with "npx --yes skills remove fastedit -g -y".
+
+Installable branch: the fork's GitHub DEFAULT branch (main) is stale — the
+repo's landing page shows old code — so the installable branch is
+feat/create-file. The uvx one-liner and the raw.githubusercontent script URL
+pin it explicitly; a successful install prints both from-scratch one-liners
+plus a `fastedit --version` verification hint in its footer.
 EOF
 }
 
@@ -241,6 +274,10 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=1
       shift
       ;;
+    --check)
+      CHECK_ONLY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -256,6 +293,12 @@ done
 if [[ "$DEV" -eq 1 && "$REVERT" -eq 1 ]]; then
   echo "error: --dev and --revert contradict each other: --dev installs this working tree," >&2
   echo "error: --revert restores upstream fastedits from PyPI. Pick one." >&2
+  exit 1
+fi
+
+if [[ "$CHECK_ONLY" -eq 1 && ("$DEV" -eq 1 || "$REVERT" -eq 1 || "$DRY_RUN" -eq 1) ]]; then
+  echo "error: --check is read-only and combines with nothing: it installs and mutates nothing," >&2
+  echo "error: so --dev, --revert and --dry-run are all meaningless beside it. Drop them." >&2
   exit 1
 fi
 
@@ -981,10 +1024,208 @@ verify_agent_skill() {
 }
 
 # ---------------------------------------------------------------------------
+# --check: the read-only state report
+# ---------------------------------------------------------------------------
+
+# The exact from-scratch one-liners and the stale-branch pin note. ONE
+# function, because the footer of a successful install (print_success_footer)
+# and the --check report must show the same commands — two copies would drift.
+print_from_scratch_one_liners() {
+  cat <<EOF
+  uvx --from 'fastedits[mcp] @ git+${FORK_URL}@${INSTALLABLE_BRANCH}' fastedit --help
+  curl -fsSL ${RAW_BASE_URL}/${INSTALLABLE_BRANCH}/scripts/install-dev.sh | bash
+EOF
+}
+
+print_branch_pin_note() {
+  cat <<EOF
+note: the fork's GitHub landing page shows the stale default branch (main);
+note: the installable branch is ${INSTALLABLE_BRANCH} — the one-liners above pin it.
+note: verify after installing: fastedit --version
+EOF
+}
+
+# The grammar axis of the --check report: same probe the postflight runs
+# (the tool env's OWN python at <tool dir>/fastedits/bin/python), so --check
+# answers with what the installed tool can actually load — never with what
+# whatever python is first on PATH can.
+check_report() {
+  echo "install-dev.sh --check (read-only: installs nothing, removes nothing)"
+  echo ""
+
+  echo "== installed fastedits =="
+  local any=0 line
+  local uv_list=""
+  uv_list="$(run_bounded 15 uv tool list 2>/dev/null || true)"
+  if [[ -n "$uv_list" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "$PACKAGE "*) echo "  uv tool: $line"; any=1 ;;
+      esac
+    done <<<"$uv_list"
+  fi
+  if command -v pipx >/dev/null 2>&1; then
+    local pipx_list=""
+    pipx_list="$(run_bounded 15 pipx list --short 2>/dev/null || true)"
+    if [[ -n "$pipx_list" ]]; then
+      while IFS= read -r line; do
+        case "$line" in
+          "$PACKAGE "*) echo "  pipx: $line"; any=1 ;;
+        esac
+      done <<<"$pipx_list"
+    fi
+  fi
+  local pipbin=""
+  if command -v pip3 >/dev/null 2>&1; then
+    pipbin="pip3"
+  elif command -v pip >/dev/null 2>&1; then
+    pipbin="pip"
+  fi
+  if [[ -n "$pipbin" ]]; then
+    local show=""
+    if show="$(run_bounded 15 "$pipbin" show "$PACKAGE" 2>/dev/null)"; then
+      echo "  ${pipbin}: ${PACKAGE} $(awk -F': ' '/^Version:/ {print $2; exit}' <<<"$show")"
+      any=1
+    fi
+  fi
+  if [[ "$any" -eq 0 ]]; then
+    echo "  (none found)"
+  fi
+  echo ""
+
+  echo "== fastedit binary =="
+  local bin_path=""
+  bin_path="$(command -v fastedit 2>/dev/null || true)"
+  if [[ -z "$bin_path" ]]; then
+    echo "  fastedit on PATH: not found"
+    echo "  fork install: NO"
+  else
+    echo "  fastedit on PATH: $bin_path"
+    local ver_out=""
+    ver_out="$(run_bounded 10 fastedit --version 2>/dev/null || true)"
+    if [[ -n "$ver_out" ]]; then
+      echo "  fastedit --version: $ver_out"
+    else
+      echo "  fastedit --version: (did not answer)"
+    fi
+    # The fork verbs are the one signature upstream's binary lacks: the same
+    # check verify_fork_install runs after a real install.
+    local help_out=""
+    help_out="$(run_bounded 10 fastedit --help 2>/dev/null || true)"
+    local missing=() cmd
+    for cmd in create duplicate split join; do
+      grep -qw "$cmd" <<<"$help_out" || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+      echo "  fork install: YES (create/duplicate/split/join present)"
+    else
+      echo "  fork install: NO (missing fork subcommands: ${missing[*]})"
+    fi
+  fi
+  echo ""
+
+  echo "== model caches under ${MODELS_DIR} =="
+  if [[ ! -d "$MODELS_DIR" ]]; then
+    echo "  (no cache directory — nothing cached yet)"
+  else
+    local d name size state any_cache=0
+    for d in "$MODELS_DIR"/*; do
+      [[ -d "$d" ]] || continue
+      any_cache=1
+      name="$(basename "$d")"
+      size="$(run_bounded 15 du -sh "$d" 2>/dev/null | awk '{print $1}' || true)"
+      state="$(model_cache_state "$d")"
+      echo "  ${name}  ${size:-?}  ${state}"
+    done
+    if [[ "$any_cache" -eq 0 ]]; then
+      echo "  (no model directories)"
+    fi
+  fi
+  echo ""
+
+  echo "== grammars =="
+  local tool_python=""
+  tool_python="$(uv tool dir 2>/dev/null)/${PACKAGE}/bin/python"
+  if [[ ! -x "$tool_python" ]]; then
+    echo "  no tool python found at ${tool_python} — nothing installed via uv tool"
+  elif "$tool_python" -c "from tree_sitter_language_pack import get_language" 2>/dev/null; then
+    echo "  present (verified via the tool's own python)"
+  else
+    echo "  not importable in the tool environment — extended languages (scala, lua, perl, ...) will not resolve"
+  fi
+  echo ""
+
+  echo "== local clone =="
+  if [[ "$HAVE_LOCAL_TREE" -eq 1 ]]; then
+    echo "  local clone: ${REPO_ROOT}"
+    local branch=""
+    branch="$(run_bounded 10 git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+      echo "  current branch: ${branch}"
+    else
+      echo "  current branch: (detached HEAD)"
+    fi
+  else
+    echo "  local clone: none detected (this script is not sitting in a fastedit checkout)"
+  fi
+  echo ""
+
+  echo "== fork remote (${FORK_URL}) =="
+  echo "  default branch on GitHub: main (stale — the landing page shows old code)"
+  local heads status=0
+  heads="$(run_bounded 20 git ls-remote --heads "$FORK_URL" 2>/dev/null)" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "  warning: could not reach the fork remote (offline?) — branch existence not verified." >&2
+    echo "  branch '${INSTALLABLE_BRANCH}' exists on the fork remote: unknown (could not reach ${FORK_URL})"
+  elif awk -v want="refs/heads/${INSTALLABLE_BRANCH}" '$2 == want { found=1 } END { exit found ? 0 : 1 }' <<<"$heads"; then
+    echo "  branch '${INSTALLABLE_BRANCH}' exists on the fork remote"
+    echo "  pinned install target: fastedits @ git+${FORK_URL}@${INSTALLABLE_BRANCH}"
+  else
+    echo "  error: branch '${INSTALLABLE_BRANCH}' does NOT exist on the fork remote — the one-liners below would fail." >&2
+    echo "  pinned install target: fastedits @ git+${FORK_URL}@${INSTALLABLE_BRANCH} (MISSING)"
+  fi
+  echo ""
+
+  echo "== install from scratch (no clone needed) =="
+  print_from_scratch_one_liners
+  echo ""
+  print_branch_pin_note
+}
+
+# The footer of a SUCCESSFUL real install: the from-scratch one-liners for
+# people without a clone, and the verification hint. --check embeds the same
+# two commands in its report (print_from_scratch_one_liners is the one
+# source); the revert path prints neither — it restores upstream, and fork
+# one-liners have no business on a reverted machine.
+print_success_footer() {
+  echo ""
+  echo "Install from scratch on another machine (no clone needed):"
+  print_from_scratch_one_liners
+  echo ""
+  print_branch_pin_note
+}
+
+# ---------------------------------------------------------------------------
 # Mode resolution, branch autodetect, preflight detection
 # ---------------------------------------------------------------------------
 
 resolve_source_mode
+
+# --check exits before ANY mutating or validating surface: no source menu, no
+# remote-ref verification abort, no prompts. The ref matters to the report
+# only as the name it verifies, so --check resolves it from the same inputs
+# the real run would (explicit --ref, else the local clone's branch, else the
+# built-in default) without the forward install's autodetect line.
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  if [[ "$REF_SET" -eq 0 && "$HAVE_LOCAL_TREE" -eq 1 ]]; then
+    detected_ref="$(run_bounded 10 git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -n "$detected_ref" && "$detected_ref" != "HEAD" ]]; then
+      REF="$detected_ref"
+    fi
+  fi
+  check_report
+  exit 0
+fi
 
 # Validation must cover BOTH ways DEV can become 1: explicit --dev from a
 # stray copy of this script (no pyproject.toml -> abort loudly rather than
@@ -1127,6 +1368,14 @@ else
   if [[ "$DRY_RUN" -eq 0 ]]; then
     verify_fork_install
     verify_grammars
+  fi
+
+  # The footer follows the verifications, so the from-scratch one-liners and
+  # the version hint print only against a confirmed fork install. Dry runs
+  # skip it: nothing was installed, so a success footer would be a lie. (It is
+  # a fork-install footer by definition — the revert path must never print it.)
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    print_success_footer
   fi
 
   if [[ "$NO_MODEL" -eq 0 ]]; then

@@ -6,14 +6,18 @@ autodetect, the model-cache preflight (VALID kept / STALE removed), the
 all-grammars prompt/flag, the agent-skill install (Vercel skills CLI, sourced
 from this clone's local tree — never a GitHub URL or the repo shorthand,
 which would resolve the fork's default branch and its legacy claude-skill
-content), the revert path, and the dry-run
-transcript, all through the script's real CLI.
+content), the revert path, the dry-run
+transcript, the --check read-only state report, and the successful-install
+footer (the from-scratch one-liners plus the stale-main branch pin note),
+all through the script's real CLI.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -23,6 +27,10 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "install-dev.sh"
 REPO_ROOT = SCRIPT.parent.parent
 FORK_URL = "https://github.com/Emasoft/fastedit"
+# The fork's INSTALLABLE branch: the GitHub default branch (main) is stale,
+# so the raw-script URL, the uvx one-liner and the branch-pin note all pin
+# THIS branch, never the default.
+INSTALLABLE_BRANCH = "feat/create-file"
 
 
 def run(*args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess[str]:
@@ -847,3 +855,276 @@ class TestInstallDevArgumentValidation:
         """An unrecognized flag is rejected instead of silently ignored."""
         result = run("--this-flag-does-not-exist")
         assert result.returncode != 0
+
+
+class TestCheckMode:
+    """--check: a read-only state report — installs nothing, removes nothing,
+    needs no npx, and works when the network is unreachable."""
+
+    def test_check_exits_zero_and_is_explicitly_non_mutating(self) -> None:
+        result = run("--check")
+        assert result.returncode == 0, result.stderr
+        assert "read-only" in result.stdout + result.stderr
+
+    def test_check_does_not_install_or_sweep(self) -> None:
+        """The mutating paths stay dark: no sweep, no install, no pull, no skill add."""
+        result = run("--check")
+        assert result.returncode == 0, result.stderr
+        assert "uv tool uninstall" not in result.stdout
+        assert "uv tool install" not in result.stdout
+        assert "pipx uninstall" not in result.stdout
+        assert "fastedit pull" not in result.stdout
+        assert "skills add" not in result.stdout
+        assert "skills remove" not in result.stdout
+
+    def test_check_needs_no_npx(self, tmp_path: Path) -> None:
+        """--check is a no-npx surface: the stub toolchain minus npx must not warn.
+
+        Asserted on the report's actual npx surfaces (warnings, the skills CLI
+        invocation, the agent-skill axis) rather than the bare substring: the
+        binary's PATH is echoed in the report and test directory names can
+        legitimately contain "npx".
+        """
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout + result.stderr
+        assert "npx not found" not in out
+        assert "npx --yes" not in out
+        assert "agent skill" not in out
+        assert "skills" not in out
+
+    def test_check_needs_no_network(self, tmp_path: Path) -> None:
+        """An unreachable fork remote downgrades to a warning, never a failure.
+
+        The stub uv eats `ls-remote`'s stderr through $( ), so this machine's
+        real git is the reference: it reports a genuine ls-remote failure the
+        same way the script does.
+        """
+        real_git = shutil.which("git")
+        if real_git is None:  # pragma: no cover
+            pytest.skip("no git on PATH to drive the unreachable-remote probe")
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        # On the networked dev machine the ls-remote probe genuinely succeeds;
+        # either way the run must not abort.
+        rc = subprocess.run(
+            [real_git, "ls-remote", "--heads", FORK_URL],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if rc.returncode == 0:
+            assert "warning: could not verify" not in result.stdout + result.stderr
+        else:
+            assert "warning: could not verify" in result.stdout + result.stderr
+
+    def test_check_reports_a_fork_install_from_the_stub_binary(self, tmp_path: Path) -> None:
+        """A fastedit on PATH that lists the fork verbs reports a fork install."""
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "fork install: YES" in result.stdout
+
+    def test_check_on_this_machine_reports_upstream_or_fork(self) -> None:
+        """The real machine: one of the two install states, and never a traceback."""
+        result = run("--check")
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert "fork install: YES" in out or "fork install: NO" in out
+
+    def test_check_reports_absent_binary_and_no_model_cache(self, tmp_path: Path) -> None:
+        """An empty HOME with nothing installed: the report says NO, not an error.
+
+        PATH keeps only the stub uv (no fastedit stub) plus the system dirs,
+        so the binary axis exercises its "not found" branch.
+        """
+        home = tmp_path / "empty-home"
+        home.mkdir()
+        fake = tmp_path / "bin"
+        fake.mkdir(exist_ok=True)
+        (fake / "uv").write_text(
+            "#!/bin/bash\n"
+            '[[ "$1" == "--version" ]] && { echo "uv 0.12.12 (stub)"; exit 0; }\n'
+            "exit 0\n"
+        )
+        (fake / "uv").chmod(0o755)
+        env = {"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert "fastedit on PATH: not found" in out
+        assert "fork install: NO" in out
+        assert "(no cache directory — nothing cached yet)" in out
+
+    def test_check_reports_valid_and_stale_model_caches(self, tmp_path: Path) -> None:
+        """One VALID and one STALE cache dir are labelled without being touched."""
+        home = tmp_path / "cache-home"
+        models = home / ".cache" / "fastedit" / "models"
+        valid = models / "valid-model"
+        valid.mkdir(parents=True)
+        (valid / "model.safetensors").write_text("weights", encoding="utf-8")
+        stale = models / "stale-model"
+        stale.mkdir(parents=True)
+        (stale / "config.json").write_text("{}", encoding="utf-8")
+
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert "valid-model" in out and "VALID" in out
+        assert "stale-model" in out and "STALE (partial, no *.safetensors)" in out
+        assert "would remove" not in out
+        assert valid.exists() and stale.exists()
+
+    def test_check_reports_local_clone_state_and_pin_line(self) -> None:
+        """A run from inside this clone names the local tree and the installable branch."""
+        result = run("--check")
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert f"local clone: {REPO_ROOT}" in out
+        # The stale-main pin note: names the stale default branch AND the
+        # installable one, in the same wording the success footer uses.
+        assert "stale default branch (main)" in out
+        assert f"the installable branch is {INSTALLABLE_BRANCH}" in out
+
+    def test_check_reports_grammars_via_the_tool_python(self, tmp_path: Path) -> None:
+        """The grammar axis probes the tool env's own python, exactly like the postflight."""
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        # The report carries a grammars section whose outcome is one of the
+        # three real probe shapes.
+        assert "== grammars ==" in out
+        assert re.search(
+            r"present \(verified via the tool's own python\)|"
+            r"not importable in the tool environment|"
+            r"no tool python found at ",
+            out,
+        )
+
+    def test_check_reports_version_of_installed_binary(self, tmp_path: Path) -> None:
+        """When the binary answers `--version`, the report carries that version line."""
+        fake = tmp_path / "ver-bin"
+        fake.mkdir()
+        (fake / "fastedit").write_text(
+            "#!/bin/bash\n"
+            'if [[ "$1" == "--version" ]]; then echo "fastedit 0.5.0"; exit 0; fi\n'
+            'if [[ "$1" == "--help" ]]; then\n'
+            '  echo "usage: fastedit [command]"\n'
+            '  echo "commands:"\n'
+            '  echo "  create"\n'
+            '  echo "  duplicate"\n'
+            '  echo "  split"\n'
+            '  echo "  join"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        (fake / "fastedit").chmod(0o755)
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        env["PATH"] = f"{fake}:{env['PATH']}"
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "fastedit --version: fastedit 0.5.0" in result.stdout
+
+    def test_check_reports_a_non_answer_version_probe(self, tmp_path: Path) -> None:
+        """A binary without a working --version gets the honest 'did not answer' line."""
+        fake = tmp_path / "nover-bin"
+        fake.mkdir()
+        (fake / "fastedit").write_text("#!/bin/bash\nexit 0\n")
+        (fake / "fastedit").chmod(0o755)
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        env["PATH"] = f"{fake}:{env['PATH']}"
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "fastedit --version: (did not answer)" in result.stdout
+
+    def test_check_resolves_the_real_fork_state(self) -> None:
+        """The one live-integration assertion: this branch IS installable from the fork."""
+        result = run("--check")
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert f"branch '{INSTALLABLE_BRANCH}' exists on the fork remote" in out
+        assert f"{FORK_URL}@{INSTALLABLE_BRANCH}" in out
+
+    def test_check_with_dry_run_is_a_clean_error(self) -> None:
+        """--check --dry-run is a contradiction; the script says so and exits non-zero."""
+        result = run("--check", "--dry-run")
+        assert result.returncode != 0
+        assert "--dry-run" in result.stderr
+
+
+class TestSuccessFooter:
+    """The footer a SUCCESSFUL real install prints: the from-scratch one-liners
+    and the stale-main pin note. Hermetic via the stubbed toolchain."""
+
+    def test_real_run_prints_the_uvx_one_liner(self, tmp_path: Path) -> None:
+        home = tmp_path / "footer-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert (
+            f"uvx --from 'fastedits[mcp] @ git+{FORK_URL}@{INSTALLABLE_BRANCH}' fastedit --help"
+        ) in result.stdout
+
+    def test_real_run_prints_the_pinned_curl_one_liner(self, tmp_path: Path) -> None:
+        home = tmp_path / "footer-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert f"curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/{INSTALLABLE_BRANCH}/scripts/install-dev.sh | bash" in result.stdout
+
+    def test_real_run_mentions_fastedit_version_for_verification(self, tmp_path: Path) -> None:
+        home = tmp_path / "footer-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "fastedit --version" in result.stdout
+
+    def test_real_run_prints_the_branch_pin_note(self, tmp_path: Path) -> None:
+        """The stale-main warning names the default branch AND the installable one."""
+        home = tmp_path / "footer-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--ref", "feat/create-file", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "GitHub landing page shows the stale default branch (main)" in result.stdout
+        assert f"installable branch is {INSTALLABLE_BRANCH}" in result.stdout
+
+    def test_footer_is_suppressed_in_check_mode(self, tmp_path: Path) -> None:
+        """--check shows the one-liners under its own report header, but never
+        the SUCCESS footer ("Install from scratch on another machine") — that
+        belongs to a real install that just succeeded."""
+        home = tmp_path / "check-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
+        result = run("--check", "--ref", "feat/create-file", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        assert "Install from scratch on another machine" not in out
+        assert "== install from scratch (no clone needed) ==" in out
+        assert f"uvx --from 'fastedits[mcp] @ git+{FORK_URL}@{INSTALLABLE_BRANCH}' fastedit --help" in out
+
+    def test_footer_is_suppressed_in_revert_mode(self, tmp_path: Path) -> None:
+        home = tmp_path / "revert-home"
+        home.mkdir()
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--revert", "--no-model", env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "uvx --from" not in result.stdout
