@@ -276,9 +276,11 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     from .data_gen.ast_analyzer import validate_parse
     from .inference.chunked_merge import (
         ChunkedMergeResult,
+        _deterministic_result_is_faithful,
         _normalize_merged_eol,
         _qualified_symbol_names,
         _resolve_symbol,
+        _snippet_splice_covers_deleted_lines,
         get_ast_map,
         get_ast_map_from_source,
     )
@@ -326,6 +328,20 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # Try deterministic text-match first
     edited = deterministic_edit(original_func, snippet)
     if edited is not None:
+        # Issue #1 (hole 1): the CLI text-match path used to return the
+        # editor's output with only a parse check. A parse cannot see
+        # content corruption (a dropped preserved line, a leaked marker, a
+        # selective re-indent all parse fine), so the SAME content battery
+        # chunked_merge wraps its own text-match result with runs here too.
+        # Failure falls through to the model path, which is fully validated.
+        if not _deterministic_result_is_faithful(original_func, edited, snippet):
+            print(
+                f"Deterministic text-match for '{replace_sym}' failed the "
+                f"content-faithfulness check; falling through to the "
+                f"validated model path.",
+                file=sys.stderr,
+            )
+            return None
         edited = normalize_line_endings(edited, line_ending)
         edited_lines = edited.splitlines(keepends=True)
         if edited_lines and not edited_lines[-1].endswith(("\n", "\r")):
@@ -416,12 +432,25 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         "function", "method", "class", "interface", "struct", "enum",
         "trait", "protocol", "module", "object", "impl",
     }
+    # Issue #1 part A: B3 format symbols (markdown section, json key, css
+    # rule, toml table, ...) are NOT code definitions, so _DEFINITION_KINDS
+    # never matched them and a heading-omitting markdown --replace snippet
+    # spliced over the whole section span — deleting the heading and every
+    # body line the snippet did not restate, reported as success. Their
+    # specs now declare the requirement (definition_line_required=True);
+    # code languages keep the existing kind floor.
+    from .inference.ast_utils import _FORMAT_SYMBOL_SPECS
+    format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
+    definition_line_required = (
+        format_spec.definition_line_required if format_spec is not None
+        else target_node.kind in _DEFINITION_KINDS
+    )
     has_def = _snippet_has_any_definition(
         snippet, ext=path.suffix, first_original_line=original_lines[func_start]
     )
     if has_def and language == "python":
         has_def = _snippet_is_single_matching_definition(snippet, target_node)
-    if target_node.kind in _DEFINITION_KINDS and not has_def:
+    if definition_line_required and not has_def:
         raise ValueError(
             f"snippet for '{replace_sym}' (kind: {target_node.kind}) has no definition "
             f"line of its own, so splicing it over the symbol would delete its "
@@ -443,6 +472,29 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     if language:
         parse_valid = validate_parse(merged, language)
     if parse_valid:
+        # Issue #1 (hole 1): the CLI direct-swap path used to hand a
+        # parse-valid splice straight back with NO content validation.
+        # For a CODE symbol the branch's structural proof stands: the
+        # snippet parses as exactly one definition (checked above), so it
+        # IS the wholesale new symbol the caller declared. A FORMAT symbol
+        # (definition_line_required spec row) has no closing delimiter —
+        # nothing structural distinguishes a complete re-definition from a
+        # snippet restating the definition line and silently dropping body
+        # lines — so a completeness gate applies: every content line the
+        # swap deletes must be covered by a declared new line. Neither
+        # holds → fall through to the validated model path.
+        if (
+            format_spec is not None
+            and format_spec.definition_line_required
+            and not _snippet_splice_covers_deleted_lines(original_func, snippet_text)
+        ):
+            print(
+                f"Deterministic replace for '{replace_sym}' would delete "
+                f"original lines the snippet does not restate; falling "
+                f"through to the validated model path.",
+                file=sys.stderr,
+            )
+            return None
         return ChunkedMergeResult(
             merged_code=merged, parse_valid=True,
             chunks_used=0, chunk_regions=[], model_tokens=0, latency_ms=0.0,
@@ -496,6 +548,7 @@ def _cmd_edit_locked(args):
         ConcurrentModificationError,
         _atomic_write,
     )
+    from .write_gates import _all_chunks_rejected, _rejection_refusal
 
     snippet = sys.stdin.read() if args.snippet == "-" else args.snippet
     path = Path(args.file)
@@ -610,6 +663,33 @@ def _cmd_edit_locked(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Hallucination gate (MCP parity, Step 18): a merge whose chunks were
+    # ALL rejected retries until exhaustion and returns the rejection
+    # convention -- merged_code IS the original and parse_valid is forced
+    # False -- so the parse gate above cannot refuse it (the original
+    # parses like the original) and only the chunk accounting can. On
+    # retry-exhaustion that merged_code is byte-identical to what was read,
+    # so writing it would be a no-op reported as success. Refuse BEFORE the
+    # write, with the MCP tool's exact refusal wording. Partial rejections
+    # (0 < rejected < used) keep their write-with-warning behavior below.
+    if _all_chunks_rejected(result):
+        tok_per_sec = (
+            result.model_tokens / (result.latency_ms / 1000)
+            if result.latency_ms > 0 else 0
+        )
+        metrics = (
+            f"latency: {result.latency_ms:.0f}ms, "
+            f"{tok_per_sec:.0f} tok/s, {result.model_tokens} tokens"
+        )
+        if result.chunks_used > 1:
+            metrics += f", {result.chunks_used} chunk(s)"
+        metrics += _validation_retries_metric(getattr(result, "retries", 0))
+        # The shared refusal already opens with "Error: " (the verbatim MCP
+        # wording) — printing it as-is keeps one prefix, never a doubled
+        # "Error: Error: ...".
+        print(_rejection_refusal(result, metrics), file=sys.stderr)
+        sys.exit(1)
+
     try:
         _atomic_write(
             path, result.merged_code, backups=backups, encoding=encoding,
@@ -674,6 +754,7 @@ def _cmd_batch_edit_locked(args):
         ConcurrentModificationError,
         _atomic_write,
     )
+    from .write_gates import _all_chunks_rejected, _rejection_refusal
 
     edits_json = sys.stdin.read() if args.edits == "-" else args.edits
     try:
@@ -733,6 +814,25 @@ def _cmd_batch_edit_locked(args):
         _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    # Hallucination gate (MCP parity, Step 18) — same predicate and refusal
+    # wording as cmd_edit's model path above: a fully-rejected batch merge
+    # returns merged_code == the original with parse_valid forced False, so
+    # the parse gate cannot refuse it and only the chunk accounting can.
+    # Refuse before the write; partial rejections keep their existing
+    # write-with-warning behavior (none exists on this tail today).
+    if _all_chunks_rejected(result):
+        tok_per_sec = (
+            result.model_tokens / (result.latency_ms / 1000)
+            if result.latency_ms > 0 else 0
+        )
+        metrics = (
+            f"latency: {result.latency_ms:.0f}ms, "
+            f"{tok_per_sec:.0f} tok/s, {result.model_tokens} tokens"
+        )
+        metrics += _validation_retries_metric(getattr(result, "retries", 0))
+        # The shared refusal already opens with "Error: " — print it as-is.
+        print(_rejection_refusal(result, metrics), file=sys.stderr)
         sys.exit(1)
     try:
         _atomic_write(
@@ -794,6 +894,7 @@ def _cmd_multi_edit_locked(args, file_edits_list):
         ConcurrentModificationError,
         _atomic_write,
     )
+    from .write_gates import _all_chunks_rejected, _rejection_refusal
 
     _backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
@@ -930,7 +1031,32 @@ def _cmd_multi_edit_locked(args, file_edits_list):
     # that was knowable beforehand -- including a concurrent change to any
     # target that PHASE 2.5 or the write-time stat check could detect -- which
     # is the entire defect above.
+    refused_targets: list[str] = []
     for path, merged_code, edit_count, result, _original_hash, read_stat, encoding in pending:
+        # Hallucination gate (MCP parity, Step 18), per target — the same
+        # predicate and refusal wording the edit/batch-edit tails use. A
+        # fully-rejected merge returns merged_code == that target's original
+        # with parse_valid forced False, so PHASE 2's parse gate cannot
+        # refuse it: the target would otherwise be "written" with its own
+        # unchanged bytes and reported Applied. The refused target stays
+        # untouched while the remaining targets still write (partial-batch
+        # semantics, matching fast_multi_edit's refusal handling), and the
+        # command exits 1 afterwards so the caller learns the run did not
+        # fully land.
+        if _all_chunks_rejected(result):
+            tok_per_sec = (
+                result.model_tokens / (result.latency_ms / 1000)
+                if result.latency_ms > 0 else 0
+            )
+            metrics = (
+                f"latency: {result.latency_ms:.0f}ms, "
+                f"{tok_per_sec:.0f} tok/s, {result.model_tokens} tokens"
+            )
+            metrics += _validation_retries_metric(getattr(result, "retries", 0))
+            # The shared refusal already opens with "Error: " — print as-is.
+            print(_rejection_refusal(result, metrics), file=sys.stderr)
+            refused_targets.append(str(path))
+            continue
         try:
             _atomic_write(
                 path, merged_code, backups=backups, encoding=encoding,
@@ -944,6 +1070,8 @@ def _cmd_multi_edit_locked(args, file_edits_list):
             f"latency: {result.latency_ms:.0f}ms, {result.model_tokens} tokens"
             f"{_validation_retries_metric(getattr(result, 'retries', 0))}"
         )
+    if refused_targets:
+        sys.exit(1)
 
 
 def cmd_delete(args):

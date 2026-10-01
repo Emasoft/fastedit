@@ -20,6 +20,7 @@ from ..inference.chunked_merge import (
 from ..io_utils import UnsupportedEncodingError, read_source
 from ..lang_attributes import DocxError, build_docx_bytes, read_docx
 from ..update_check import get_update_notice_async
+from ..write_gates import _all_chunks_rejected, _rejection_refusal
 from .server import ConcurrentModificationError, _atomic_write, mcp
 
 # Once-per-server-session flag — attaches the update banner to the first
@@ -52,31 +53,15 @@ async def _maybe_append_update_notice(message: str) -> str:
 #
 # fast_edit, fast_batch_edit and fast_multi_edit must enforce the SAME
 # signals in the SAME order: the fail-loud hallucination refusal first
-# (never overridable), then the parse gate (force=True opt-in). Sharing the
-# helpers keeps the message shapes identical across the three tools — the
-# single-edit refusals below are quoted verbatim by the batch tools.
+# (never overridable), then the parse gate (force=True opt-in). The two
+# gate helpers above are imported from fastedit.write_gates so the CLI's
+# edit/batch-edit/multi-edit tails enforce the identical predicate with
+# the identical refusal wording — the single-edit refusals below are
+# quoted verbatim by the batch tools. The response-shaped helpers that
+# follow (_partial_rejection_warning, _parse_refusal,
+# _concurrent_modification_error) stay MCP-local: the CLI prints its own
+# established message shapes.
 # ---------------------------------------------------------------------------
-
-
-def _all_chunks_rejected(result) -> bool:
-    """True when every chunk the merge used was rejected as a hallucination.
-
-    The ``> 0`` guard matters: a zero-model batch (pure ``after=`` /
-    ``preserve_siblings=`` splices report ``chunks_used == 0``) must not
-    read as "everything rejected" via ``0 >= 0``.
-    """
-    rejected = getattr(result, "chunks_rejected", 0)
-    return rejected > 0 and rejected >= result.chunks_used
-
-
-def _rejection_refusal(result, metrics: str) -> str:
-    """Fail-loud refusal for an all-chunks-rejected merge. Never
-    force-overridable: a hallucinated merge has no safe interpretation."""
-    return (
-        f"Error: edit rejected — model hallucinated on {result.chunks_rejected} chunk(s). "
-        f"File unchanged. The function may be too large ({result.chunks_used} chunk(s)) "
-        f"for the 1.7B model. Try a smaller edit or split the function. {metrics}"
-    )
 
 
 def _partial_rejection_warning(result, metrics: str) -> str:

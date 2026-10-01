@@ -35,6 +35,10 @@ from ..split_join import mask_string_spans
 # Canonical long-form markers the rest of the pipeline understands.
 _CANONICAL_HASH_MARKER = "# ... existing code ..."
 _CANONICAL_SLASH_MARKER = "// ... existing code ..."
+# Issue #1 (hole 2): the HTML/XML comment idiom is the marker form models
+# emit for markup documents (markdown sections, html elements). It was
+# invisible to every gate below and was written into files literally.
+_CANONICAL_HTML_MARKER = "<!-- ... existing code ... -->"
 
 # Phrases that mark "keep everything here" in snippets. Membership is
 # LINE-ANCHORED (exact match on the stripped line) — substring
@@ -48,6 +52,7 @@ _CANONICAL_SLASH_MARKER = "// ... existing code ..."
 _MARKER_PHRASES = (
     _CANONICAL_HASH_MARKER,
     _CANONICAL_SLASH_MARKER,
+    _CANONICAL_HTML_MARKER,
     # Legacy forms kept for backward compatibility with the pre-B15
     # substring set: a bare "... existing code ..." line, and the
     # ellipsis-only comment stubs.
@@ -60,7 +65,7 @@ _MARKER_PHRASES = (
 # rewritten to the canonical long form before any downstream processing.
 #
 # Detection (stripped line):
-#   - Exact: ``#...``, ``//...``, ``…`` (Unicode ellipsis U+2026)
+#   - Exact: ``#...``, ``//...``, ``<!--...-->``, ``…`` (Unicode ellipsis U+2026)
 #   - Legacy long forms match via exact membership in ``_MARKER_PHRASES``.
 #   - Generic regex catches spacing variants (e.g. ``# ...``, ``// ..``).
 #
@@ -69,6 +74,13 @@ _MARKER_PHRASES = (
 _SHORT_HASH_RE = re.compile(r"^\s*#\s*\.\.\.\s*$")
 _SHORT_SLASH_RE = re.compile(r"^\s*//\s*\.\.\.\s*$")
 _UNICODE_ELLIPSIS_RE = re.compile(r"^\s*…\s*$")
+
+# HTML-comment short form and canonical long form. Both are LINE-ANCHORED:
+# the regex matches a whole line (allowing surrounding whitespace) so the
+# marker text mid-line — ``<p>text <!-- ... existing code ... --></p>`` —
+# stays CONTENT, exactly like the ``#``/``//`` line-anchored rule.
+_SHORT_HTML_RE = re.compile(r"^<!--\s*\.\.\.\s*-->")
+_LONG_HTML_RE = re.compile(r"^<!--\s*\.\.\..*existing.*\.\.\.\s*-->")
 
 # Exact-form set used by ``snippet_has_keep_marker`` (text_match) —
 # deliberately NOT the permissive substring set: "# ..." / "// ..." as
@@ -104,6 +116,11 @@ def is_marker_line(line: str) -> bool:
         or bool(_SHORT_HASH_RE.match(stripped))
         or bool(_SHORT_SLASH_RE.match(stripped))
         or bool(_UNICODE_ELLIPSIS_RE.match(stripped))
+        # HTML/XML comment forms (issue #1 hole 2): the canonical long form
+        # is in _MARKER_PHRASES (stripped exact match); the regexes cover
+        # spacing variants of the long form and the short ``<!--...-->``.
+        or bool(_LONG_HTML_RE.match(stripped))
+        or bool(_SHORT_HTML_RE.match(stripped))
     )
 
 
@@ -114,12 +131,17 @@ def normalize_markers(snippet: str) -> str:
 
       * ``#...``              → ``# ... existing code ...``
       * ``//...``             → ``// ... existing code ...``
+      * ``<!--...-->``        → ``# ... existing code ...`` (HTML short
+        form; same canonical hash target as the other short forms)
       * ``…`` (U+2026)    → ``# ... existing code ...`` (hash form;
         ``is_marker_line`` recognizes the canonical form regardless of
         language, so one canonical form suffices)
 
     Legacy long-form markers (``# ... existing code ...``,
-    ``// ... existing code ...``) are passed through unchanged.
+    ``// ... existing code ...``, and the HTML/XML
+    ``<!-- ... existing code ... -->``) are passed through unchanged
+    (spacing variants of the HTML long form are tightened to the exact
+    canonical text).
 
     Indentation is preserved on the rewritten line so downstream indent
     arithmetic in ``deterministic_edit`` (which uses marker snippet
@@ -166,6 +188,12 @@ def normalize_markers(snippet: str) -> str:
             out.append(indent + _CANONICAL_SLASH_MARKER + term)
         elif stripped == "…":
             out.append(indent + _CANONICAL_HASH_MARKER + term)
+        elif stripped == "<!--...-->":
+            # HTML short form → the canonical hash marker (same rewrite
+            # target as the other short forms: one canonical form suffices
+            # because is_marker_line recognizes the canonical form
+            # regardless of language).
+            out.append(indent + _CANONICAL_HASH_MARKER + term)
         elif _SHORT_HASH_RE.match(masked_body) and "existing" not in masked_body:
             # Covers spacing variants like ``# ...`` / ``#  ...`` that
             # aren't full legacy long-form markers. ``is_marker_line``
@@ -177,6 +205,11 @@ def normalize_markers(snippet: str) -> str:
             out.append(indent + _CANONICAL_SLASH_MARKER + term)
         elif _UNICODE_ELLIPSIS_RE.match(masked_body):
             out.append(indent + _CANONICAL_HASH_MARKER + term)
+        elif _LONG_HTML_RE.match(masked_body.strip()):
+            # Spacing variants of the canonical HTML long form are
+            # rewritten to the exact canonical HTML text (it is already a
+            # member of _MARKER_PHRASES, so this only tightens spacing).
+            out.append(indent + _CANONICAL_HTML_MARKER + term)
         else:
             out.append(raw)
     return "".join(out)

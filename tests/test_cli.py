@@ -306,6 +306,324 @@ class TestCLIEdit:
 # 3. fastedit delete
 # ===================================================================
 
+class TestCLIEditFormatDefinitionLineGuard:
+    """GitHub issue #1 part A: markdown ``--replace`` with a
+    heading-OMITTING snippet used to splice the snippet over the WHOLE
+    section span (the AST anchor covers heading + body), deleting the
+    heading and every body line the snippet did not restate — exit 0,
+    silent corruption.
+
+    The definition-line guard in ``_try_deterministic_replace`` covered
+    only code definition kinds (``_DEFINITION_KINDS``); format symbols
+    (markdown section, json key, css rule, ...) now declare the same
+    requirement declaratively on their ``_FormatSymbolSpec`` row
+    (``definition_line_required=True``), so the guard fires for them too
+    while a heading-restating snippet keeps landing byte-exact.
+    """
+
+    MD_ORIGINAL = (
+        "# T\n"
+        "\n"
+        "## Features\n"
+        "\n"
+        "- A **one**: first\n"
+        "- B **two**: old wording here\n"
+        "- C **three**: third\n"
+        "\n"
+        "## Next\n"
+        "\n"
+        "text\n"
+    )
+
+    def test_edit_replace_markdown_heading_omitted_snippet_refused(
+        self, tmp_path: Path,
+    ):
+        """The issue-#1 repro shape: --replace Features with a snippet that
+        restates only two body lines. Must exit 1 with the definition-line
+        refusal and leave the file byte-for-byte unchanged."""
+        target = tmp_path / "doc.md"
+        target.write_text(self.MD_ORIGINAL)
+        snippet = "- A **one**: first\n- B **two**: new wording here\n"
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--replace", "Features",
+        )
+
+        assert result.returncode == 1, (
+            f"expected refusal, stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert (
+            "Error: snippet for 'Features' (kind: section) has no definition "
+            "line of its own"
+        ) in result.stderr, result.stderr
+        assert target.read_text() == self.MD_ORIGINAL
+        assert "Applied edit" not in result.stdout
+
+    def test_edit_replace_markdown_whole_section_snippet_rewrites_byte_exact(
+        self, tmp_path: Path,
+    ):
+        """The legal shape: the snippet restates the heading (the section's
+        definition line) and the whole body, so the section swap lands
+        byte-exact. Must keep working."""
+        target = tmp_path / "doc.md"
+        target.write_text(self.MD_ORIGINAL)
+        snippet = (
+            "## Features\n"
+            "\n"
+            "- A **one**: first\n"
+            "- B **two**: new wording here\n"
+            "- C **three**: third\n"
+        )
+        expected = (
+            "# T\n"
+            "\n"
+            "## Features\n"
+            "\n"
+            "- A **one**: first\n"
+            "- B **two**: new wording here\n"
+            "- C **three**: third\n"
+            "\n"
+            "## Next\n"
+            "\n"
+            "text\n"
+        )
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--replace", "Features",
+        )
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "Applied edit to" in result.stdout
+        assert target.read_text() == expected
+
+    def test_edit_replace_json_value_wipe_snippet_refused(
+        self, tmp_path: Path,
+    ):
+        """Single-line JSON key with a wiped value ('"name": ') — the value
+        is lost and the fragment is not a valid JSON document, so the edit
+        is refused and the file is unchanged."""
+        original = '{\n  "name": "old",\n  "version": "1.0.0"\n}\n'
+        target = tmp_path / "data.json"
+        target.write_text(original)
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", '"name": ',
+            "--replace", "name",
+        )
+
+        assert result.returncode == 1
+        assert "not valid json" in result.stderr, result.stderr
+        assert target.read_text() == original
+
+
+class TestCLIEditDeterministicFaithfulness:
+    """GitHub issue #1 part B, hole 1: the CLI's
+    ``_try_deterministic_replace`` returned text-match and direct-swap
+    results WITHOUT the content battery that ``chunked_merge`` runs on the
+    same editor output — so a battery-failing splice landed unwritten-
+    validated with exit 0.
+
+    (a) a ``# ... existing code ...`` snippet consumed by the CLI text-match
+        path used to splice an editor output that dropped the preserved-gap
+        semantics (marker written literally / body duplicated). After the fix
+        the result must be FAITHFUL: every unmentioned original body line
+        survives exactly once (preserve-by-default), the marker never lands
+        in the file.
+
+    (b) a direct-swap snippet that restates the definition line but drops
+        unmentioned body lines (a format symbol whose "signature" is its
+        first line) must NOT be spliced: the deterministic branch declines
+        and the CLI falls through to the validated model path. For a
+        hermetic test the model path is stubbed via the established CLI stub
+        pattern (``_make_backend_with_overrides`` → fake backend; model
+        result must honor the battery) and the fall-through is proven by
+        the stub having been reached with a zero-token result shape.
+    """
+
+    MD_ORIGINAL = (
+        "# T\n"
+        "\n"
+        "## Features\n"
+        "\n"
+        "- A **one**: first\n"
+        "- B **two**: old wording here\n"
+        "- C **three**: third\n"
+        "\n"
+        "## Next\n"
+        "\n"
+        "text\n"
+    )
+
+    def test_edit_replace_marker_snippet_via_text_match_is_faithful(
+        self, tmp_path: Path,
+    ):
+        """Case e of the repro: ``## Features`` + ``# ... existing code ...``
+        + one changed line. The CLI text-match path consumes the snippet;
+        the battery must ratify ONLY a preserve-by-default output: body
+        lines preserved exactly once, no marker leaked, no duplicate."""
+        target = tmp_path / "doc_e.md"
+        target.write_text(self.MD_ORIGINAL)
+        snippet = (
+            "## Features\n"
+            "# ... existing code ...\n"
+            "- B **two**: new wording here\n"
+        )
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--replace", "Features",
+        )
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "Applied edit to" in result.stdout
+        content = target.read_text()
+        # The marker is a directive, never content:
+        assert "existing code" not in content, content
+        # Preserve-by-default: every original body line survives exactly once.
+        assert content.count("- A **one**: first") == 1, content
+        assert content.count("- C **three**: third") == 1, content
+        # The changed line landed exactly once.
+        assert content.count("- B **two**: new wording here") == 1, content
+        # The old wording did not silently duplicate alongside the new one
+        # beyond its one preserved/restated occurrence.
+        assert content.count("- B **two**: old wording here") <= 1, content
+        # Sections other than the target are byte-identical.
+        assert "## Next\n\ntext\n" in content, content
+
+    def test_edit_replace_direct_swap_dropping_body_lines_falls_through_to_model_path(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """A markdown --replace snippet that restates the heading but drops
+        unmentioned body lines cannot be served by a wholesale swap (the
+        grammar gives a section no complete-re-definition proof). The
+        deterministic branch must decline — fall through to the model path,
+        which is validated. Hermetic: chunked_merge is stubbed (the
+        established CLI stub pattern) and asserts the fall-through happened
+        by serving a battery-honoring merge."""
+        import fastedit.inference.chunked_merge as chunked_merge_module
+        from fastedit import cli as cli_module
+        from fastedit.inference.ast_utils import ChunkedMergeResult
+
+        target = tmp_path / "doc_b.md"
+        target.write_text(self.MD_ORIGINAL)
+        # Restates the definition line (## Features) but drops the other two
+        # body lines without any marker — the part-A flag passes (the
+        # heading IS restated), so only the new battery wrap catches it.
+        snippet = (
+            "## Features\n"
+            "- B **two**: new wording here\n"
+        )
+
+        deterministic_declined: list[bool] = []
+        real_try = cli_module._try_deterministic_replace
+
+        def spy_try(*a, **kw):
+            result = real_try(*a, **kw)
+            deterministic_declined.append(result is None)
+            return result
+
+        monkeypatch.setattr(cli_module, "_try_deterministic_replace", spy_try)
+
+        MODEL_MERGED = (
+            "# T\n"
+            "\n"
+            "## Features\n"
+            "\n"
+            "- A **one**: first\n"
+            "- B **two**: new wording here\n"
+            "- C **three**: third\n"
+            "\n"
+            "## Next\n"
+            "\n"
+            "text\n"
+        )
+
+        def stubbed_chunked_merge(*a, **kw):
+            # The stub mimics the validated model path: the REAL model path
+            # runs the full battery over its output before returning, and
+            # the CLI's write gates run after. The stub hands back the
+            # preserve-by-default merge a battery-honoring path would
+            # produce for this edit.
+            return ChunkedMergeResult(
+                merged_code=MODEL_MERGED,
+                parse_valid=True,
+                chunks_used=1,
+                chunk_regions=[(3, 7)],
+                model_tokens=0,
+                latency_ms=0.0,
+            )
+
+        monkeypatch.setattr(
+            chunked_merge_module, "chunked_merge", stubbed_chunked_merge,
+        )
+        monkeypatch.setenv("FASTEDIT_NO_UPDATE_CHECK", "1")
+
+        # Drive cmd_edit in-process (the spy cannot cross a process boundary).
+        argv_backup = sys.argv
+        sys.argv = [
+            "fastedit", "edit", str(target),
+            "--snippet", snippet, "--replace", "Features",
+        ]
+        try:
+            cli_module.main()
+        finally:
+            sys.argv = argv_backup
+
+        # The fall-through DID happen: the deterministic branch declined.
+        assert deterministic_declined == [True], (
+            f"expected the deterministic branch to decline; got {deterministic_declined}"
+        )
+        # The validated model-path result was written.
+        out = capsys.readouterr().out
+        assert "Applied edit to" in out, out
+        assert target.read_text() == MODEL_MERGED
+
+    def test_edit_replace_direct_swap_keeps_working_for_complete_redefinition(
+        self, tmp_path: Path,
+    ):
+        """Control: a snippet that restates the heading AND every body line
+        is a complete re-definition — the direct swap keeps landing
+        byte-exact (no battery regression on the wholesale path)."""
+        target = tmp_path / "doc_g.md"
+        target.write_text(self.MD_ORIGINAL)
+        snippet = (
+            "## Features\n"
+            "\n"
+            "- A **one**: first\n"
+            "- B **two**: new wording here\n"
+            "- C **three**: third\n"
+        )
+        expected = (
+            "# T\n"
+            "\n"
+            "## Features\n"
+            "\n"
+            "- A **one**: first\n"
+            "- B **two**: new wording here\n"
+            "- C **three**: third\n"
+            "\n"
+            "## Next\n"
+            "\n"
+            "text\n"
+        )
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--replace", "Features",
+        )
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "Applied edit to" in result.stdout
+        assert target.read_text() == expected
+
+
 class TestCLIDelete:
     """Tests for `fastedit delete <file> <symbol>`."""
 

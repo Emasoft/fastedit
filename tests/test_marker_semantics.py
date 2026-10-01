@@ -542,3 +542,283 @@ def test_unescape_only_maps_its_own_nonce():
     escaped = _escape_tags(text, "aaaa1111")
     assert _unescape_tags(escaped, "bbbb2222") == escaped
     assert _unescape_tags(escaped, "aaaa1111") == text
+
+
+# ===========================================================================
+# Section 3 — the HTML-comment marker form (issue #1 hole 2).
+#
+#   ``<!-- ... existing code ... -->`` is the canonical HTML/XML comment
+#   idiom and was INVISIBLE to every marker gate: ``_MARKER_PHRASES`` and
+#   the short-form regexes only knew ``#`` and ``//`` prefixes, so the
+#   marker line was written into files literally (case f of the repro).
+#
+#   The grammar is LINE-ANCHORED like every other form: a bare (or
+#   indented) ``<!-- ... existing code ... -->`` line IS a marker; the
+#   same text mid-line — ``<p>text <!-- ... existing code ... --></p>``
+#   — is CONTENT and must survive every merge untouched.
+# ===========================================================================
+
+from fastedit.inference.markers import is_marker_line
+
+_HTML_MARKER = "<!-- ... existing code ... -->"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _HTML_MARKER,
+        "  " + _HTML_MARKER,
+        "\t" + _HTML_MARKER,
+    ],
+    ids=["bare", "indented-spaces", "indented-tab"],
+)
+def test_is_marker_line_true_for_html_comment_form(line):
+    """The canonical HTML-comment keep-marker is a marker line, bare or
+    indented — line-anchored on stripped content like every other form."""
+    assert is_marker_line(line) is True, line
+
+
+def test_is_marker_line_false_for_mid_line_html_marker():
+    """A marker phrase embedded mid-line is CONTENT (the line-anchored
+    rule): ``<p>text <!-- ... existing code ... --></p>`` must survive the
+    merge and must never be treated as a directive."""
+    assert is_marker_line("<p>text <!-- ... existing code ... --></p>") is False
+
+
+def test_is_marker_line_false_for_partial_html_marker_shapes():
+    """Near-miss lines are content: a comment about the marker, an unclosed
+    opener, and a different comment payload are not directives."""
+    assert is_marker_line("<!-- the marker below is documented -->") is False
+    assert is_marker_line("<!-- ... existing code ...") is False
+    assert is_marker_line("<!-- do not remove -->") is False
+
+
+def test_normalize_markers_rewrites_html_short_form():
+    """The short HTML form ``<!--...-->`` is rewritten to the canonical
+    hash marker like the other short forms."""
+    assert normalize_markers("<!--...-->\n") == "# ... existing code ...\n"
+    assert normalize_markers("x\n<!--...-->\n") == (
+        "x\n# ... existing code ...\n"
+    )
+
+
+def test_normalize_markers_keeps_canonical_html_form_unchanged():
+    """The canonical HTML form passes through normalization unchanged (it is
+    already canonical) and is recognized as a marker afterward."""
+    assert normalize_markers(_HTML_MARKER + "\n") == _HTML_MARKER + "\n"
+    assert is_marker_line(_HTML_MARKER) is True
+
+
+def test_normalize_markers_preserves_html_marker_indent():
+    """Indentation on a rewritten HTML short form is preserved, matching the
+    other short forms' indent semantics."""
+    assert normalize_markers("  <!--...-->\n") == (
+        "  # ... existing code ...\n"
+    )
+
+
+def test_normalize_markers_leaves_html_marker_inside_string_alone():
+    """B18 string-awareness covers the HTML form too: a marker-looking line
+    inside a triple-quoted string is user data, never rewritten."""
+    snippet = (
+        "x = 1\n"
+        'template = """\n'
+        + _HTML_MARKER + "\n"
+        '"""\n'
+    )
+    assert normalize_markers(snippet) == snippet
+
+
+def test_normalize_markers_still_recognizes_html_marker_after_string_closes():
+    """A HTML marker line AFTER the closing delimiter is a real directive
+    (string masking is span-local): the canonical form passes through
+    normalization unchanged and is still recognized as a marker — a short
+    form in the same position would be rewritten."""
+    snippet = 'template = """\n' + _HTML_MARKER + '\n"""\n' + _HTML_MARKER + "\n"
+    normalized = normalize_markers(snippet)
+    assert normalized.splitlines()[-1] == _HTML_MARKER
+    assert is_marker_line(normalized.splitlines()[-1]) is True
+    # The in-string copy stays untouched user data.
+    assert normalized.splitlines()[1] == _HTML_MARKER
+    rewritten = normalize_markers(
+        'template = """\n' + _HTML_MARKER + '\n"""\n<!--...-->\n'
+    )
+    assert rewritten.splitlines()[-1] == "# ... existing code ..."
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: an after= snippet carrying the HTML marker behaves exactly
+# like the # marker — the directive is dropped, never written literally.
+# ---------------------------------------------------------------------------
+
+
+def test_after_path_drops_html_comment_marker(tmp_path):
+    """Case f of the repro, at the merge layer: ``<!-- ... existing code
+    ... -->`` in an after= snippet is a directive and must be dropped, not
+    spliced into the file as a literal comment."""
+    snippet = (
+        "def gamma():\n"
+        + _HTML_MARKER + "\n"
+        "    return 3\n"
+    )
+
+    result = _merge_after(
+        tmp_path, "marker_html.py", _ORIGINAL_LF, snippet, after="alpha"
+    )
+
+    assert result.model_tokens == 0
+    assert result.parse_valid is True, result.merged_code
+    assert result.merged_code == _EXPECTED_GAMMA_LF, (
+        f"HTML-comment marker leaked into the splice:\n{result.merged_code!r}"
+    )
+
+
+def test_after_path_marker_only_html_snippet_is_rejected_loudly(tmp_path):
+    """A snippet made only of HTML markers declares no insertable code and
+    must fail loudly like every other marker-only after= snippet."""
+    with pytest.raises(ValueError, match="no insertable code"):
+        _merge_after(
+            tmp_path, "reject_html.py", _ORIGINAL_LF,
+            _HTML_MARKER + "\n", after="alpha",
+        )
+
+
+def test_after_path_normalizes_html_short_form_then_drops_it(tmp_path):
+    """The short HTML form ``<!--...-->`` is normalized to the canonical
+    marker and then dropped like any other marker line."""
+    snippet = (
+        "def gamma():\n"
+        "<!--...-->\n"
+        "    return 3\n"
+    )
+
+    result = _merge_after(
+        tmp_path, "marker_html_short.py", _ORIGINAL_LF, snippet, after="alpha"
+    )
+
+    assert result.model_tokens == 0
+    assert result.merged_code == _EXPECTED_GAMMA_LF, (
+        f"short HTML marker leaked into the splice:\n{result.merged_code!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end markdown (issue #1 repro case f, whole pipeline): a
+# replace=<section> snippet carrying the HTML marker flows through
+# chunked_merge exactly like the # marker — the leak-guard/battery sees it,
+# and the marker is never written into the file literally.
+# ---------------------------------------------------------------------------
+
+_MD_ORIGINAL = (
+    "# Guide\n"
+    "\n"
+    "Intro paragraph.\n"
+    "\n"
+    "## Usage\n"
+    "\n"
+    "Usage notes.\n"
+    "\n"
+    "## Next\n"
+    "\n"
+    "more text\n"
+)
+
+
+def _merge_md_replace(tmp_path, model_merged_code, snippet, calls):
+    """Drive chunked_merge on a markdown replace= with a stubbed model that
+    always returns ``model_merged_code`` (recorded per call in ``calls``)."""
+    from types import SimpleNamespace
+
+    file_path = tmp_path / "doc.md"
+    file_path.write_text(_MD_ORIGINAL)
+
+    def merge_fn(chunk, snippet_text, language):
+        calls.append(snippet_text)
+        return SimpleNamespace(
+            merged_code=model_merged_code, parse_valid=True,
+            tokens_generated=7, latency_ms=1.0, truncated=False,
+        )
+
+    return chunked_merge(
+        original_code=_MD_ORIGINAL,
+        snippet=snippet,
+        file_path=str(file_path),
+        merge_fn=merge_fn,
+        language="markdown",
+        replace="Usage",
+    )
+
+
+def test_md_replace_html_marker_tail_preserved_never_written(tmp_path):
+    """The HTML marker in a markdown replace= snippet is a directive: the
+    text-match path consumes it and the merged output preserves the section
+    tail with the new line appended — the marker itself never reaches the
+    file (repro case f: it used to be written literally)."""
+    snippet = (
+        "## Usage\n"
+        "<!-- ... existing code ... -->\n"
+        "Updated usage notes.\n"
+    )
+    expected = (
+        "# Guide\n"
+        "\n"
+        "Intro paragraph.\n"
+        "\n"
+        "## Usage\n"
+        "\n"
+        "Usage notes.\n"
+        "Updated usage notes.\n"
+        "\n"
+        "## Next\n"
+        "\n"
+        "more text\n"
+    )
+    calls: list[str] = []
+
+    result = _merge_md_replace(tmp_path, expected, snippet, calls)
+
+    # Zero-token: the deterministic text-match path placed the edit.
+    assert calls == [], "the model must not be needed for a placed marker edit"
+    assert result.merged_code == expected, result.merged_code
+    assert "existing code" not in result.merged_code, result.merged_code
+    assert result.model_tokens == 0
+
+
+def test_md_replace_model_leaked_html_marker_is_rejected_by_battery(tmp_path):
+    """The leak-guard sees the HTML form: a model merge that echoes the
+    ``<!-- ... existing code ... -->`` line into its output fails the
+    content-faithfulness battery on every retry and the chunk is rejected —
+    the original markdown is kept and the marker is never persisted."""
+    snippet = (
+        "## Usage\n"
+        "First inserted line.\n"
+        "<!-- ... existing code ... -->\n"
+        "Second inserted line.\n"
+    )
+    leaked = (
+        "# Guide\n"
+        "\n"
+        "Intro paragraph.\n"
+        "\n"
+        "## Usage\n"
+        "\n"
+        "First inserted line.\n"
+        "<!-- ... existing code ... -->\n"
+        "Usage notes.\n"
+        "Second inserted line.\n"
+        "\n"
+        "## Next\n"
+        "\n"
+        "more text\n"
+    )
+    calls: list[str] = []
+
+    result = _merge_md_replace(tmp_path, leaked, snippet, calls)
+
+    # The model path ran (ambiguous marker position) and was retried.
+    assert len(calls) >= 2, calls
+    # Rejection convention: original kept, every chunk reported rejected.
+    assert result.chunks_rejected >= 1
+    assert result.chunks_rejected >= result.chunks_used
+    assert result.merged_code == _MD_ORIGINAL, result.merged_code
+    assert "existing code" not in result.merged_code

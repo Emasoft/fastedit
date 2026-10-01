@@ -654,6 +654,17 @@ class _FormatSymbolSpec:
             The trim is content-preserving: blank lines carry no symbol
             content, and the following construct's own leading layout is
             untouched.
+        definition_line_required: the format symbol's FIRST line is its
+            signature — the anchor line that names it (a markdown heading,
+            a TOML ``[table]`` header, an SQL ``CREATE TABLE``, an HTML
+            open tag) — so a ``replace=`` snippet that does not restate
+            that line cannot be swapped over the symbol's span without
+            deleting it (issue #1 part A: a heading-omitting markdown
+            snippet spliced over the section span deleted the heading and
+            every unlisted body line). Consumers of the AST map check this
+            flag with the same voice the code-language definition-kind
+            guard uses; ``False`` keeps code-language behavior governed by
+            the consumer's own ``_DEFINITION_KINDS`` floor.
     """
 
     node_types: tuple[str, ...]
@@ -662,6 +673,7 @@ class _FormatSymbolSpec:
     recurse: bool = False
     kind_by_node: dict[str, str] = field(default_factory=dict)
     trim_trailing_blank_lines: bool = False
+    definition_line_required: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -714,18 +726,24 @@ class _FormatSymbolSpec:
 #   bash       (in _FUNCTION_LIKE_NODE_TYPES) `function_definition`.
 #              Shell variable assignments are deliberately not symbols.
 # ---------------------------------------------------------------------------
+# Every row carries definition_line_required=True: each listed symbol's
+# first line IS the line that names it (heading, [table] header, CREATE
+# TABLE, open tag, AS alias...), so a replace= snippet omitting it would
+# delete the symbol's own signature — see the flag's docstring.
 _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
     "html": _FormatSymbolSpec(
         node_types=("element",),
         kind="element",
         extract=_html_element_name,
         recurse=True,
+        definition_line_required=True,
     ),
     "xml": _FormatSymbolSpec(
         node_types=("element",),
         kind="element",
         extract=_xml_element_name,
         recurse=True,
+        definition_line_required=True,
     ),
     "markdown": _FormatSymbolSpec(
         node_types=("section",),
@@ -733,28 +751,33 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
         extract=_markdown_section_name,
         recurse=True,
         trim_trailing_blank_lines=True,
+        definition_line_required=True,
     ),
     "json": _FormatSymbolSpec(
         node_types=("pair",),
         kind="key",
         extract=_json_pair_name,
         recurse=True,
+        definition_line_required=True,
     ),
     "yaml": _FormatSymbolSpec(
         node_types=("block_mapping_pair",),
         kind="key",
         extract=_yaml_key_name,
         recurse=True,
+        definition_line_required=True,
     ),
     "css": _FormatSymbolSpec(
         node_types=("rule_set",),
         kind="rule",
         extract=_css_rule_name,
+        definition_line_required=True,
     ),
     "toml": _FormatSymbolSpec(
         node_types=("table", "table_array_element"),
         kind="table",
         extract=_toml_table_name,
+        definition_line_required=True,
     ),
     "sql": _FormatSymbolSpec(
         node_types=(
@@ -769,11 +792,13 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
             "create_index": "index",
         },
         extract=_sql_object_name,
+        definition_line_required=True,
     ),
     "dockerfile": _FormatSymbolSpec(
         node_types=("from_instruction",),
         kind="stage",
         extract=_dockerfile_stage_name,
+        definition_line_required=True,
     ),
     # B3: all-grammars extra, sampled by the golden matrix. Schema type
     # definitions are the addressable symbols of a GraphQL document.
@@ -785,6 +810,7 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
         ),
         kind="type",
         extract=_name_field_name,
+        definition_line_required=True,
     ),
     # G1b: the two census languages whose grammar quirks G1a bounded (cobol
     # wedges its error recovery; test emits a systematic MISSING-at-EOF
@@ -811,11 +837,13 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
         },
         extract=_cobol_symbol_name,
         recurse=True,
+        definition_line_required=True,
     ),
     "test": _FormatSymbolSpec(
         node_types=("test",),
         kind="record",
         extract=_test_record_name,
+        definition_line_required=True,
     ),
 }
 

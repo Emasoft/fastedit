@@ -360,6 +360,68 @@ def _deterministic_result_is_faithful(
     ) == 1.0
 
 
+def _snippet_splice_covers_deleted_lines(
+    original_func: str,
+    snippet_text: str,
+) -> bool:
+    """Completeness check for a WHOLESALE symbol swap (issue #1, hole 1).
+
+    A direct swap is legitimate exactly when it is a COMPLETE re-definition
+    of the target symbol. For code symbols the grammar gives that proof
+    structurally: the direct-swap branch's single-definition parse plus the
+    bracket-balance equality (snippet balance == span balance) certify that
+    the snippet closes the symbol the span opens. For FORMAT symbols
+    (markdown sections, json keys, yaml keys, ...) there is no closing
+    delimiter — nothing structural distinguishes a complete re-definition
+    from a snippet that restates the definition line and silently drops the
+    rest of the body.
+
+    This predicate supplies the missing proof declaratively, in the
+    vocabulary the content validator already uses: classify the snippet
+    against the span with the editor's own classifier
+    (:func:`text_match._classify_edit_lines`), then require that every
+    non-blank original content line the swap deletes is covered by a
+    declared new line (``len(deleted) <= len(new)``). A snippet that
+    restates the definition line and one body line while the section has
+    three fails; a snippet restating heading + full body passes. Blank
+    lines and marker lines carry no comparable content and are skipped on
+    both sides (same convention as :func:`_raw_content_lines`), so the
+    count arithmetic is content-only.
+
+    This is a NECESSARY condition, not the preserve-by-default validator:
+    a swap may legitimately rewrite every body line, so per-line deletion
+    justification (keyed identity, positional adjacency) does not apply
+    here. The gate catches the dropped-body corruption shape; the parse
+    gate and the CLI's caller-side checks keep their existing roles.
+    """
+    from .text_match import _AmbiguousAnchorBinding, _classify_edit_lines
+
+    raw_lines = original_func.splitlines()
+    try:
+        classified = _classify_edit_lines(
+            raw_lines, snippet_text.splitlines(), 0,
+        )
+    except _AmbiguousAnchorBinding:
+        # The gate fails closed for the same inputs the editor declines.
+        return False
+
+    content_idx: dict[int, int] = {}
+    ci = 0
+    for ri, ln in enumerate(raw_lines):
+        if not ln.strip() or is_marker_line(ln):
+            continue
+        content_idx[ri] = ci
+        ci += 1
+
+    bound = {
+        c[2] for c in classified
+        if c[0] == "context" and c[2] in content_idx
+    }
+    deleted = [ci for ri, ci in content_idx.items() if ri not in bound]
+    new_lines = [c for c in classified if c[0] == "new"]
+    return len(deleted) <= len(new_lines)
+
+
 def _classify_snippet_raw(
     snippet: str,
     orig: list[str],
@@ -2396,19 +2458,49 @@ def chunked_merge(
                             parse_diagnostics(merged, language),
                         )
 
-                    _log.info(
-                        "Direct-swap for replace='%s' (L%d-L%d): "
-                        "0 model tokens, %d snippet lines",
-                        replace, func_start + 1, func_end, len(snippet_lines),
-                    )
-                    return ChunkedMergeResult(
-                        merged_code=merged,
-                        parse_valid=parse_valid,
-                        chunks_used=0,
-                        chunk_regions=[],
-                        model_tokens=0,
-                        latency_ms=0.0,
-                    )
+                    # Issue #1 (hole 1): parse validity cannot see content
+                    # corruption in a wholesale swap. For a CODE symbol the
+                    # branch's structural proof stands: the snippet parsed
+                    # as exactly one definition and the bracket balance
+                    # matches the span's, so it IS the complete new symbol.
+                    # A FORMAT symbol (definition_line_required spec row)
+                    # has no closing delimiter — nothing structural
+                    # distinguishes a complete re-definition from a snippet
+                    # restating the definition line while dropping body
+                    # lines — so the splice-completeness check supplies the
+                    # missing proof. Failing it → decline to the validated
+                    # model path, never write the mangled swap.
+                    from .ast_utils import _FORMAT_SYMBOL_SPECS
+                    format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
+                    format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
+                    if (
+                        format_spec is not None
+                        and format_spec.definition_line_required
+                        and not _snippet_splice_covers_deleted_lines(
+                            original_func, snippet_text,
+                        )
+                    ):
+                        _log.warning(
+                            "Direct-swap for replace='%s' would delete "
+                            "original lines the snippet does not restate; "
+                            "discarding it and falling through to the "
+                            "validated model path",
+                            replace,
+                        )
+                    else:
+                        _log.info(
+                            "Direct-swap for replace='%s' (L%d-L%d): "
+                            "0 model tokens, %d snippet lines",
+                            replace, func_start + 1, func_end, len(snippet_lines),
+                        )
+                        return ChunkedMergeResult(
+                            merged_code=merged,
+                            parse_valid=parse_valid,
+                            chunks_used=0,
+                            chunk_regions=[],
+                            model_tokens=0,
+                            latency_ms=0.0,
+                        )
 
             _log.info(
                 "Deterministic text-match and direct-swap failed for "
