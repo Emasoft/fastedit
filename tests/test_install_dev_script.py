@@ -1,15 +1,18 @@
 """Contract tests for scripts/install-dev.sh — the one installer.
 
-Covers both forward modes (fork install pinned to a git ref, --dev editable
-install from the working tree), the interactive source menu, branch
-autodetect, the model-cache preflight (VALID kept / STALE removed), the
-all-grammars prompt/flag, the agent-skill install (Vercel skills CLI, sourced
-from this clone's local tree — never a GitHub URL or the repo shorthand,
-which would resolve the fork's default branch and its legacy claude-skill
-content), the revert path, the dry-run
-transcript, the --check read-only state report, and the successful-install
-footer (the from-scratch one-liners plus the stale-main branch pin note),
-all through the script's real CLI.
+The ONE install shape is an editable install from a local clone: running the
+script inside a fastedit checkout installs THAT working tree; a standalone
+copy (curl|bash — no pyproject.toml beside the script) maintains the
+installer-managed clone at ~/.fastedit/src (override: FASTEDIT_CLONE_DIR),
+cloned on first run and fetched/hard-reset to the tracked branch on every
+run after. There is no source menu, and --dev is accepted as a no-op
+compatibility flag. Covers the model-cache preflight (VALID kept / STALE
+removed), the all-grammars prompt/flag, the agent-skill install (Vercel
+skills CLI, sourced from the SAME clone the package comes from), the revert
+path (which removes the default managed clone), the dry-run transcript, the
+--check read-only state report, and the successful-install footer (the
+from-scratch one-liners plus the stale-main branch pin note), all through
+the script's real CLI.
 """
 
 from __future__ import annotations
@@ -33,44 +36,28 @@ FORK_URL = "https://github.com/Emasoft/fastedit"
 INSTALLABLE_BRANCH = "feat/create-file"
 
 
-def run(*args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess[str]:
-    # stdin=DEVNULL pins the installer to a non-TTY stdin so neither the
-    # source menu nor the all-grammars prompt can ever block a test waiting
-    # on a human, no matter how pytest itself was launched. The non-TTY path
-    # is itself under test: the menu is skipped, all-grammars defaults to yes
-    # with a one-line notice, and a stale model cache is removed without
-    # asking.
+def run(*args: str, env_extra: dict | None = None, script: Path = SCRIPT) -> subprocess.CompletedProcess[str]:
+    # stdin=DEVNULL pins the installer to a non-TTY stdin so the all-grammars
+    # prompt can never block a test waiting on a human, no matter how pytest
+    # itself was launched. The non-TTY path is itself under test: all-grammars
+    # defaults to yes with a one-line notice, and a stale model cache is
+    # removed without asking. `script` lets the managed-clone tests run a
+    # standalone copy of the installer (no fastedit checkout beside it).
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
-        [str(SCRIPT), *args],
+        [str(script), *args],
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
-        timeout=30,
+        # Generous budget: dry runs are sub-second idle, but the full suite
+        # loads the machine and an oversubscribed uv invocation must surface
+        # as a test failure, not as a hang.
+        timeout=90,
         check=False,
         env=env,
     )
-
-
-def _autodetected_branch() -> str:
-    """The branch install-dev.sh autodetects for THIS clone.
-
-    Mirrors the script's `git -C <repo> rev-parse --abbrev-ref HEAD`: a fork
-    run from inside a clone with no explicit --ref installs THAT clone's
-    current branch. A detached HEAD returns "HEAD" and the script falls back
-    to its built-in default; these tests need a real branch.
-    """
-    result = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, timeout=10, check=False,
-    )
-    branch = result.stdout.strip()
-    assert branch and branch != "HEAD", (
-        f"expected the repo to be on a real branch, got {branch!r} ({result.stderr})"
-    )
-    return branch
 
 
 def spec_argv(stdout: str, prefix: str) -> str:
@@ -79,8 +66,9 @@ def spec_argv(stdout: str, prefix: str) -> str:
     Asserts the spec is copy-pasteable as ONE argv token (shlex.split
     backslash-unescapes it back to the original string) rather than
     checking for a literal quoting style, since printf %q's escaping
-    convention can vary. The spec is the LAST token on the line in both
-    modes -- `--force --editable` precedes it only in dev mode.
+    convention can vary. The spec is the LAST token on the line --
+    `--force --editable` always precedes it: every install shape is an
+    editable install from a local clone.
     """
     for line in stdout.splitlines():
         if line.startswith(f"+ {prefix}"):
@@ -136,42 +124,39 @@ def _with_all_grammars(extras: str) -> str:
     return f"{extras},all-grammars" if extras else "all-grammars"
 
 
-def _fork_spec(extras: str, ref: str | None = None) -> str:
-    """The fork-mode package spec for an extras list (possibly empty).
+def _checkout_spec(extras: str) -> str:
+    """The install spec for a run inside this checkout: `REPO_ROOT[extras]`.
 
-    ref=None means the AUTODETECTED branch -- what the script installs when it
-    runs from inside this clone with no explicit --ref.
+    There is no fork-git-URL install shape any more: the ONE install shape is
+    an editable install from a local clone, so from inside this repo every
+    spec is this working tree's path, with or without bracketed extras.
     """
-    if ref is None:
-        ref = _autodetected_branch()
     if extras:
-        return f"fastedits[{extras}] @ git+{FORK_URL}@{ref}"
-    return f"fastedits @ git+{FORK_URL}@{ref}"
+        return f"{REPO_ROOT}[{extras}]"
+    return str(REPO_ROOT)
 
 
 def _run_with_pty_stdin(feed: bytes, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the installer with a pty as stdin, write `feed` as the answers.
 
     These are REAL full-installer runs (no --dry-run) with a hard 30s
-    subprocess budget, so they opt out of the agent-skill axis (--no-skill):
-    two live npx calls measure ~7s+ each on this machine and would blow the
-    budget for tests whose subject is the source menu and the grammar prompt.
-    The skill axis is covered hermetically by TestAgentSkillInstall instead.
+    subprocess budget, so they opt out of every axis whose subject is not the
+    prompt: --no-skill skips two live npx calls (~7s+ each) and --no-model
+    skips `fastedit pull` plus `fastedit doctor`. Neither lever touches the
+    grammar prompt under test; the skill axis is covered hermetically by
+    TestAgentSkillInstall instead.
 
-    Extra args go through to the script. On a TTY the script asks up to two
-    questions IN ORDER -- first the source menu ("Install from: [1/2]", only
-    when a fastedit clone sits next to the script), then the all-grammars
-    [Y/n] prompt -- so `feed` must carry one line per question to answer
-    (e.g. b"2\\nn\\n" = fork install, grammars no). The master side stays open
-    until the child exits: closing it early makes the slave's read fail
-    instead of delivering buffered input, which would silently flip every
-    answer to the Enter default.
+    Extra args go through to the script. On a TTY the script asks the
+    all-grammars [Y/n] question, so `feed` must carry one line to answer
+    (e.g. b"n\\n" = grammars no). The master side stays open until the child
+    exits: closing it early makes the slave's read fail instead of delivering
+    buffered input, which would silently flip the answer to the Enter default.
     """
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
     try:
         proc = subprocess.Popen(
-            [str(SCRIPT), "--no-skill", *args],
+            [str(SCRIPT), "--no-skill", "--no-model", *args],
             stdin=slave,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -186,7 +171,10 @@ def _run_with_pty_stdin(feed: bytes, *args: str) -> subprocess.CompletedProcess[
     # consumes it, so there is no write-before-read race to sleep away.
     os.write(master, feed)
     try:
-        out, err = proc.communicate(timeout=30)
+        # Generous budget: the real install steps take ~10s idle, and the full
+        # suite loads the machine — an oversubscribed run must surface as a
+        # test failure, not as a hang.
+        out, err = proc.communicate(timeout=90)
     except subprocess.TimeoutExpired:
         proc.kill()
         raise
@@ -213,6 +201,13 @@ def _stub_toolchain(
     reporting nothing, to test the failure-tolerant path. PATH is restricted
     to the stubs plus /usr/bin:/bin so the real uv (and the venv's real
     fastedit) on this machine can never be reached.
+
+    A `git` stub is included so a standalone (managed-clone) run stays
+    hermetic: the installer fetches/checks-out/resets the managed clone
+    through git, and a real `git fetch origin <ref>` here would hit the
+    network. The stub logs its argv to .git-args files under the stub dir
+    (appended, newline-delimited, shell-quoted) so tests can assert which git
+    steps ran, without the managed clone itself observing a fake git.
     """
     fake = tmp_path / "stub-bin"
     fake.mkdir()
@@ -259,9 +254,42 @@ def _stub_toolchain(
             "fi\n"
             "exit 0\n"
         )
+    # git stub: logs its argv (shell-quoted, one invocation per line) to a
+    # .git-args file beside it so tests can assert the managed-clone git
+    # steps, while every subcommand itself succeeds as a no-op. Logs under
+    # the stub dir, never inside a clone, so the fake tree stays inspectable.
+    # FASTEDIT_STUB_GIT_DIRTY=1 makes `status --porcelain` report an uncommitted
+    # change, to drive the dirty-override-clone refusal.
+    (fake / "git").write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$(printf "%q " "$@")" >> "$(dirname "$0")/.git-args"\n'
+        'if [[ "$FASTEDIT_STUB_GIT_DIRTY" == "1" ]]; then\n'
+        '  for a in "$@"; do\n'
+        '    if [[ "$a" == "--porcelain" ]]; then\n'
+        '      echo " M dirty-file.txt"\n'
+        "      exit 0\n"
+        "    fi\n"
+        "  done\n"
+        "fi\n"
+        "exit 0\n"
+    )
     for stub in fake.iterdir():
         stub.chmod(0o755)
     return {"PATH": f"{fake}:/usr/bin:/bin"}
+
+
+def _git_invocations(tmp_path: Path) -> list[list[str]]:
+    """The git invocations a stubbed run made, shell-split per line.
+
+    Reads the .git-args log the git stub appended to, so tests can assert the
+    managed-clone steps (clone / fetch / checkout / reset --hard) without
+    touching a real network. File-descriptor-style flags (e.g. the `2>/dev/null`
+    a caller redirects) are never part of argv and so never appear here.
+    """
+    log = tmp_path / "stub-bin" / ".git-args"
+    if not log.exists():
+        return []
+    return [shlex.split(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 class TestUvVersionFloor:
@@ -321,20 +349,20 @@ class TestInstallDevScriptExists:
 
 class TestInstallDevDryRun:
     def test_dry_run_exits_zero_and_shows_default_install(self) -> None:
-        """--dry-run succeeds and prints the uninstall sweep plus a platform-matched install spec."""
+        """--dry-run succeeds and prints the uninstall sweep plus a platform-matched editable spec."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
         assert "uv tool uninstall fastedits" in result.stdout
         # stdin is DEVNULL (non-TTY): the grammar prompt defaults to yes.
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
         )
 
-    def test_dry_run_prints_the_fork_mode_line(self) -> None:
-        """Fork mode names itself and the ref it pins to (the autodetected branch)."""
+    def test_dry_run_prints_the_editable_from_this_checkout_line(self) -> None:
+        """The in-repo run names its install source: THIS checkout, editable."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
-        assert f"fork install (pinned to {_autodetected_branch()})" in result.stdout
+        assert f"installing editable from this checkout: {REPO_ROOT}" in result.stdout
 
     def test_dry_run_sweeps_every_install_method(self) -> None:
         """Uninstall-first sweeps uv tool, pipx and pip so no leftover install collides."""
@@ -356,19 +384,20 @@ class TestInstallDevDryRun:
         assert result.returncode == 0, result.stderr
         assert "fastedit pull --model" not in result.stdout
 
-    def test_ref_flag_overrides_default_branch(self) -> None:
-        """--ref pins the install to an explicit branch/tag/sha instead of the autodetected one."""
+    def test_ref_note_in_repo(self) -> None:
+        """--ref inside a checkout has no effect on the install, and the run says so."""
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
-            _with_all_grammars(_platform_extras()), ref="v1.2.3"
-        )
+        assert (
+            "note: --ref has no effect when running from inside a checkout "
+            "(the working tree is the install source)"
+        ) in result.stderr
 
     def test_extras_flag_adds_bracketed_extras_to_package_spec(self) -> None:
-        """--extras mlx,mcp installs fastedits[mlx,mcp,...] rather than the bare package."""
+        """--extras mlx,mcp installs fastedit-clone[mlx,mcp,...] rather than the bare path."""
         result = run("--extras", "mlx,mcp", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars("mlx,mcp")
         )
 
@@ -376,7 +405,7 @@ class TestInstallDevDryRun:
         """--extras all-grammars plus a yes answer must not yield all-grammars twice."""
         result = run("--extras", "all-grammars", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec("all-grammars")
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec("all-grammars")
 
     def test_help_lists_the_new_flags(self) -> None:
         """-h documents --dev and --all-grammars."""
@@ -385,44 +414,227 @@ class TestInstallDevDryRun:
         assert "--dev" in result.stdout
         assert "--all-grammars" in result.stdout
 
+    def test_usage_names_the_managed_clone_and_the_dev_noop(self) -> None:
+        """-h speaks the managed-clone vocabulary: --ref tracks the managed
+        clone, --dev is spelled as a no-op compatibility flag, and the install
+        shape is the editable-from-local-clone one."""
+        result = run("-h")
+        assert result.returncode == 0, result.stderr
+        assert "managed clone" in result.stdout
+        assert "Accepted for compatibility, no longer needed" in result.stdout
+        assert "editable install from a local clone" in result.stdout
 
-class TestBranchAutodetect:
-    """Fork mode, no explicit --ref, run from inside a clone -> THAT clone's branch."""
 
-    def test_non_tty_dry_run_autodetects_the_local_branch(self) -> None:
-        """Non-TTY default: the menu is skipped and the spec pins the AUTODETECTED branch."""
-        branch = _autodetected_branch()
+class TestInRepoSourceResolution:
+    """Run inside a checkout: the working tree IS the install source, and the
+    managed-clone machinery (clone/fetch/reset, --ref) stays out of the way."""
+
+    def test_non_tty_dry_run_installs_this_checkout(self) -> None:
+        """Non-TTY default: no menu, the spec is THIS tree, editable."""
         result = run("--dry-run")
         assert result.returncode == 0, result.stderr
-        assert f"branch: installing the local clone's current branch '{branch}' from the fork" in result.stdout
-        # No terminal on stdin -> no source menu, no menu prompt anywhere.
-        assert "Install from:" not in result.stderr
-        # The remote verification prints what it WOULD check; the network call
-        # itself is skipped in dry-run so the preview stays hermetic.
-        assert f"+ git ls-remote --heads {FORK_URL} {branch}" in result.stdout
-        assert (
-            "note: dry-run: the fork-remote branch check is skipped (no network); "
-            "the real run verifies before installing."
-        ) in result.stdout
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+        assert f"installing editable from this checkout: {REPO_ROOT}" in result.stdout
+        # No terminal on stdin and no menu in the script at all: no prompt
+        # fragment may appear on either stream.
+        assert "Install from:" not in result.stdout + result.stderr
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
         )
 
-    def test_explicit_ref_skips_autodetect_and_the_remote_check(self) -> None:
-        """--ref is the user's pin (may be a tag or sha): no autodetect, no ls-remote check."""
+    def test_explicit_ref_has_no_effect_inside_a_checkout(self) -> None:
+        """--ref names the branch a MANAGED clone tracks; a checkout run says
+        so, never touches git, and keeps the working tree as the spec."""
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert "branch: installing the local clone's current branch" not in result.stdout
-        assert "git ls-remote" not in result.stdout
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
-            _with_all_grammars(_platform_extras()), ref="v1.2.3"
+        assert (
+            "note: --ref has no effect when running from inside a checkout "
+            "(the working tree is the install source)"
+        ) in result.stderr
+        # The ref is swallowed, not installed: no git+ URL, no v1.2.3 pin, no
+        # git invocation printed.
+        assert "git+" not in result.stdout
+        assert "@v1.2.3" not in result.stdout
+        assert "git " not in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
+            _with_all_grammars(_platform_extras())
         )
 
-    def test_dev_skips_autodetect(self) -> None:
-        """--dev installs the working tree; there is no branch to detect."""
+    def test_dev_is_a_no_op_note(self) -> None:
+        """--dev is accepted for compatibility and says so; the install is the
+        same editable-from-this-checkout shape."""
         result = run("--dev", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert "branch: installing the local clone's current branch" not in result.stdout
+        assert (
+            "note: --dev is a no-op: every install is now an editable install "
+            f"from a local clone (this checkout, or the managed clone at {Path.home()}/.fastedit/src)"
+        ) in result.stderr
+        assert f"installing editable from this checkout: {REPO_ROOT}" in result.stdout
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
+            _with_all_grammars(_platform_extras())
+        )
+
+
+class TestManagedCloneStandalone:
+    """Standalone runs (no pyproject.toml beside the script): the installer
+    maintains its own editable clone at ~/.fastedit/src — cloned on first run,
+    fetched/check-out/hard-reset on every run after, deletable only at the
+    DEFAULT path, and never hard-reset when FASTEDIT_CLONE_DIR points at a
+    tree the user manages. Every real git step is stubbed; HOME is sandboxed;
+    the script is COPIED to a neutral dir so no checkout is detected.
+    """
+
+    def _copy_script(self, tmp_path: Path) -> Path:
+        """A runnable copy of the installer in a neutral dir (no pyproject.toml
+        beside it), so the script resolves HAVE_LOCAL_TREE=0. copyfile would
+        drop the exec bit, so 0o755 is re-applied."""
+        script_copy = tmp_path / "standalone" / "install-dev.sh"
+        script_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(SCRIPT, script_copy)
+        script_copy.chmod(0o755)
+        return script_copy
+
+    def _standalone_env(self, tmp_path: Path, home_name: str) -> tuple[dict[str, str], Path]:
+        """A sandboxed standalone run: script copy outside any checkout, stub
+        toolchain (incl. git) on PATH, private HOME."""
+        home = tmp_path / home_name
+        home.mkdir()
+        env = {
+            **_stub_toolchain(tmp_path),
+            "HOME": str(home),
+        }
+        return env, self._copy_script(tmp_path)
+
+    def test_dry_run_prints_the_clone_transcript_without_executing_git(
+        self, tmp_path: Path
+    ) -> None:
+        """First standalone run, dry: the `+ git clone --branch ...` transcript
+        line is printed, and no git (or clone) actually runs."""
+        env, script_copy = self._standalone_env(tmp_path, "mc-dry-home")
+        result = run("--dry-run", "--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        expected = f"{tmp_path}/mc-dry-home/.fastedit/src"
+        assert f"no fastedit clone here — cloning into {expected} (branch feat/create-file)..." in result.stdout
+        assert f"+ git clone --branch feat/create-file {FORK_URL} {expected}" in result.stdout
+        # Dry-run purity: no git ran, nothing was cloned.
+        assert _git_invocations(tmp_path) == []
+        assert not Path(expected).exists()
+
+    def test_real_run_clones_into_the_default_managed_dir(self, tmp_path: Path) -> None:
+        """First standalone run, real: exactly one `git clone --branch` with
+        the built-in default ref, into ~/.fastedit/src under the test's HOME."""
+        env, script_copy = self._standalone_env(tmp_path, "mc-clone-home")
+        result = run("--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        home = tmp_path / "mc-clone-home"
+        expected = f"{home}/.fastedit/src"
+        assert f"no fastedit clone here — cloning into {expected} (branch feat/create-file)..." in result.stdout
+        invocations = _git_invocations(tmp_path)
+        assert invocations == [["clone", "--branch", "feat/create-file", FORK_URL, expected]]
+
+    def test_real_run_updates_an_existing_managed_clone(self, tmp_path: Path) -> None:
+        """An existing managed clone is fetched, checked out and hard-reset to
+        origin/<tracked branch> — and never re-cloned."""
+        home = tmp_path / "mc-update-home"
+        home.mkdir()
+        clone = home / ".fastedit" / "src"
+        clone.mkdir(parents=True)
+        # The marker the script uses to recognize a fastedit clone.
+        (clone / "pyproject.toml").write_text("[project]\nname = 'fastedits'\n", encoding="utf-8")
+        script_copy = self._copy_script(tmp_path)
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        assert "managed clone updated to origin/feat/create-file (" in result.stdout
+        assert str(clone) in result.stdout
+        # The update steps, in order: a dirtiness probe (status --porcelain),
+        # fetch, checkout, reset --hard, then the sha lookup for the "managed
+        # clone updated ... (<sha>)" line. `git -C <dir> ...` puts -C and <dir>
+        # BEFORE the subcommand, so the subcommand is argv[2]; the reset target
+        # is origin/<ref>, never a local ref.
+        invocations = _git_invocations(tmp_path)
+        assert [inv[2] for inv in invocations] == ["status", "fetch", "checkout", "reset", "rev-parse"]
+        assert invocations[1] == ["-C", str(clone), "fetch", "origin", "feat/create-file"]
+        assert invocations[2] == ["-C", str(clone), "checkout", "feat/create-file"]
+        assert invocations[3][:4] == ["-C", str(clone), "reset", "--hard"]
+        assert invocations[3][4] == "origin/feat/create-file"
+        assert invocations[4][2] == "rev-parse"
+
+    def test_dirty_override_clone_is_refused_with_exit_1(self, tmp_path: Path) -> None:
+        """FASTEDIT_CLONE_DIR pointing at a user-managed tree with uncommitted
+        changes is refused (exit 1) — never hard-reset, nothing touched."""
+        home = tmp_path / "mc-dirty-home"
+        home.mkdir()
+        clone = tmp_path / "user-tree"
+        clone.mkdir()
+        (clone / "pyproject.toml").write_text("[project]\nname = 'fastedits'\n", encoding="utf-8")
+        script_copy = self._copy_script(tmp_path)
+        env = {
+            **_stub_toolchain(tmp_path),
+            "HOME": str(home),
+            "FASTEDIT_CLONE_DIR": str(clone),
+            "FASTEDIT_STUB_GIT_DIRTY": "1",
+        }
+        result = run("--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 1
+        assert (
+            f"error: FASTEDIT_CLONE_DIR points at {clone}, which has uncommitted changes — "
+            "refusing to reset a tree you manage."
+        ) in result.stderr
+        # Nothing was touched: only the dirtiness probe ran, no fetch/reset,
+        # and the tree keeps its file.
+        assert [inv[2] for inv in _git_invocations(tmp_path)] == ["status"]
+        assert (clone / "pyproject.toml").is_file()
+
+    def test_revert_removes_the_default_managed_clone(self, tmp_path: Path) -> None:
+        """--revert deletes the installer-OWNED default clone: `+ rm -rf` and
+        'removed:' — but keeps an override clone the user pointed at."""
+        home = tmp_path / "mc-revert-home"
+        home.mkdir()
+        clone = home / ".fastedit" / "src"
+        clone.mkdir(parents=True)
+        (clone / "pyproject.toml").write_text("[project]\nname = 'fastedits'\n", encoding="utf-8")
+        script_copy = self._copy_script(tmp_path)
+        env = {**_stub_toolchain(tmp_path), "HOME": str(home)}
+        result = run("--revert", "--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        assert f"+ rm -rf {clone}" in result.stdout
+        assert f"removed: installer-managed clone at {clone}" in result.stdout
+        assert not clone.exists()
+
+    def test_revert_leaves_an_override_clone_in_place(self, tmp_path: Path) -> None:
+        """FASTEDIT_CLONE_DIR outside the default path is the user's: --revert
+        reports it and leaves it in place."""
+        home = tmp_path / "mc-revert-override-home"
+        home.mkdir()
+        clone = tmp_path / "user-override-tree"
+        clone.mkdir()
+        (clone / "pyproject.toml").write_text("[project]\nname = 'fastedits'\n", encoding="utf-8")
+        script_copy = self._copy_script(tmp_path)
+        env = {
+            **_stub_toolchain(tmp_path),
+            "HOME": str(home),
+            "FASTEDIT_CLONE_DIR": str(clone),
+        }
+        result = run("--revert", "--no-model", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        assert f"note: FASTEDIT_CLONE_DIR points outside ~/.fastedit — leaving {clone} in place" in result.stdout
+        assert (clone / "pyproject.toml").is_file()
+
+    def test_check_reports_the_managed_clone_state(self, tmp_path: Path) -> None:
+        """Standalone --check reports the managed clone path and whether it is
+        absent or present — the read-only answer to 'what does this machine
+        have at ~/.fastedit/src?'."""
+        env, script_copy = self._standalone_env(tmp_path, "mc-check-home")
+        clone = tmp_path / "mc-check-home" / ".fastedit" / "src"
+        result = run("--check", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        assert f"managed clone: {clone} (absent)" in result.stdout
+        # After a clone exists, the same report flips the state word.
+        clone.mkdir(parents=True)
+        (clone / "pyproject.toml").write_text("[project]\nname = 'fastedits'\n", encoding="utf-8")
+        result = run("--check", env_extra=env, script=script_copy)
+        assert result.returncode == 0, result.stderr
+        assert f"managed clone: {clone} (present)" in result.stdout
 
 
 class TestAllGrammarsFlag:
@@ -430,15 +642,16 @@ class TestAllGrammarsFlag:
         """--all-grammars no installs exactly the platform extras -- no grammar pack, no notice."""
         result = run("--all-grammars", "no", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(_platform_extras())
-        assert "all-grammars" not in result.stdout + result.stderr
+        # The choice must not leak into the spec or any notice -- the exact
+        # spec equality above already proves the extra is absent.
         assert "non-interactive" not in result.stdout + result.stderr
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(_platform_extras())
 
     def test_all_grammars_yes_includes_the_extra(self) -> None:
         """--all-grammars yes appends the pack to the platform extras without asking."""
         result = run("--all-grammars", "yes", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
         )
         assert "non-interactive" not in result.stdout + result.stderr
@@ -449,7 +662,7 @@ class TestAllGrammarsFlag:
         assert result.returncode == 0, result.stderr
         assert "non-interactive: all grammars enabled by default" in result.stderr
         assert "pass --all-grammars no to skip" in result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
         )
 
@@ -457,7 +670,7 @@ class TestAllGrammarsFlag:
         """--extras "" --all-grammars no: bare spec, model pull skipped because no backend."""
         result = run("--extras", "", "--all-grammars", "no", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec("")
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec("")
         assert "fastedit pull --model" not in result.stdout
 
     def test_all_grammars_rejects_an_invalid_value(self) -> None:
@@ -475,70 +688,35 @@ class TestAllGrammarsFlag:
 class TestAllGrammarsPrompt:
     """The interactive [Y/n] prompt — needs a real TTY, so driven through a pty.
 
-    On a TTY the source menu is asked FIRST (this repo is a clone), so every
-    feed below answers the menu with [2] (fork) before reaching the grammars
-    question.
+    There is no source menu, so the grammars question is the ONLY thing a TTY
+    is ever asked: each feed answers exactly that one question.
     """
 
     def test_enter_defaults_to_yes(self) -> None:
         """A bare Enter at the grammars prompt means yes: the grammar pack joins the install."""
-        r = _run_with_pty_stdin(b"2\n\n")  # menu -> fork; grammars -> Enter (yes)
+        r = _run_with_pty_stdin(b"\n")  # grammars -> Enter (yes)
         assert r.returncode == 0, r.stderr
-        assert "Install from:" in r.stderr
         assert "Install all grammars?" in r.stderr
-        assert spec_argv(r.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(r.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
         )
 
     def test_no_answers_no(self) -> None:
         """Answering n skips the pack."""
-        r = _run_with_pty_stdin(b"2\nn\n")  # menu -> fork; grammars -> n
+        r = _run_with_pty_stdin(b"n\n")  # grammars -> n
         assert r.returncode == 0, r.stderr
         assert "Install all grammars?" in r.stderr
-        assert spec_argv(r.stdout, "uv tool install ") == _fork_spec(_platform_extras())
+        assert spec_argv(r.stdout, "uv tool install ") == _checkout_spec(_platform_extras())
 
     def test_explicit_flag_suppresses_the_prompt(self) -> None:
         """--all-grammars yes must never ask, even on a TTY."""
-        # The feed answers only the source menu; the grammars question is
-        # pre-answered by the flag, so nothing else is read.
-        r = _run_with_pty_stdin(b"2\n", "--all-grammars", "yes")
+        # The grammars question is pre-answered by the flag, so the script
+        # reads nothing from stdin at all.
+        r = _run_with_pty_stdin(b"", "--all-grammars", "yes")
         assert r.returncode == 0, r.stderr
         assert "Install all grammars?" not in r.stdout + r.stderr
-        assert spec_argv(r.stdout, "uv tool install ") == _fork_spec(
+        assert spec_argv(r.stdout, "uv tool install ") == _checkout_spec(
             _with_all_grammars(_platform_extras())
-        )
-
-
-class TestSourceMenuPrompt:
-    """The interactive source menu — [1] local editable tree vs [2] remote fork."""
-
-    def test_menu_pick_1_installs_editable_local_tree(self) -> None:
-        """Menu pick 1 -> the editable local-tree spec, exactly like --dev."""
-        r = _run_with_pty_stdin(b"1\n", "--all-grammars", "no")
-        assert r.returncode == 0, r.stderr
-        assert "Install from: [1] local working tree" in r.stderr
-        assert "dev install (editable, tracks your working tree)" in r.stdout
-        assert spec_argv(r.stdout, "uv tool install --force --editable ") == (
-            f"{REPO_ROOT}[{_platform_extras()}]"
-        )
-
-    def test_menu_bare_enter_defaults_to_the_local_tree(self) -> None:
-        """A bare Enter at the menu takes the detected default: the local tree ([1])."""
-        r = _run_with_pty_stdin(b"\n", "--all-grammars", "no")
-        assert r.returncode == 0, r.stderr
-        assert "dev install (editable, tracks your working tree)" in r.stdout
-        assert spec_argv(r.stdout, "uv tool install --force --editable ") == (
-            f"{REPO_ROOT}[{_platform_extras()}]"
-        )
-
-    def test_menu_pick_2_pins_the_autodetected_branch(self) -> None:
-        """Menu pick 2 -> the fork spec, pinned to THIS clone's current branch."""
-        branch = _autodetected_branch()
-        r = _run_with_pty_stdin(b"2\n", "--all-grammars", "no")
-        assert r.returncode == 0, r.stderr
-        assert f"branch: installing the local clone's current branch '{branch}' from the fork" in r.stdout
-        assert spec_argv(r.stdout, "uv tool install ") == _fork_spec(
-            _platform_extras(), ref=branch
         )
 
 
@@ -625,18 +803,21 @@ class TestModelCachePreflight:
 
 
 class TestDevInstall:
+    """--dev is a no-op compatibility flag: the install is the same editable
+    one, and the run says so rather than silently swallowing the flag."""
+
     def test_dev_dry_run_spec_is_the_local_repo_path(self) -> None:
-        """--dev installs editable from the working tree: path[extras], no git URL."""
+        """The install is editable from the working tree: path[extras], no git URL."""
         result = run("--dev", "--dry-run")
         assert result.returncode == 0, result.stderr
-        assert "dev install (editable, tracks your working tree)" in result.stdout
+        assert f"installing editable from this checkout: {REPO_ROOT}" in result.stdout
         assert "git+" not in result.stdout
         assert spec_argv(
             result.stdout, "uv tool install --force --editable "
         ) == f"{REPO_ROOT}[{_with_all_grammars(_platform_extras())}]"
 
     def test_dev_dry_run_uses_force_and_editable(self) -> None:
-        """The dev install line carries --force --editable so re-runs refresh in place."""
+        """The install line carries --force --editable so re-runs refresh in place."""
         result = run("--dev", "--dry-run")
         assert result.returncode == 0, result.stderr
         assert "+ uv tool install --force --editable " in result.stdout
@@ -658,7 +839,7 @@ class TestDevInstall:
         ) == f"{REPO_ROOT}[mcp]"
 
     def test_dev_dry_run_still_sweeps_and_shows_model_pull(self) -> None:
-        """Dev mode keeps the sweep and the model logic — only the spec shape changes."""
+        """--dev keeps the sweep and the model logic — only the note is new."""
         result = run("--dev", "--dry-run")
         assert result.returncode == 0, result.stderr
         assert "uv tool uninstall fastedits" in result.stdout
@@ -666,7 +847,7 @@ class TestDevInstall:
         assert "fastedit pull --model" in result.stdout
 
     def test_dev_ref_combination_warns_and_uses_the_local_path(self) -> None:
-        """--ref pins the git spec; in dev mode it has no effect, and the script says so."""
+        """--ref has no effect inside a checkout, and the script says so."""
         result = run("--dev", "--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
         assert "--ref has no effect" in result.stderr
@@ -710,15 +891,15 @@ class TestInstallDevRevert:
 
 
 class TestAgentSkillInstall:
-    """The agent-skill axis: installed with the Vercel skills CLI from THIS
-    clone's local tree (REPO_ROOT/skills/fastedit) — never from a GitHub tree
-    URL or the repo shorthand. Both GitHub forms resolve the fork's DEFAULT
-    branch (main), which still carries the legacy claude-skill content, and
-    the tree-URL form fails outright in non-TTY mode; the local tree is the
-    locally-verified install shape and removes the branch question entirely
-    (--ref stays a package-only concern). Failure-tolerant exactly like the
-    optional backend install -- a skill failure must never leave this machine
-    without fastedit, and the postflight reports what actually happened.
+    """The agent-skill axis: installed with the Vercel skills CLI from the
+    SAME clone the package comes from (this checkout, or the managed clone on
+    a standalone run) — never from a GitHub tree URL or the repo shorthand.
+    Both GitHub forms resolve the fork's DEFAULT branch (main), which still
+    carries the legacy claude-skill content, and the tree-URL form fails
+    outright in non-TTY mode; the local tree is the locally-verified install
+    shape. Failure-tolerant exactly like the optional backend install -- a
+    skill failure must never leave this machine without fastedit, and the
+    postflight reports what actually happened.
     """
 
     SKILL_SOURCE_DIR = f"{REPO_ROOT}/skills/fastedit"
@@ -743,15 +924,15 @@ class TestAgentSkillInstall:
         assert (REPO_ROOT / "skills" / "fastedit" / "SKILL.md").is_file()
 
     def test_ref_pins_the_package_but_never_the_skill(self) -> None:
-        """--ref pins the package spec only: the skill always comes from the
-        local tree, so no ref appears anywhere in the add command."""
+        """--ref (from inside a checkout: swallowed with a note) must never
+        reach the skill command: the skill always comes from the local tree."""
         result = run("--ref", "v1.2.3", "--dry-run")
         assert result.returncode == 0, result.stderr
         tokens = self._add_tokens(result)
         assert self.SKILL_SOURCE_DIR in tokens
         assert not any("v1.2.3" in token for token in tokens)
-        assert spec_argv(result.stdout, "uv tool install ") == _fork_spec(
-            _with_all_grammars(_platform_extras()), ref="v1.2.3"
+        assert spec_argv(result.stdout, "uv tool install ") == _checkout_spec(
+            _with_all_grammars(_platform_extras())
         )
 
     def test_no_skill_flag_omits_every_skill_command(self) -> None:
@@ -896,31 +1077,22 @@ class TestCheckMode:
         assert "agent skill" not in out
         assert "skills" not in out
 
-    def test_check_needs_no_network(self, tmp_path: Path) -> None:
-        """An unreachable fork remote downgrades to a warning, never a failure.
+    def test_check_survives_a_remote_that_answers_nothing(self, tmp_path: Path) -> None:
+        """A fork remote that cannot be probed never fails --check.
 
-        The stub uv eats `ls-remote`'s stderr through $( ), so this machine's
-        real git is the reference: it reports a genuine ls-remote failure the
-        same way the script does.
+        With the stub PATH the script's `git ls-remote --heads` resolves to the
+        git stub, which exits 0 but answers nothing — the same shape an
+        unreachable-but-not-failing remote produces. The report must say the
+        branch state is unresolved and STILL exit 0: --check is read-only and
+        the network is not its problem.
         """
-        real_git = shutil.which("git")
-        if real_git is None:  # pragma: no cover
-            pytest.skip("no git on PATH to drive the unreachable-remote probe")
         home = tmp_path / "check-home"
         home.mkdir()
         env = {**_stub_toolchain(tmp_path, with_npx=False), "HOME": str(home)}
         result = run("--check", "--ref", "feat/create-file", env_extra=env)
         assert result.returncode == 0, result.stderr
-        # On the networked dev machine the ls-remote probe genuinely succeeds;
-        # either way the run must not abort.
-        rc = subprocess.run(
-            [real_git, "ls-remote", "--heads", FORK_URL],
-            capture_output=True, text=True, timeout=20, check=False,
-        )
-        if rc.returncode == 0:
-            assert "warning: could not verify" not in result.stdout + result.stderr
-        else:
-            assert "warning: could not verify" in result.stdout + result.stderr
+        assert f"branch '{INSTALLABLE_BRANCH}' exists on the fork remote" not in result.stdout
+        assert "(MISSING)" in result.stdout
 
     def test_check_reports_a_fork_install_from_the_stub_binary(self, tmp_path: Path) -> None:
         """A fastedit on PATH that lists the fork verbs reports a fork install."""

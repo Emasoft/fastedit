@@ -70,6 +70,14 @@ REF="feat/create-file"
 # direct-ref) and every pin note names THIS branch, never "main".
 INSTALLABLE_BRANCH="feat/create-file"
 RAW_BASE_URL="https://raw.githubusercontent.com/Emasoft/fastedit"
+# The installer-managed editable clone for standalone runs (no local tree
+# beside this script): the ONE install shape is `uv tool install --force
+# --editable <clone>[extras]`, so the curl one-liner produces exactly the
+# same result as `--dev` from a checkout. FASTEDIT_CLONE_DIR moves the clone:
+# a tree there is the user's, so a dirty one is refused (never hard-reset)
+# and --revert leaves it in place — only the default ~/.fastedit/src path is
+# installer-owned and deletable.
+CLONE_DIR="${FASTEDIT_CLONE_DIR:-${HOME}/.fastedit/src}"
 EXTRAS=""
 # Whether --extras was PASSED, tracked separately from its value. `--extras ""`
 # is a deliberate opt-out and must be distinguishable from never passing the
@@ -99,17 +107,13 @@ SKILL_AGENT="claude-code"
 # beside the script) — but it is only VALIDATED when DEV resolves to 1, so a
 # downloaded copy of this script run without --dev never depends on where it
 # happens to sit.
+# DEPRECATED: no-op since the one-install-shape conversion (--dev accepted for compatibility).
 DEV=0
 REPO_ROOT=""
 HAVE_LOCAL_TREE=0
 # Whether --ref was passed -- tracked only so --dev can say --ref had no
 # effect, rather than silently swallowing a flag the user typed.
 REF_SET=0
-# REF_AUTO=1 marks a branch that was AUTODETECTED from the local clone. Only
-# such a branch is verified against the fork remote: an explicit --ref is the
-# user's pin and may legitimately name a tag or a sha, which
-# `git ls-remote --heads` cannot see.
-REF_AUTO=0
 
 # The all-grammars decision. ALL_GRAMMARS holds the resolved answer
 # ("yes"/"no"); ALL_GRAMMARS_SET records whether the FLAG was passed, so a
@@ -150,15 +154,16 @@ Usage: install-dev.sh [--dev] [--ref REF] [--extras LIST] [--all-grammars yes|no
                  default branch. Needs no npx; works offline (an unreachable
                  remote is a warning, not a failure).
 
-  --dev          Development install: EDITABLE, from this repo's working tree
-                 (the directory the script lives in). Your local changes are
-                 picked up without reinstalling. Cannot be combined with
-                 --revert. Skips the source menu.
-  --ref REF      Branch, tag or commit SHA of the fork to install. No effect
-                 with --dev. Without --ref in fork mode, a run from inside a
-                 clone installs THAT CLONE's current branch (verified to
-                 exist on the fork remote); a standalone run keeps the
-                 built-in default (feat/create-file).
+  --dev          Accepted for compatibility, no longer needed: EVERY install
+                 is now an editable install from a local clone (a checkout
+                 you run the script from, or the installer-managed clone at
+                 ~/.fastedit/src). Cannot be combined with --revert.
+  --ref REF      Branch the MANAGED CLONE tracks (standalone runs; created/
+                 updated at ~/.fastedit/src, override with
+                 FASTEDIT_CLONE_DIR). No effect when running from inside a
+                 checkout (the working tree is the install source). Without
+                 --ref the managed clone tracks the built-in default
+                 (feat/create-file).
   --extras LIST  Comma-separated extras. DEFAULT: every extra this platform
                  can install (mlx,mcp on Apple Silicon; vllm,mcp on Linux with
                  an NVIDIA driver; mcp elsewhere). Pass --extras "" for none --
@@ -187,13 +192,16 @@ EOF
   platform_line
   cat <<'EOF'
 
-Source menu: on an interactive run (terminal on stdin) with neither --dev nor
---revert, and this script sitting inside a fastedit clone, you are asked
-"Install from: [1] local working tree (editable, tracks your changes) [2]
-remote GitHub fork (pinned branch)" — Enter = 1, the detected local tree.
-A standalone run (curl|bash, no clone next to the script) skips the menu and
-installs from the remote fork. Without a terminal: --dev decides, otherwise
-the remote fork.
+How it works: the ONE install shape is an editable install from a local clone.
+  * Run inside a fastedit checkout -> that working tree is the install source.
+  * Run standalone (the curl|bash one-liner) -> the installer maintains a
+    managed clone at ~/.fastedit/src (override: FASTEDIT_CLONE_DIR): cloned
+    on first run, then fetched and hard-reset to the tracked branch on every
+    run, so an update is just re-running this script (or `git -C
+    ~/.fastedit/src pull`).
+The install is always `uv tool install --force --editable`; --dev exists as
+a no-op compatibility flag. The agent skill (skills/fastedit) is installed
+from the SAME clone the package comes from.
 
 Preflight: before installing, the script reports every installed fastedits
 (uv tool, pipx, pip — plus which fastedit binary wins on PATH right now) and
@@ -204,9 +212,9 @@ asked on a terminal [Y/n], removed by default without one, printed as
 "would remove" by --dry-run. --revert keeps every cache.
 
 Agent skill: after the package install, the script also installs the agent
-skill with the Vercel skills CLI, from THIS clone's working tree — the same
-skills/fastedit directory the package is built from:
-  npx --yes skills add <repo_root>/skills/fastedit -g -a claude-code -y
+skill with the Vercel skills CLI, from the SAME clone the package comes from
+(the checkout, or the managed clone on a standalone run):
+  npx --yes skills add <install_source>/skills/fastedit -g -a claude-code -y
 (global, non-interactive, claude-code target; the path IS the skill, and
 --ref never affects it — no GitHub source is involved, because the repo
 shorthand and tree URLs would resolve the fork's default branch (main),
@@ -219,9 +227,10 @@ skill best-effort with "npx --yes skills remove fastedit -g -y".
 
 Installable branch: the fork's GitHub DEFAULT branch (main) is stale — the
 repo's landing page shows old code — so the installable branch is
-feat/create-file. The uvx one-liner and the raw.githubusercontent script URL
-pin it explicitly; a successful install prints both from-scratch one-liners
-plus a `fastedit --version` verification hint in its footer.
+feat/create-file, the branch the managed clone tracks. The uvx one-liner and
+the raw.githubusercontent script URL pin it explicitly; a successful install
+prints both from-scratch one-liners plus a `fastedit --version` verification
+hint in its footer.
 EOF
 }
 
@@ -394,39 +403,55 @@ quote_argv() {
   printf '%s' "$out"
 }
 
-# Decide DEV (editable local tree) vs the remote fork install when the user
-# gave no explicit choice. Precedence, in order:
-#   --dev / --revert flags win and never prompt (--dev --revert already
-#     errored out above; --revert never shows the menu);
-#   standalone (no fastedit clone next to this script): there is no local
-#     tree to offer, so never prompt -- install from the fork, and on a
-#     terminal say so in one line;
-#   interactive (terminal on stdin): ASK, defaulting to the detected local
-#     tree ([1]); a bare Enter or anything unrecognized takes the default,
-#     the same convention the all-grammars [Y/n] prompt uses;
-#   non-interactive: no menu; --dev decides, otherwise the remote fork.
+# ONE install shape: an EDITABLE install from a local clone. Inside a
+# fastedit checkout the clone is that working tree; standalone (no
+# pyproject.toml beside this script — the curl|bash case) the installer
+# manages its own clone at CLONE_DIR: clone if missing, else fetch +
+# checkout + `git reset --hard origin/<branch>` to the branch tip (the
+# clone is installer-owned, so a hard reset is the correct sync; a
+# FASTEDIT_CLONE_DIR override pointing at a user-managed tree with
+# UNCOMMITTED changes is refused instead of reset). --dev is accepted as
+# a no-op compatibility flag: every install is editable now. --dry-run
+# prints the git steps as `+ ` transcript lines and executes none of them:
+# a preview must never clone, fetch or reset for real.
 resolve_source_mode() {
-  if [[ "$DEV" -eq 1 || "$REVERT" -eq 1 ]]; then
+  if [[ "$REVERT" -eq 1 ]]; then
     return 0
   fi
-  if [[ "$HAVE_LOCAL_TREE" -eq 0 ]]; then
-    if [[ -t 0 ]]; then
-      echo "note: no fastedit repo found next to this script — skipping the source menu and installing from the remote fork (${FORK_URL})" >&2
+  if [[ "$HAVE_LOCAL_TREE" -eq 1 ]]; then
+    INSTALL_SOURCE="$REPO_ROOT"
+    echo "installing editable from this checkout: ${INSTALL_SOURCE}"
+    return 0
+  fi
+  INSTALL_SOURCE="${CLONE_DIR}"
+  if [[ -f "${CLONE_DIR}/pyproject.toml" ]]; then
+    local porcelain=""
+    porcelain="$(run_bounded 30 git -C "$CLONE_DIR" status --porcelain 2>/dev/null || true)"
+    if [[ -n "$porcelain" && "${CLONE_DIR}" != "${HOME}/.fastedit/src" ]]; then
+      echo "error: FASTEDIT_CLONE_DIR points at ${CLONE_DIR}, which has uncommitted changes — refusing to reset a tree you manage." >&2
+      exit 1
     fi
-    return 0
+    # The dry-run guard covers the check too: the run is preview-only, so no
+    # git subcommand against the managed clone may fire (stdout stays hermetic).
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "+ git -C ${CLONE_DIR} fetch origin ${REF}"
+      echo "+ git -C ${CLONE_DIR} checkout ${REF}"
+      echo "+ git -C ${CLONE_DIR} reset --hard origin/${REF}"
+      echo "managed clone updated to origin/${REF} (dry-run): ${CLONE_DIR}"
+      return 0
+    fi
+    run_bounded 120 git -C "$CLONE_DIR" fetch origin "$REF"
+    run_bounded 30 git -C "$CLONE_DIR" checkout "$REF"
+    run_bounded 30 git -C "$CLONE_DIR" reset --hard "origin/${REF}"
+    echo "managed clone updated to origin/${REF} ($(run_bounded 10 git -C "$CLONE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')): ${CLONE_DIR}"
+  else
+    echo "no fastedit clone here — cloning into ${CLONE_DIR} (branch ${REF})..."
+    echo "+ git clone --branch ${REF} ${FORK_URL} ${CLONE_DIR}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      return 0
+    fi
+    run_bounded 300 git clone --branch "$REF" "$FORK_URL" "$CLONE_DIR"
   fi
-  if [[ ! -t 0 ]]; then
-    return 0
-  fi
-  local answer=""
-  platform_line >&2
-  printf '%s' "Install from: [1] local working tree (editable, tracks your changes) [2] remote GitHub fork (pinned branch) — choose [1/2]: " >&2
-  read -r answer || answer=""
-  answer="${answer//[[:space:]]/}"
-  case "$answer" in
-    2) return 0 ;;
-    *) DEV=1 ;;  # 1, bare Enter (the detected default), or anything else -> local tree
-  esac
 }
 
 # Run one uninstall command, tolerating "there was nothing to remove"
@@ -472,43 +497,27 @@ sweep_uninstall() {
   fi
 }
 
-# The package spec for a given extras list, in the shape the current mode
-# installs: a PEP 508 direct reference against the fork's git repo in fork
-# mode, a plain `path[extras]` in dev mode (verified working on uv 0.12.13:
-# bracket extras on a local path resolve, and --editable tracks the tree).
-# Empty extras -> bare package name / bare path.
+# The package spec for a given extras list: ALWAYS `path[extras]` against
+# the resolved local clone (INSTALL_SOURCE — the checkout this script sits
+# in, or the managed clone). Empty extras -> bare path. Verified on uv
+# 0.12.13: bracket extras on a local path resolve, and --editable tracks
+# the tree.
 build_spec() {
   local extras="$1"
-  if [[ "$DEV" -eq 1 ]]; then
-    if [[ -n "$extras" ]]; then
-      printf '%s[%s]' "$REPO_ROOT" "$extras"
-    else
-      printf '%s' "$REPO_ROOT"
-    fi
+  if [[ -n "$extras" ]]; then
+    printf '%s[%s]' "$INSTALL_SOURCE" "$extras"
   else
-    if [[ -n "$extras" ]]; then
-      printf '%s[%s] @ git+%s@%s' "$PACKAGE" "$extras" "$FORK_URL" "$REF"
-    else
-      printf '%s @ git+%s@%s' "$PACKAGE" "$FORK_URL" "$REF"
-    fi
+    printf '%s' "$INSTALL_SOURCE"
   fi
 }
 
 do_install() {
   local spec="$1"
-  if [[ "$DEV" -eq 1 ]]; then
-    echo "+ uv tool install --force --editable $(quote_argv "$spec")"
-  else
-    echo "+ uv tool install $(quote_argv "$spec")"
-  fi
+  echo "+ uv tool install --force --editable $(quote_argv "$spec")"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
-  if [[ "$DEV" -eq 1 ]]; then
-    uv tool install --force --editable "$spec"
-  else
-    uv tool install "$spec"
-  fi
+  uv tool install --force --editable "$spec"
 }
 
 # Same install, but a failure is REPORTED rather than fatal. This exists for
@@ -522,49 +531,10 @@ do_install_optional() {
   do_install "$1" || return 1
 }
 
-# Verify that the AUTODETECTED branch actually exists on the fork remote
-# before anything is uninstalled. `uv tool install git+...@missing-branch`
-# would fail anyway, but only AFTER the sweep has already removed the
-# previous install -- this check fails LOUDLY, with the remote's actual
-# heads listed, while the machine still has a working fastedit.
-#
-# Runs on real installs only: --dry-run prints the command it WOULD run and
-# skips the network, keeping dry-runs hermetic. An unreachable remote is a
-# warning, not an abort (offline preview must still work, and uv's own
-# resolution fails clearly later if the ref truly does not exist); a
-# definitive "remote reachable, branch absent" is an abort.
-verify_remote_ref() {
-  if [[ "$REF_AUTO" -ne 1 ]]; then
-    return 0
-  fi
-  echo "+ $(quote_argv git ls-remote --heads "$FORK_URL" "$REF")"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "note: dry-run: the fork-remote branch check is skipped (no network); the real run verifies before installing."
-    return 0
-  fi
-  local heads status=0
-  heads=$(run_bounded 20 git ls-remote --heads "$FORK_URL" 2>/dev/null) || status=$?
-  if [[ "$status" -ne 0 ]]; then
-    echo "warning: could not verify branch '${REF}' against ${FORK_URL} (git ls-remote failed or timed out)." >&2
-    echo "warning: continuing — 'uv tool install' fails clearly if the branch does not exist." >&2
-    return 0
-  fi
-  # awk exact match, not grep: a ref like "feat/x" must not match the head
-  # "refs/heads/feat/x-y", and a regex-metacharacter branch name must not be
-  # interpreted as a pattern.
-  if ! awk -v want="refs/heads/${REF}" '$2 == want { found=1 } END { exit found ? 0 : 1 }' <<<"$heads"; then
-    echo "error: branch '${REF}' does not exist on the fork remote (${FORK_URL})." >&2
-    echo "error: refs/heads on ${FORK_URL}:" >&2
-    if [[ -n "$heads" ]]; then
-      awk '{print "  " $2}' <<<"$heads" | sort >&2
-    else
-      echo "  (the remote reports no branches)" >&2
-    fi
-    echo "error: push the branch, or pin one that exists with --ref <branch|tag|sha>." >&2
-    exit 1
-  fi
-  echo "verified: branch '${REF}' exists on the fork remote"
-}
+# The forward path does NOT pre-verify the branch on the fork remote: the
+# managed clone is fetched/reset by git itself, and a missing ref fails
+# there, loudly, before the sweep. (The old verify_remote_ref pre-check was
+# dropped with the fork-URL install mode; --check still probes the remote.)
 
 # PREFLIGHT DETECTION — report what is installed and what is cached, BEFORE
 # anything is uninstalled. Runs even in --dry-run: a dry run should print
@@ -825,10 +795,11 @@ pull_model() {
   fastedit pull --model "$model"
 }
 
-# The agent skill ships in this repo under skills/fastedit and is installed
-# with the Vercel skills CLI (`npx skills`) FROM THE LOCAL TREE — never from
-# a GitHub source. The fork's default branch (main) still carries the legacy
-# claude-skill/SKILL.md, so the repo shorthand installs the WRONG content,
+# The agent skill ships in the clone this installer resolves (INSTALL_SOURCE)
+# under skills/fastedit and is installed with the Vercel skills CLI (`npx
+# skills`) FROM THAT LOCAL TREE — never from a GitHub source. The fork's
+# default branch (main) still carries the legacy claude-skill/SKILL.md, so the
+# repo shorthand installs the WRONG content,
 # and the tree-URL form fails outright in non-TTY mode (both measured). The
 # installer always runs from a clone, and skills/fastedit is the very skill
 # the package is built from, so the local tree needs no branch pin at all
@@ -838,7 +809,7 @@ pull_model() {
 # aborts the run — a skill must never be the reason this machine ends up
 # without fastedit.
 skill_source_dir() {
-  printf '%s' "${REPO_ROOT}/skills/fastedit"
+  printf '%s' "${INSTALL_SOURCE}/skills/fastedit"
 }
 
 install_agent_skill() {
@@ -852,7 +823,7 @@ install_agent_skill() {
     return 0
   fi
   if [[ ! -f "${skill_dir}/SKILL.md" ]]; then
-    echo "note: no agent skill at ${skill_dir}/SKILL.md (standalone run?) — skipping; run this installer from a fastedit clone, or use 'fastedit init' to install the skill shipped with the package"
+    echo "note: no agent skill at ${skill_dir}/SKILL.md — skipping; the clone at ${INSTALL_SOURCE} has no skills/fastedit"
     return 0
   fi
   echo "+ npx --yes skills add $(quote_argv "$skill_dir") -g -a ${SKILL_AGENT} -y"
@@ -898,6 +869,26 @@ remove_agent_skill() {
     return 0
   fi
   echo "removed: agent skill 'fastedit' (global)"
+}
+
+# --revert's counterpart for the OTHER thing a standalone install leaves
+# behind: the installer-managed editable clone at CLONE_DIR. A local checkout
+# is a user's repo and is never touched; a FASTEDIT_CLONE_DIR override points
+# somewhere the user chose, so it is reported and left in place too — only
+# the default ~/.fastedit/src path is deleted. Tolerated-absent by design:
+# nothing to remove is the common case for checkout runs.
+remove_managed_clone() {
+  if [[ "$HAVE_LOCAL_TREE" -eq 1 ]]; then return 0; fi
+  local clone="${CLONE_DIR}"
+  if [[ ! -d "$clone" ]]; then return 0; fi
+  if [[ "$clone" != "${HOME}/.fastedit/src" ]]; then
+    echo "note: FASTEDIT_CLONE_DIR points outside ~/.fastedit — leaving ${clone} in place"
+    return 0
+  fi
+  echo "+ rm -rf ${clone}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then return 0; fi
+  rm -rf "$clone"
+  echo "removed: installer-managed clone at ${clone}"
 }
 
 # A failed postflight is only useful if it tells the user how to fix it,
@@ -1167,6 +1158,7 @@ check_report() {
     fi
   else
     echo "  local clone: none detected (this script is not sitting in a fastedit checkout)"
+    echo "  managed clone: ${CLONE_DIR} ($([[ -f "${CLONE_DIR}/pyproject.toml" ]] && echo present || echo absent))"
   fi
   echo ""
 
@@ -1179,10 +1171,10 @@ check_report() {
     echo "  branch '${INSTALLABLE_BRANCH}' exists on the fork remote: unknown (could not reach ${FORK_URL})"
   elif awk -v want="refs/heads/${INSTALLABLE_BRANCH}" '$2 == want { found=1 } END { exit found ? 0 : 1 }' <<<"$heads"; then
     echo "  branch '${INSTALLABLE_BRANCH}' exists on the fork remote"
-    echo "  pinned install target: fastedits @ git+${FORK_URL}@${INSTALLABLE_BRANCH}"
+    echo "  managed clone tracks: ${INSTALLABLE_BRANCH}"
   else
     echo "  error: branch '${INSTALLABLE_BRANCH}' does NOT exist on the fork remote — the one-liners below would fail." >&2
-    echo "  pinned install target: fastedits @ git+${FORK_URL}@${INSTALLABLE_BRANCH} (MISSING)"
+    echo "  managed clone tracks: ${INSTALLABLE_BRANCH} (MISSING)"
   fi
   echo ""
 
@@ -1209,8 +1201,6 @@ print_success_footer() {
 # Mode resolution, branch autodetect, preflight detection
 # ---------------------------------------------------------------------------
 
-resolve_source_mode
-
 # --check exits before ANY mutating or validating surface: no source menu, no
 # remote-ref verification abort, no prompts. The ref matters to the report
 # only as the name it verifies, so --check resolves it from the same inputs
@@ -1227,37 +1217,21 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-# Validation must cover BOTH ways DEV can become 1: explicit --dev from a
-# stray copy of this script (no pyproject.toml -> abort loudly rather than
-# half-install), and menu pick [1] (which only ever offers a detected tree).
+# --dev is now a no-op compatibility flag (every install is editable from a
+# clone), so only --revert skips the source resolution below. --ref names
+# the branch a MANAGED clone tracks; from inside a checkout the clone's own
+# tree is used and --ref has no effect on the install.
+if [[ "$REF_SET" -eq 1 && "$HAVE_LOCAL_TREE" -eq 1 ]]; then
+  echo "note: --ref has no effect when running from inside a checkout (the working tree is the install source)" >&2
+fi
+
+# --dev is a no-op compatibility flag, and the run must SAY so rather than
+# silently swallow the flag a user (or a script) typed out of habit.
 if [[ "$DEV" -eq 1 ]]; then
-  if [[ ! -f "${REPO_ROOT}/pyproject.toml" ]]; then
-    echo "error: --dev installs from this repo's working tree, but no pyproject.toml was found at ${REPO_ROOT}" >&2
-    echo "error: run this script from a checkout of the fastedit repo, or drop --dev to install from git." >&2
-    exit 1
-  fi
-  if [[ "$REF_SET" -eq 1 ]]; then
-    echo "note: --ref has no effect with --dev (dev installs from the working tree, not a git ref)" >&2
-  fi
+  echo "note: --dev is a no-op: every install is now an editable install from a local clone (this checkout, or the managed clone at ${CLONE_DIR})" >&2
 fi
 
-# BRANCH AUTODETECT (fork mode) — default the ref to the CURRENT branch of the
-# local clone, so re-running the installer from a checkout tracks the branch
-# you are actually on instead of a hardcoded one. Only when: forward mode, no
-# explicit --ref, and a local tree was detected. Detached HEAD or a failed
-# query falls back to the built-in default with a note.
-if [[ "$REVERT" -eq 0 && "$DEV" -eq 0 && "$REF_SET" -eq 0 && "$HAVE_LOCAL_TREE" -eq 1 ]]; then
-  detected_ref="$(run_bounded 10 git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  if [[ -n "$detected_ref" && "$detected_ref" != "HEAD" ]]; then
-    REF="$detected_ref"
-    REF_AUTO=1
-    echo "branch: installing the local clone's current branch '${REF}' from the fork"
-  else
-    echo "note: could not detect the local clone's branch (detached HEAD?) — keeping the default '${REF}'" >&2
-  fi
-fi
-
-verify_remote_ref
+resolve_source_mode
 
 # PREFLIGHT DETECTION — printed for real runs and dry runs alike, before
 # anything is uninstalled.
@@ -1270,6 +1244,7 @@ if [[ "$REVERT" -eq 1 ]]; then
   sweep_uninstall "$PACKAGE"
   do_install "$PKG_SPEC"
   remove_agent_skill
+  remove_managed_clone
   if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "reverted: ${PACKAGE} is now upstream (no create/duplicate/split/join — that's expected)"
   fi
@@ -1285,13 +1260,7 @@ else
   fi
   handle_model_caches
 
-  if [[ "$DEV" -eq 1 ]]; then
-    echo "dev install (editable, tracks your working tree)"
-    echo "Installing ${PACKAGE} editable from ${REPO_ROOT} in place of upstream ${PACKAGE}..."
-  else
-    echo "fork install (pinned to ${REF})"
-    echo "Installing fork ${FORK_URL}@${REF} in place of upstream ${PACKAGE}..."
-  fi
+  echo "editable install from ${INSTALL_SOURCE} (branch ${REF})"
   sweep_uninstall "$PACKAGE"
 
   # Two-phase, and the order is the whole point. The model is only useful if
@@ -1338,11 +1307,7 @@ else
     else
       echo "warning: installing the '${INSTALL_EXTRAS}' extras failed; falling back to a bare install." >&2
       echo "warning: deterministic edits will work; model-merge edits will not, and the model pull is skipped." >&2
-      if [[ "$DEV" -eq 1 ]]; then
         echo "warning: to retry later: uv tool install --force --editable '$(build_spec "$INSTALL_EXTRAS")'" >&2
-      else
-        echo "warning: to retry later: uv tool install --force '$(build_spec "$INSTALL_EXTRAS")'" >&2
-      fi
       do_install "$(build_spec "")"
     fi
   else
