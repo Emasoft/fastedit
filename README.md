@@ -140,12 +140,9 @@ Avoid `pip install fastedits` into a Homebrew / distro-managed Python — it wil
 
 ### This fork
 
-This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with **`install-dev.sh`**, the repo's one installer. It has two forward modes:
+This fork is not published to PyPI — PyPI stays upstream's release channel. Install it with **`install-dev.sh`**, the repo's one installer. There is ONE install shape: an **editable install from a local clone** — `uv tool install --force --editable <clone>[extras]` — so what's on your system is always exactly what's in the repo.
 
-- **Fork install** (default) — installs from the fork's git repo, pinned to a branch/tag/sha. This is how you use the fork without cloning it.
-- **Dev install** (`--dev`) — installs **editable** from the repo's working tree, so your local changes take effect immediately, no reinstall. For development.
-
-> **Branch pin — read this first:** the fork's GitHub **default branch (`main`) is stale** — the repo's landing page shows old code. The installable branch is **`feat/create-file`**: every one-liner below pins it explicitly, and the installer's success footer repeats it. Verify any install with `fastedit --version`.
+> **Branch pin — read this first:** the fork's GitHub **default branch (`main`) is stale** — the repo's landing page shows old code. The installable branch is **`feat/create-file`**. Verify any install with `fastedit --version`.
 
 **From-scratch install (no clone needed)** — one line, pinned to the installable branch:
 
@@ -153,34 +150,27 @@ This fork is not published to PyPI — PyPI stays upstream's release channel. In
 curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/feat/create-file/scripts/install-dev.sh | bash
 ```
 
-Or, without running the installer at all — a direct one-shot try before you commit to installing:
+The installer maintains a **managed clone** at `~/.fastedit/src` (override: `FASTEDIT_CLONE_DIR`): cloned on the first run, then fetched and reset to the tracked branch on every run, and installed editable from it. Run from inside a fastedit checkout instead, and that working tree is the install source (no managed clone is created, and `--revert` never touches your checkout).
+
+**Update the fork** — re-run the same one-liner (idempotent: it re-syncs the managed clone to the branch tip and reinstalls), or pull directly:
 
 ```bash
-uvx --from 'fastedits[mcp] @ git+https://github.com/Emasoft/fastedit@feat/create-file' fastedit --help
+git -C ~/.fastedit/src pull && uv tool install --force --editable ~/.fastedit/src
 ```
 
-Download-then-run, deliberately, rather than `curl … | bash`: piping straight into a shell executes a **partial** script if the connection drops mid-transfer, and a shell will happily run the first half of an installer. Downloading first makes the fetch either succeed or fail as a whole, and leaves the script on disk to read before running it — which you should:
+Run from a checkout? Update with `git pull` — the install tracks it.
+
+Also worth knowing:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Emasoft/fastedit/feat/create-file/scripts/install-dev.sh -o /tmp/install-dev.sh
-bash /tmp/install-dev.sh
+scripts/install-dev.sh --check        # read-only state report — installs nothing
+scripts/install-dev.sh --revert       # back to upstream fastedits from PyPI (also removes the managed clone + agent skill)
+fastedit init                         # (re)install the agent skill from the installed package
 ```
 
-**From a clone**, if you have one:
+`--dev` still exists as a no-op compatibility flag (every install is editable now). The uvx try-before-install one-liner: `uvx --from 'fastedits[mcp] @ git+https://github.com/Emasoft/fastedit@feat/create-file' fastedit --help`. Download-then-run, if you prefer to read the script before running it: `curl -fsSL <same URL> -o /tmp/install-dev.sh && bash /tmp/install-dev.sh` — piping straight into a shell executes a partial script if the connection drops; downloading first makes the fetch succeed or fail as a whole.
 
-```bash
-git clone https://github.com/Emasoft/fastedit && cd fastedit
-scripts/install-dev.sh                        # fork install, pinned to feat/create-file
-scripts/install-dev.sh --dev                  # dev install: editable, tracks your working tree
-scripts/install-dev.sh --check                # read-only state report — installs nothing
-scripts/install-dev.sh --all-grammars no      # skip the offline grammar pack without being asked
-scripts/install-dev.sh --extras mlx,mcp       # override the auto-selected extras
-scripts/install-dev.sh --ref v1.2.3           # pin a branch/tag/sha (fork mode only)
-scripts/install-dev.sh --no-model             # skip the ~3 GB model download
-scripts/install-dev.sh --revert               # undo — back to upstream from PyPI
-```
-
-After a successful fork or dev install, the installer prints the two from-scratch one-liners (for people on machines without a clone) and the branch-pin note; `fastedit --version` confirms what landed. `--check` reports the current state without touching anything: installed `fastedits` per method, which `fastedit` binary wins on PATH and what `fastedit --version` reports on it, model caches (VALID/STALE), the grammar pack, the local clone, and whether the installable branch exists on the fork remote — plus the same two from-scratch one-liners. It needs no `npx` and works offline (an unreachable remote is a warning, not a failure).
+After a successful install, the installer prints the two from-scratch one-liners (for people on machines without a clone) and the branch-pin note; `fastedit --version` confirms what landed. `--check` reports the current state without touching anything: installed `fastedits` per method, which `fastedit` binary wins on PATH and what `fastedit --version` reports on it, model caches (VALID/STALE), the grammar pack, the local clone, and whether the installable branch exists on the fork remote — plus the same two from-scratch one-liners. It needs no `npx` and works offline (an unreachable remote is a warning, not a failure).
 
 ### Grammars: the one question the installer asks
 
@@ -192,7 +182,7 @@ Install all grammars? (offline 173-language tree-sitter pack — every tree-sitt
 
 **Enter = yes.** Answering yes adds the `all-grammars` extra, so every tree-sitter-supported language resolves offline (see "Supported languages" below). Answer `n`, or pre-answer with `--all-grammars no` to skip the pack. In non-interactive runs (CI, piped stdin) there is no prompt: all grammars default **on**, and the installer says so in one line — pass `--all-grammars no` to opt out. `--revert` never asks and never installs the pack.
 
-After installing, the installer verifies the grammar axis honestly via the tool's own Python and warns if the pack was selected but is missing. Note `--ref` applies to the *package* the script installs; to install a different branch's code in fork mode you must also fetch that branch's script, since the URL above pins `feat/create-file`. (`--ref` has no effect with `--dev`, which installs your working tree; the installer points that out.)
+After installing, the installer verifies the grammar axis honestly via the tool's own Python and warns if the pack was selected but is missing. Note `--ref` names the branch a **managed clone** tracks (standalone runs; default `feat/create-file`). From inside a checkout it has no effect — the working tree is the install source.
 
 The fork ships under the same PyPI name and console-script names as upstream, so the script uninstalls any existing `fastedits` from every method it finds (uv tool, pipx, pip) before installing, then verifies the `fastedit` that actually ends up on PATH is the fork — not a shadowed leftover. Add `--dry-run` to any of the above to see the commands without running them.
 
