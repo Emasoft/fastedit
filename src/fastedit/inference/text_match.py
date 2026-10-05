@@ -82,6 +82,80 @@ _AMBIGUOUS_LINES = frozenset([
 _MIN_ANCHOR_LENGTH = 4
 
 
+def _marker_snippet_placement_refusal(original_func: str, snippet: str) -> str:
+    """Explain WHY a marker-bearing snippet cannot be placed (issue #12).
+
+    ``deterministic_edit`` declined a snippet that carries a keep-marker,
+    and the caller's refusal used to claim "no anchor line matched the
+    original body" even when the anchor line EXISTS but is REPEATED across
+    the symbol (a ``} catch {`` line twenty occurrences deep, say) — the
+    one case where the fix is obvious from the data but the message said
+    the opposite of what was true.
+
+    This helper re-reads the same data the editor used and names the first
+    actionable fact, with the remedy spelled out:
+
+      * enough unique anchors matched but the editor still declined → the
+        snippet is an ambiguous rewrite or changes the structural balance;
+        the full replacement body is the way through;
+      * a snippet line matches N > 1 original lines → that anchor is
+        ambiguous; include more surrounding unique lines;
+      * nothing matched → the classic no-anchor message (unchanged);
+      * fewer than two unique anchors matched → say so (the editor's own
+        floor).
+
+    Diagnostic only — it never decides the edit; ``deterministic_edit``
+    already declined, and this only makes the decline actionable.
+    """
+    original_counts: dict[str, int] = {}
+    for line in original_func.splitlines():
+        stripped = line.strip()
+        if stripped:
+            original_counts[stripped] = original_counts.get(stripped, 0) + 1
+
+    unique_matches = 0
+    matched_any = False
+    repeated_line: str | None = None
+    repeated_count = 0
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if not stripped or is_marker_line(line):
+            continue
+        count = original_counts.get(stripped, 0)
+        if count == 0:
+            continue
+        matched_any = True
+        if count == 1:
+            unique_matches += 1
+        elif repeated_line is None:
+            repeated_line, repeated_count = stripped, count
+
+    if unique_matches >= 2:
+        return (
+            "the snippet matched the original body, but the deterministic "
+            "editor still declined the merge — pass the full replacement "
+            "body instead of a marker"
+        )
+    if repeated_line is not None:
+        return (
+            f"the anchor line {repeated_line!r} matches {repeated_count} "
+            f"original lines, so its position is ambiguous — include more "
+            f"surrounding unique lines in the snippet (or pass the full "
+            f"replacement body instead of a marker)"
+        )
+    if not matched_any:
+        return (
+            "no anchor line matched the original body. Pass the full "
+            "replacement body instead of a marker."
+        )
+    return (
+        f"only {unique_matches} unique anchor line(s) matched the original "
+        f"body — at least two are needed to place the edit; include more "
+        f"surrounding unique lines in the snippet (or pass the full "
+        f"replacement body instead of a marker)"
+    )
+
+
 def snippet_has_keep_marker(snippet: str) -> bool:
     """True when a snippet contains a line that IS a keep-marker.
 

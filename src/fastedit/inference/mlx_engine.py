@@ -366,7 +366,24 @@ class MLXEngine:
         cache_dir: str | None = None,
         max_cache_bytes: int = 2 * 1024 * 1024 * 1024,
     ):
-        self.model, self.tokenizer = load(model_path)
+        # Issue #12: transformers prints its tokenizer-conversion warnings
+        # (e.g. the Mistral `fix_mistral_regex` notice) on EVERY engine
+        # init, burying fastedit's own model-path diagnostics. Scope the
+        # suppression to the load itself — transformers' verbosity drops to
+        # ERROR around `load()` and is RESTORED afterwards, so real load
+        # failures still surface and no other library's logging is muted
+        # for the process lifetime. (transformers.logging is an attribute
+        # alias of transformers.utils.logging, so it is imported as an
+        # attribute, not a submodule.)
+        import transformers
+
+        _hf_logging = transformers.logging
+        _prev_verbosity = _hf_logging.get_verbosity()
+        _hf_logging.set_verbosity_error()
+        try:
+            self.model, self.tokenizer = load(model_path)
+        finally:
+            _hf_logging.set_verbosity(_prev_verbosity)
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
         self.max_tokens = max_tokens

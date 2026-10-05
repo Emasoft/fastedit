@@ -453,7 +453,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     from .data_gen.ast_analyzer import validate_parse
     from .inference.chunked_merge import (
         ChunkedMergeResult,
-        _deterministic_result_is_faithful,
+        _deterministic_result_unfaithful_reason,
         _normalize_merged_eol,
         _qualified_symbol_names,
         _resolve_symbol,
@@ -461,7 +461,11 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         get_ast_map,
         get_ast_map_from_source,
     )
-    from .inference.text_match import deterministic_edit, snippet_has_keep_marker
+    from .inference.text_match import (
+        _marker_snippet_placement_refusal,
+        deterministic_edit,
+        snippet_has_keep_marker,
+    )
     from .split_join import (
         detect_line_ending,
         normalize_bare_cr_for_ast,
@@ -537,11 +541,16 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         # selective re-indent all parse fine), so the SAME content battery
         # chunked_merge wraps its own text-match result with runs here too.
         # Failure falls through to the model path, which is fully validated.
-        if not _deterministic_result_is_faithful(original_func, edited, snippet):
+        unfaithful_reason = _deterministic_result_unfaithful_reason(
+            original_func, edited, snippet,
+        )
+        if unfaithful_reason is not None:
+            # Issue #12: name the first failing line and the rule — a bare
+            # "failed the content-faithfulness check" cannot be corrected.
             print(
                 f"Deterministic text-match for '{replace_sym}' failed the "
-                f"content-faithfulness check; falling through to the "
-                f"validated model path.",
+                f"content-faithfulness check ({unfaithful_reason}); falling "
+                f"through to the validated model path.",
                 file=sys.stderr,
             )
             return None
@@ -585,10 +594,15 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # returning None would route to a merge backend that may not be installed and
     # surface as a bare ModuleNotFoundError, which tells the user nothing.
     if snippet_has_keep_marker(snippet):
+        # Issue #12: the old message claimed "no anchor line matched the
+        # original body" even when the anchor EXISTS but is repeated across
+        # the symbol (ambiguous). Diagnose the actual decline and spell out
+        # the remedy (the text_match helper reads the same data the editor
+        # used).
         raise ValueError(
-            f"snippet for '{replace_sym}' contains a keep-marker but no anchor line "
-            f"matched the original body, so fastedit cannot place the edit. "
-            f"Pass the full replacement body instead of a marker."
+            f"snippet for '{replace_sym}' contains a keep-marker but the edit "
+            f"cannot be placed deterministically: "
+            f"{_marker_snippet_placement_refusal(original_func, snippet)}"
         )
 
     # DIRECT-SWAP PARSE GATE (exit-0 regression, Step 5 follow-up). Everything
@@ -704,6 +718,31 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
         )
     # Parse invalid: fall through to model-based chunked_merge
     return None
+
+# Issue #12(5): a refused edit wrote nothing and created no backup, but
+# `fastedit diff` after it said "No backup recorded ... Run an edit command
+# first", which read as if the edit might have half-applied. The refusal is
+# the right place to say the two things the user needs: nothing changed,
+# and a follow-up diff will show no changes. Printed by every cmd_edit
+# refusal path below (all of them exit before the atomic write).
+_EDIT_REFUSAL_DIFF_NOTE = (
+    "The edit was refused — the file is unchanged; `fastedit diff` will "
+    "show no changes."
+)
+
+
+def _print_edit_refusal(message: str) -> None:
+    """Print a refusal line plus the unchanged-file/diff guidance (issue #12).
+
+    ``message`` may arrive with or without the ``Error: `` prefix (the
+    shared write-gate refusal already carries it verbatim for MCP parity).
+    """
+    print(
+        message if message.startswith("Error: ") else f"Error: {message}",
+        file=sys.stderr,
+    )
+    print(_EDIT_REFUSAL_DIFF_NOTE, file=sys.stderr)
+
 
 def _refuse_if_edit_broke_parse(path, original_code, merged_code, language):
     """Raise when THIS edit is what broke the parse.
@@ -823,13 +862,13 @@ def _cmd_edit_locked(args):
             # raises ValueError instead of returning None so the failure is a
             # clean diagnostic here, not a bare traceback nor a silent fall-through
             # to a merge backend that may not be installed.
-            print(f"Error: {e}", file=sys.stderr)
+            _print_edit_refusal(str(e))
             sys.exit(1)
         if result is not None:
             try:
                 _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
             except ValueError as e:
-                print(f"Error: {e}", file=sys.stderr)
+                _print_edit_refusal(str(e))
                 sys.exit(1)
             try:
                 _atomic_write(
@@ -867,13 +906,13 @@ def _cmd_edit_locked(args):
             replace=replace_sym,
         )
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _print_edit_refusal(str(e))
         sys.exit(1)
 
     try:
         _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _print_edit_refusal(str(e))
         sys.exit(1)
 
     # Hallucination gate (MCP parity, Step 18): a merge whose chunks were
@@ -898,8 +937,10 @@ def _cmd_edit_locked(args):
             metrics += f", {result.chunks_used} chunk(s)"
         metrics += _validation_retries_metric(getattr(result, "retries", 0))
         # The shared refusal already opens with "Error: " (the verbatim MCP
-        # wording) — printing it as-is keeps one prefix, never a doubled
-        # "Error: Error: ...".
+        # wording) and carries the unchanged-file/diff guidance itself
+        # (issue #12(5) — the clause lives in _rejection_refusal so the
+        # CLI/MCP wording stays byte-identical). Print it as-is: one prefix,
+        # never a doubled "Error: Error: ...", no second note line.
         print(_rejection_refusal(result, metrics), file=sys.stderr)
         sys.exit(1)
 

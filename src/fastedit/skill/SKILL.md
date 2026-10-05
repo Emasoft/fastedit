@@ -179,7 +179,7 @@ writers.
 | `file changed on disk since it was read` | A non-fastedit writer changed the file; nothing was written; re-run against current content |
 | `parse errors; refusing to write` | The edit introduced new syntax errors; fix the snippet; the file is unchanged |
 | `Symbol 'x' not found` | Check the name — the error lists available symbols; `fastedit read` shows the map |
-| `contains a keep-marker but no anchor line` / `has no definition` | Pass the full replacement including the definition line, or use `--after` to insert |
+| `contains a keep-marker but the edit cannot be placed deterministically` / `has no definition` | The refusal names the fix (more surrounding unique lines, or the full replacement); or use `--after` to insert |
 | `Model not found locally` | `fastedit pull --model mlx-8bit` (Apple Silicon) or `--model bf16` (Linux/GPU) |
 | anything else | `fastedit doctor` |
 

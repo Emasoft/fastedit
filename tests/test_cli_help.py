@@ -129,7 +129,7 @@ def test_troubleshooting_quotes_real_error_strings():
         ("src/fastedit/mcp/backup.py", "file changed on disk since it was read"),
         ("src/fastedit/cli.py", "parse errors; refusing to write"),
         ("src/fastedit/cli.py", "Symbol '"),
-        ("src/fastedit/cli.py", "contains a keep-marker but no anchor line"),
+        ("src/fastedit/cli.py", "contains a keep-marker but the edit"),
         ("src/fastedit/cli.py", "has no definition"),
         ("src/fastedit/model_download.py", "Model not found locally"),
         ("src/fastedit/inference/markers.py", "# ... existing code ..."),

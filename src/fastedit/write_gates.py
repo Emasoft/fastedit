@@ -30,9 +30,17 @@ def _all_chunks_rejected(result) -> bool:
 
 def _rejection_refusal(result, metrics: str) -> str:
     """Fail-loud refusal for an all-chunks-rejected merge. Never
-    force-overridable: a hallucinated merge has no safe interpretation."""
+    force-overridable: a hallucinated merge has no safe interpretation.
+
+    Issue #12(5): the refusal also says what a follow-up ``fastedit diff``
+    will show — nothing — so a diff after the refusal never reads as if the
+    edit might have half-applied ("No backup recorded ..."). The clause
+    lives HERE, in the shared refusal both the MCP tools and the CLI print
+    verbatim, so the CLI/MCP wording stays byte-identical.
+    """
     return (
         f"Error: edit rejected — model hallucinated on {result.chunks_rejected} chunk(s). "
         f"File unchanged. The function may be too large ({result.chunks_used} chunk(s)) "
         f"for the 1.7B model. Try a smaller edit or split the function. {metrics}"
+        f" — `fastedit diff` will show no changes."
     )

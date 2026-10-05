@@ -193,6 +193,7 @@ def _check_hallucinations(
     merged_chunk: str,
     snippet: str,
     tokens: list[tuple[str, int | None, str | None]] | None = None,
+    allow_complete_replacement: bool = False,
 ) -> float:
     """Score merge quality: 1.0 = clean, 0.0 = hallucinated.
 
@@ -219,6 +220,15 @@ def _check_hallucinations(
     depth than the editor's ambiguous-anchor rule, producing phantom
     anchors that reject faithful editor output. ``None`` (the model path)
     classifies with :func:`_classify_snippet` exactly as before.
+
+    ``allow_complete_replacement`` (issue #6) scopes the sanctioned
+    single-line replacement to the caller that knows the file is
+    STRUCTURELESS — only the battery (:func:`_merge_rejection_reason`) can
+    grant it, because only there is a whole-span restatement the snippet
+    genuinely declares (the text-window flow builds it from anchors over
+    the whole window). Default ``False`` keeps the code-file contract
+    strict (B4): a marker-free one-line transform of a code span stays a
+    preserve-by-default refusal.
 
     A merge is rejected on any of:
 
@@ -253,22 +263,103 @@ def _check_hallucinations(
     ``_replacement_key`` (imported from :mod:`text_match`) is the single
     shared identity heuristic — the validator maintains no second
     language model. Returns ``1.0`` for a clean merge, ``0.0`` otherwise.
+
+    Issue #12: the refusal must NAME the first failing line and the rule.
+    The score alone cannot; use :func:`_hallucination_reason` for the
+    diagnostic (this wrapper stays the score-level API).
     """
-    # Marker leak guard. Scan the raw merged chunk first so a leaked
-    # marker cannot be hidden by the stripped-line comparison below.
+    return 1.0 if _hallucination_reason(
+        original_chunk, merged_chunk, snippet, tokens,
+        allow_complete_replacement=allow_complete_replacement,
+    ) is None else 0.0
+
+
+def _hallucination_reason(
+    original_chunk: str,
+    merged_chunk: str,
+    snippet: str,
+    tokens: list[tuple[str, int | None, str | None]] | None = None,
+    allow_complete_replacement: bool = False,
+) -> str | None:
+    """First content-faithfulness violation with line + rule, or ``None``.
+
+    Issue #12: "failed the content-faithfulness check" named nothing, so a
+    refused deterministic splice could not be corrected. This is the same
+    validator as :func:`_check_hallucinations` returning the FIRST
+    violation as a human-readable reason instead of a 0.0 score — the
+    retry loop and the CLI embed it verbatim:
+
+      * ``marker leaked into the merge: '<line>'``;
+      * everything :func:`_merge_unfaithful_reason` reports (dropped /
+        invented / re-indented / reordered lines, each named).
+
+    The marker leak is checked on the RAW merged chunk first so a leaked
+    marker cannot be hidden by the stripped-line comparison below.
+
+    ``allow_complete_replacement`` scopes the issue #6 single-line
+    replacement to the structureless battery (see
+    :func:`_check_hallucinations`); default ``False`` keeps code spans
+    under the strict B4 preserve-by-default contract.
+    """
     for raw_line in merged_chunk.splitlines():
         if raw_line.strip() and _is_marker_line(raw_line):
-            return 0.0
+            return f"marker leaked into the merge: {raw_line.strip()!r}"
 
     orig, orig_raw = _raw_content_lines(original_chunk)
     merged, merged_raw = _raw_content_lines(merged_chunk)
     if tokens is None:
         tokens = _classify_snippet(snippet, orig)
 
-    return 1.0 if _merge_is_faithful(
-        orig, merged, tokens, orig_raw, merged_raw,
+    return _merge_unfaithful_reason(
+        orig, merged, tokens,
+        orig_raw, merged_raw,
         wrap_insertion_only=_tokens_declare_insertion_only(tokens),
-    ) else 0.0
+        allow_complete_replacement=allow_complete_replacement,
+    )
+
+
+def _complete_restatement_removals(
+    orig: list[str],
+    tokens: list[tuple[str, int | None, str | None]],
+) -> list[int]:
+    """Original content lines a COMPLETE one-for-one restatement replaces.
+
+    Issue #6's sanctioned single-line replacement shape on structureless
+    files: the snippet restates the WHOLE span with the one line changed —
+    every original content line except exactly ONE binds as a context
+    anchor, and the snippet declares exactly one new line. The one
+    uncovered line is then not an "unmentioned original": it is the line
+    the snippet replaced, and the merge (which must equal the snippet's
+    declared content) could not have kept it. Both consumers of this
+    predicate agree by construction — and BOTH are reached only on the
+    structureless flow, whose battery grants the rule explicitly
+    (``allow_complete_replacement=structureless`` in
+    :func:`_merge_rejection_reason`); a code span keeps the strict B4
+    contract, so a code-file restatement shape is never credited here:
+
+      * the content validator justifies that one deletion
+        (:func:`_unjustified_deletion_reason`);
+      * the op derivation credits it to ``removable_traits``
+        (:func:`_snippet_justifiable_removals`), making the D1 trait
+        arithmetic exact replace-one-line-with-one-line arithmetic.
+
+    Anything else returns ``[]`` — a restatement that omits a line without
+    a declared replacement, a two-lines-become-one rewrite, a zero-anchor
+    snippet, and every partial (anchor-bracketed) shape all stay outside
+    this rule and keep failing closed.
+
+    ``orig`` is the content-line view (blank/marker lines already skipped —
+    see :func:`_raw_content_lines`) and ``tokens`` the classified snippet
+    tokens whose context indices index THAT view.
+    """
+    anchors = {t[1] for t in tokens if t[0] == "context"}
+    new_count = sum(1 for t in tokens if t[0] == "new")
+    if new_count != 1:
+        return []
+    uncovered = [i for i in range(len(orig)) if i not in anchors]
+    if len(uncovered) != 1:
+        return []
+    return uncovered
 
 
 def _deterministic_result_is_faithful(
@@ -313,6 +404,31 @@ def _deterministic_result_is_faithful(
     Returns ``True`` only when the score is clean (``1.0``); anything else
     fails closed and the caller discards the deterministic result to the
     model path.
+
+    Issue #12: a plain ``False`` names no line and no rule, so the refusal
+    the CLI prints cannot be acted on. Use
+    :func:`_deterministic_result_unfaithful_reason` for the diagnostic
+    (this wrapper stays the boolean gate).
+    """
+    reason = _deterministic_result_unfaithful_reason(
+        original_func, edited, snippet, prepend_signature_lines,
+    )
+    return reason is None
+
+
+def _deterministic_result_unfaithful_reason(
+    original_func: str,
+    edited: str,
+    snippet: str,
+    prepend_signature_lines: int = 0,
+) -> str | None:
+    """First faithfulness violation of a deterministic splice (issue #12).
+
+    Same gate as :func:`_deterministic_result_is_faithful`, returning the
+    FIRST violation — rule + offending line content — instead of ``False``,
+    e.g. ``"unmentioned original line dropped: 'ops.push(...)'"``. The
+    CLI's deterministic-refusal print embeds this verbatim so the snippet
+    can be corrected. Returns ``None`` when the splice is faithful.
     """
     from .text_match import _AmbiguousAnchorBinding, _classify_edit_lines
 
@@ -328,7 +444,7 @@ def _deterministic_result_is_faithful(
         # deterministic result built on a guessed binding never reaches
         # the file. (In practice unreachable — the editor already declined
         # on this classification — but the gate must never guess either.)
-        return False
+        return "ambiguous anchor binding: multiple equally valid original regions"
 
     # Translate the editor's raw-line indices into the validator's
     # content-line index space (blanks and marker lines are skipped
@@ -355,9 +471,9 @@ def _deterministic_result_is_faithful(
         else:
             tokens.append(("new", None, line.strip()))
 
-    return _check_hallucinations(
+    return _hallucination_reason(
         original_func, edited, snippet, tokens=tokens,
-    ) == 1.0
+    )
 
 
 def _snippet_splice_covers_deleted_lines(
@@ -858,19 +974,61 @@ def _merge_is_faithful(
     merged_raw: list[str],
     wrap_insertion_only: bool = False,
 ) -> bool:
-    """Check the merge against the per-segment invariants.
+    """Check the merge against the per-segment invariants (issue #12 gate).
 
-    Context anchors must appear in the merge in order (else declared
-    context was dropped or shuffled). The anchors partition the original
-    and the merge into aligned leading, internal and trailing segments,
-    each validated by :func:`_segment_is_faithful` together with the raw,
-    indent-bearing lines behind its stripped content (B14).
+    Boolean convenience wrapper: faithful exactly when
+    :func:`_merge_unfaithful_reason` finds no violation. See the reason
+    variant for the invariant list and the failing-line diagnostics.
+    """
+    return _merge_unfaithful_reason(
+        orig, merged, tokens, orig_raw, merged_raw,
+        wrap_insertion_only=wrap_insertion_only,
+    ) is None
+
+
+def _merge_unfaithful_reason(
+    orig: list[str],
+    merged: list[str],
+    tokens: list[tuple[str, int | None, str | None]],
+    orig_raw: list[str],
+    merged_raw: list[str],
+    wrap_insertion_only: bool = False,
+    allow_complete_replacement: bool = False,
+) -> str | None:
+    """First violation of the per-segment invariants, or ``None`` (issue #12).
+
+    The boolean gate (:func:`_merge_is_faithful`) could only say
+    "unfaithful" — the refusal then named no line and no rule, and a
+    deterministic splice could not be corrected. This variant returns a
+    human-readable description of the FIRST violation instead, naming the
+    line content and the rule it broke; the retry loop and the CLI embed
+    it verbatim in the refusal message. Checking order:
+
+      * declared context anchor missing from the merge;
+      * a context anchor re-indented without a declared scope;
+      * per-segment violations (:func:`_segment_unfaithful_reason`), in
+        segment order.
 
     ``wrap_insertion_only`` (C2): a snippet whose own shape declares a
-    genuine wrap_block (:func:`_snippet_declares_wrap`) is an insertion-only
-    op — the positional deletion fallback is disabled for every segment, so
-    a model merge that "wraps" while dropping an original line is rejected
-    instead of ratified.
+    genuine wrap_block is an insertion-only op — the positional deletion
+    fallback is disabled for every segment, so a model merge that "wraps"
+    while dropping an original line is rejected instead of ratified.
+
+    COMPLETE-RESTATEMENT REPLACEMENT (issue #6): when
+    ``allow_complete_replacement`` is granted — ONLY by the battery for a
+    STRUCTURELESS file (:func:`_merge_rejection_reason`) — and the snippet
+    binds every original content line except exactly ONE as a context
+    anchor AND declares exactly one new line
+    (:func:`_complete_restatement_removals`), that one deletion is the
+    snippet's declared single-line replacement — the merge is then
+    byte-for-byte the snippet's declared content, nothing else could have
+    survived, so the identity-free deletion is justified instead of
+    failing closed. The structureless one-line replace flow
+    (.gitignore-style files, no grammar, no markers) depends on this; a
+    code span keeps the strict B4 contract (the flag defaults False — a
+    marker-free one-line transform of code stays a refusal), and the
+    per-segment one-for-one shape check in :func:`_deletions_justified`
+    keeps every other deletion fail-closed.
 
     Anchors are located in the merge through the GLOBAL survivor alignment
     (:func:`_lcs_pair_map`, the same LCS the per-segment survivor check
@@ -900,7 +1058,10 @@ def _merge_is_faithful(
                     found = j
                     break
         if found is None:
-            return False
+            return (
+                "declared context anchor missing from the merge: "
+                f"{orig[a]!r}"
+            )
         merged_pos.append(found)
         mcursor = found + 1
 
@@ -928,19 +1089,31 @@ def _merge_is_faithful(
                 and _indent_width(orig_raw[orig_idx])
                 != _indent_width(merged_raw[merged_idx])
             ):
-                return False
+                return (
+                    "context anchor re-indented without a declared scope: "
+                    f"{orig[orig_idx]!r}"
+                )
             scope_declared = False
             anchor_rank += 1
 
+    # Issue #6: the sanctioned single-line replacement engages only when the
+    # battery granted it for a structureless file (see the docstring) — a
+    # code span never gets the allowance (B4 preserve-by-default).
+    span_replacement = (
+        allow_complete_replacement
+        and bool(_complete_restatement_removals(orig, tokens))
+    )
     for (
         orig_seg, merged_seg, seg_tokens, orig_seg_raw, merged_seg_raw,
     ) in _build_segments(orig, merged, tokens, anchors, merged_pos, orig_raw, merged_raw):
-        if not _segment_is_faithful(
+        reason = _segment_unfaithful_reason(
             orig_seg, merged_seg, seg_tokens, orig_seg_raw, merged_seg_raw,
             wrap_insertion_only=wrap_insertion_only,
-        ):
-            return False
-    return True
+            allow_complete_replacement=span_replacement,
+        )
+        if reason is not None:
+            return reason
+    return None
 
 
 def _build_segments(
@@ -1025,8 +1198,44 @@ def _segment_is_faithful(
     orig_seg_raw: list[str],
     merged_seg_raw: list[str],
     wrap_insertion_only: bool = False,
+    allow_complete_replacement: bool = False,
 ) -> bool:
     """Validate one segment against the preserve-by-default invariants.
+
+    Boolean convenience wrapper: faithful exactly when
+    :func:`_segment_unfaithful_reason` finds no violation.
+    """
+    return _segment_unfaithful_reason(
+        orig_seg, merged_seg, seg_tokens, orig_seg_raw, merged_seg_raw,
+        wrap_insertion_only=wrap_insertion_only,
+        allow_complete_replacement=allow_complete_replacement,
+    ) is None
+
+
+def _segment_unfaithful_reason(
+    orig_seg: list[str],
+    merged_seg: list[str],
+    seg_tokens: list[tuple[str, int | None, str | None]],
+    orig_seg_raw: list[str],
+    merged_seg_raw: list[str],
+    wrap_insertion_only: bool = False,
+    allow_complete_replacement: bool = False,
+) -> str | None:
+    """First violation in one segment, naming the line and rule (issue #12).
+
+    The boolean form of this gate could only say "unfaithful"; the refusal
+    then carried no line and no rule. This variant describes the FIRST
+    violation instead (the caller embeds it verbatim in the refusal):
+
+      * ``declared new line '<x>' missing from the merge`` / ``merge line
+        '<y>' is not a declared snippet line`` — the merge's new lines
+        must equal the snippet's declared new lines exactly;
+      * ``preserved line '<x>' re-indented`` — B14's indent-delta rule;
+      * ``new line '<x>' on the wrong side of the preserved gap`` — the
+        marker side-order rule;
+      * ``unmentioned original line dropped: '<x>'`` (identity-free) or
+        ``original line '<x>' dropped without a unique replacement``
+        (keyed) — the deletion-justification rules.
 
     EVERY segment is protected (B4): a segment is an insertion zone, never
     a replacement zone. Whether it leads the span, trails it, fills a
@@ -1035,27 +1244,11 @@ def _segment_is_faithful(
     into them — the merge may not overwrite the segment with its new
     lines.
 
-    A segment is faithful when all of the following hold:
-
-      * **invention / omission / duplication / new-line reorder** — the
-        merge's unmatched lines equal the declared new lines for the
-        segment exactly (order and multiplicity);
-      * **indentation faithfulness (B14)** — consecutive surviving
-        originals keep the indent DELTA they have in the original,
-        computed on the raw indent-bearing lines (see
-        :func:`_indent_deltas_preserved`); a uniform shift of a whole
-        group (block wrapping) is accepted, selective re-indentation of a
-        single survivor is not;
-      * **marker side-order** (marker-bearing segments) — a declared new
-        line keeps the side of the preserved gap the snippet gave it (see
-        :func:`_new_side_order_ok`);
-      * **justified deletion** — every original the merge drops is
-        justified (see :func:`_deletions_justified`): a unique shared
-        ``_replacement_key`` identity, or — only when the segment actually
-        carries a marker AND the snippet is not a declared wrap
-        (``wrap_insertion_only``, C2) — marker-adjacent positional
-        adjacency for an identity-free line. With no marker, or in a
-        declared wrap, identity-free deletions fail closed.
+    ``allow_complete_replacement`` (issue #6) is the span-level
+    complete-restatement property from
+    :func:`_complete_restatement_removals`: when the snippet restates the
+    whole span except one line, the single one-for-one deletion in a
+    segment is the declared replacement instead of an unmentioned drop.
     """
     new_all = [t[2] for t in seg_tokens if t[0] == "new"]
     has_marker = any(t[0] == "marker" for t in seg_tokens)
@@ -1068,15 +1261,16 @@ def _segment_is_faithful(
         merged_seg[j] for j in range(len(merged_seg)) if j not in kept_merged
     ]
     if new_in_merged != new_all:
-        return False
+        return _new_lines_mismatch_reason(new_all, new_in_merged)
 
     # B14: surviving originals keep their relative indentation. Checked on
     # the raw lines — the stripped comparison above cannot see indent
     # corruption.
-    if not _indent_deltas_preserved(
+    reason = _indent_delta_violation(
         orig_seg_raw, kept_orig, merged_seg_raw, kept_merged,
-    ):
-        return False
+    )
+    if reason is not None:
+        return reason
 
     # Marker side-order invariant: a snippet-new line declared before the
     # first marker must precede every surviving original in the merge, and a
@@ -1084,12 +1278,14 @@ def _segment_is_faithful(
     # Checked before the deletion justification below because a wrong-side
     # new line can violate the invariant with no deletion at all (the
     # survivor multiset is intact — only the relative placement is corrupt).
-    if has_marker and not _new_side_order_ok(seg_tokens, merged_seg, kept_merged):
-        return False
+    if has_marker:
+        reason = _side_order_violation(seg_tokens, merged_seg, kept_merged)
+        if reason is not None:
+            return reason
 
     deleted = [i for i in range(len(orig_seg)) if i not in kept_orig]
     if not deleted:
-        return True
+        return None
 
     new_before: list[str] = []
     new_after: list[str] = []
@@ -1104,10 +1300,38 @@ def _segment_is_faithful(
             t[2] for i, t in enumerate(seg_tokens)
             if t[0] == "new" and i > last_marker
         ]
-    return _deletions_justified(
+    return _unjustified_deletion_reason(
         orig_seg, deleted, new_all, new_before, new_after,
         allow_positional=has_marker and not wrap_insertion_only,
+        allow_complete_replacement=allow_complete_replacement,
     )
+
+
+def _new_lines_mismatch_reason(
+    new_all: list[str | None],
+    new_in_merged: list[str],
+) -> str:
+    """Name the first declared-new-line mismatch (issue #12 diagnostics)."""
+    for declared, actual in zip(new_all, new_in_merged, strict=False):
+        if declared != actual:
+            return (
+                f"declared new line {declared!r} is missing from the merge "
+                f"(merge has {actual!r} there)"
+            )
+    if len(new_in_merged) > len(new_all):
+        return (
+            f"merge line {new_in_merged[len(new_all)]!r} is not a declared "
+            f"snippet line"
+        )
+    if len(new_all) > len(new_in_merged):
+        return (
+            f"declared new line {new_all[len(new_in_merged)]!r} is missing "
+            f"from the merge"
+        )
+    return "the merge's new lines do not match the snippet's declared new lines"
+
+
+
 
 
 def _indent_deltas_preserved(
@@ -1116,7 +1340,22 @@ def _indent_deltas_preserved(
     merged_seg_raw: list[str],
     kept_merged: set[int],
 ) -> bool:
-    """B14: consecutive surviving originals keep their relative indentation.
+    """B14 boolean wrapper: faithful exactly when no indent delta breaks.
+
+    See :func:`_indent_delta_violation` for the rule and the diagnostic.
+    """
+    return _indent_delta_violation(
+        orig_seg_raw, kept_orig, merged_seg_raw, kept_merged,
+    ) is None
+
+
+def _indent_delta_violation(
+    orig_seg_raw: list[str],
+    kept_orig: set[int],
+    merged_seg_raw: list[str],
+    kept_merged: set[int],
+) -> str | None:
+    """B14: name the first surviving original whose indent delta broke.
 
     The LCS pairs survivors on STRIPPED content, so a merge can keep every
     line's content while selectively re-indenting it — flattening one
@@ -1134,6 +1373,10 @@ def _indent_deltas_preserved(
     The k-th original survivor pairs with the k-th merge survivor: the LCS
     traceback yields strictly increasing index pairs on both sides, so
     sorting each set and zipping reproduces the alignment.
+
+    Returns ``None`` when every consecutive survivor pair keeps its delta,
+    else a reason naming the second line of the failing pair — the line
+    whose indent moved relative to its surviving neighbour.
     """
     pairs = zip(sorted(kept_orig), sorted(kept_merged))
     for (i1, j1), (i2, j2) in itertools.pairwise(pairs):
@@ -1144,8 +1387,11 @@ def _indent_deltas_preserved(
             _indent_width(merged_seg_raw[j2]) - _indent_width(merged_seg_raw[j1])
         )
         if orig_delta != merged_delta:
-            return False
-    return True
+            return (
+                f"preserved line {orig_seg_raw[i2].strip()!r} re-indented "
+                f"relative to its surviving neighbour"
+            )
+    return None
 
 
 def _deletions_justified(
@@ -1155,22 +1401,67 @@ def _deletions_justified(
     new_before: list[str],
     new_after: list[str],
     allow_positional: bool = False,
+    allow_complete_replacement: bool = False,
 ) -> bool:
     """Decide whether every deleted protected original is justified.
 
-    A *keyed* original (``_replacement_key`` is not ``None``) may be deleted
-    only when exactly one original and exactly one declared new line share
-    its key — a unique shared identity. Any other keyed deletion fails
-    closed. An *identity-free* original may be deleted by positional
-    fallback only, when it sits contiguously against a marker boundary that
-    carries an identity-free new line (front for lines declared before the
-    marker, back for lines declared after) — never an arbitrary bystander.
+    Boolean convenience wrapper: justified exactly when
+    :func:`_unjustified_deletion_reason` finds no violation.
+    """
+    return _unjustified_deletion_reason(
+        orig_seg, deleted, new_all, new_before, new_after,
+        allow_positional=allow_positional,
+        allow_complete_replacement=allow_complete_replacement,
+    ) is None
+
+
+def _unjustified_deletion_reason(
+    orig_seg: list[str],
+    deleted: list[int],
+    new_all: list[str],
+    new_before: list[str],
+    new_after: list[str],
+    allow_positional: bool = False,
+    allow_complete_replacement: bool = False,
+) -> str | None:
+    """Name the FIRST unjustified deleted protected original (issue #12).
+
+    The boolean form of this gate could only fail the merge; the refusal
+    then read "preserve-by-default violation" with no line and no rule.
+    This variant returns a reason naming the rule and the line content:
+
+      * ``original line '<x>' dropped without a unique replacement`` — a
+        keyed original whose ``_replacement_key`` is not shared by exactly
+        one original and exactly one declared new line;
+      * ``unmentioned original line dropped: '<x>'`` — an identity-free
+        original with no local justification.
+
+    A *keyed* original may be deleted only when exactly one original and
+    exactly one declared new line share its key — a unique shared
+    identity. Any other keyed deletion fails closed. An *identity-free*
+    original may be deleted by positional fallback only, when it sits
+    contiguously against a marker boundary that carries an identity-free
+    new line (front for lines declared before the marker, back for lines
+    declared after) — never an arbitrary bystander.
 
     The positional fallback requires ``allow_positional``: it exists only
     where a marker defines the boundary it leans on. A segment without a
     marker has no such boundary, so EVERY identity-free deletion in it
     fails closed regardless of the declared new lines (defaults to False
     — fail closed).
+
+    ``allow_complete_replacement`` (issue #6) is the one sanctioned
+    marker-free exception: when the snippet is a COMPLETE RESTATEMENT of
+    the span — every original content line except exactly one is bound as
+    a context anchor (:func:`_complete_restatement_removals`) — and this
+    segment deletes exactly one identity-free original and declares
+    exactly one new line, that deletion IS the declared single-line
+    replacement (the merge is byte-for-byte the snippet's declared
+    content; nothing else could have survived). Everything else keeps
+    failing closed: a restatement that omits a line without a declared
+    replacement, a two-lines-become-one rewrite, and the ambiguous
+    anchor-bracketed shape where the old line simply never appears in the
+    snippet.
     """
     n = len(orig_seg)
     deleted_set = set(deleted)
@@ -1193,16 +1484,29 @@ def _deletions_justified(
             # Keyed deletion: require a unique shared identity on both sides.
             if orig_key_count.get(k, 0) == 1 and new_key_count.get(k, 0) == 1:
                 continue
-            return False
+            return (
+                f"original line {orig_seg[i]!r} dropped without a unique "
+                f"replacement"
+            )
         positional.append(i)
 
     if not positional:
-        return True
+        return None
 
     if not allow_positional:
         # No marker in this segment — no marker-adjacent boundary exists,
-        # so an identity-free deletion has no local justification.
-        return False
+        # so an identity-free deletion has no local justification — unless
+        # the span-level complete-restatement property holds and this
+        # segment's shape is an exact one-for-one replacement (issue #6).
+        if (
+            allow_complete_replacement
+            and len(deleted) == 1
+            and len(new_all) == 1
+        ):
+            return None
+        return (
+            f"unmentioned original line dropped: {orig_seg[positional[0]]!r}"
+        )
 
     # Positional fallback capacity comes from identity-free new lines on
     # each side; deletions must form a contiguous run against that boundary.
@@ -1221,8 +1525,10 @@ def _deletions_justified(
     for i in positional:
         if i < front_cover or i >= n - back_cover:
             continue
-        return False
-    return True
+        return (
+            f"unmentioned original line dropped: {orig_seg[i]!r}"
+        )
+    return None
 
 
 def _new_side_order_ok(
@@ -1251,9 +1557,27 @@ def _new_side_order_ok(
     original (the constraint is then vacuous — deletion justification still
     governs acceptance upstream).
     """
+    return _side_order_violation(seg_tokens, merged_seg, kept_merged) is None
+
+
+def _side_order_violation(
+    seg_tokens: list[tuple[str, int | None, str | None]],
+    merged_seg: list[str],
+    kept_merged: set[int],
+) -> str | None:
+    """Name the first marker side-order violation (issue #12 diagnostics).
+
+    Boolean wrapper: :func:`_new_side_order_ok`. The rule is unchanged;
+    the reason names the declared new line that landed on the wrong side
+    of the preserved gap, so a rejected merge can be corrected.
+
+    Returns ``None`` when the segment carries no marker or no surviving
+    original (the constraint is then vacuous — deletion justification
+    still governs acceptance upstream).
+    """
     marker_positions = [i for i, t in enumerate(seg_tokens) if t[0] == "marker"]
     if not marker_positions:
-        return True
+        return None
     first_marker, last_marker = marker_positions[0], marker_positions[-1]
 
     # Side of each declared new line, in declared order. This list is
@@ -1271,40 +1595,103 @@ def _new_side_order_ok(
 
     survivors = sorted(kept_merged)
     if not survivors:
-        return True
+        return None
     first_survivor, last_survivor = survivors[0], survivors[-1]
 
     unmatched = [j for j in range(len(merged_seg)) if j not in kept_merged]
     for side, j in zip(new_sides, unmatched, strict=True):
         if side == "before" and j > first_survivor:
-            return False
+            return (
+                f"new line {merged_seg[j]!r} declared before the marker "
+                f"landed after a surviving original"
+            )
         if side == "after" and j < last_survivor:
-            return False
-    return True
+            return (
+                f"new line {merged_seg[j]!r} declared after the marker "
+                f"landed before a surviving original"
+            )
+    return None
 
 
-def _lcs_pair_map(
+_LCS_MAX_CELLS = 4_000_000
+"""Cell budget for the survivor-alignment DP (issue #12).
+
+The O(n·m) DP table holds n·m Python ints; on a very large symbol span
+(2,000+ lines) with the model engine resident that table alone grew to
+multi-GB and the process was OOM-killed (exit 137, no message) on EVERY
+validation attempt. The cap bounds any single alignment to ~4M cells
+(~10^2 MB): under the cap the exact DP runs, over it the banded fallback
+below runs, and when even the band cannot fit the battery raises loudly.
+"""
+
+_LCS_BAND = 500
+"""Off-diagonal band for the bounded fallback LCS (issue #12).
+
+The survivor alignment of a faithful merge is near-diagonal: the merge
+preserves the original's order, so a surviving original line lands within
+a bounded displacement of its source. |i - j| <= :data:`_LCS_BAND`
+restricts the DP to a band of ~2·500+1 cells per row (~10^2 MB total at
+the admission cap) instead of the full n·m table.
+
+SOUNDNESS of the approximation for the battery: the banded pairing is a
+common subsequence (monotone, content-equal) and can only MISS pairs the
+unbounded DP would find — a missed survivor pair makes the line read as
+DELETED (needing justification) or as an UNDECLARED new line, both of
+which the battery then rejects. Banded alignment is therefore strictly
+STRONGER for validation (it may reject a wildly-reordered merge the exact
+DP would pair up), never more permissive, and it cannot silently accept a
+merge the exact alignment would have refused.
+"""
+
+
+def _lcs_pair_map_banded(
     a: list[str],
     b: list[str],
+    band: int,
 ) -> dict[int, int]:
-    """Longest-common-subsequence pairing of two line lists.
+    """LCS pairing restricted to ``|i - j| <= band`` (issue #12).
 
-    Returns ``{a_index: b_index}`` for one maximal alignment — strictly
-    increasing on both sides, so the k-th surviving original maps to the
-    k-th surviving merge line. This is the canonical survivor alignment:
-    :func:`_merge_is_faithful` uses it to locate context anchors in the
-    merge, :func:`_lcs_matched` derives its survivor sets from it.
+    Same suffix-DP + greedy traceback as :func:`_lcs_pair_map`, computed
+    only over cells within the band: row ``i`` covers ``j`` in
+    ``[max(0, i - band), min(lb, i + band)]``. Cells outside the band are
+    forbidden states of the constrained alignment problem (no valid
+    pairing passes through them); they read as ``-1`` so the ``max``/
+    traceback steps always prefer the in-band successor, and one is always
+    available from any in-band cell. Forced matching of equal heads stays
+    optimal under the band constraint: pairing ``(i, j)`` moves diagonally
+    (never toward the band edge) and the exchange argument for "match
+    equal heads first" is band-independent.
+
+    Returns ``{a_index: b_index}`` — a maximal alignment WITHIN the band.
     """
     la, lb = len(a), len(b)
-    if la == 0 or lb == 0:
-        return {}
-    dp = [[0] * (lb + 1) for _ in range(la + 1)]
+    los = [max(0, i - band) for i in range(la + 1)]
+    his = [min(lb, i + band) for i in range(la + 1)]
+    dp = [[0] * (his[i] - los[i] + 1) for i in range(la + 1)]
+
+    def _val(i: int, j: int) -> int:
+        if i > la or j > lb:
+            return 0  # past the end: no further matches possible
+        if j < los[i] or j > his[i]:
+            return -1  # forbidden state: outside the declared band
+        return dp[i][j - los[i]]
+
     for i in range(la - 1, -1, -1):
-        for j in range(lb - 1, -1, -1):
-            if a[i] == b[j]:
-                dp[i][j] = dp[i + 1][j + 1] + 1
+        row = dp[i]
+        lo = los[i]
+        ai = a[i]
+        for k in range(len(row) - 1, -1, -1):
+            j = lo + k
+            if j == lb:
+                # The row's boundary column is the empty-b suffix: its LCS
+                # value is 0 and b[j] must not be read (out of range).
+                row[k] = 0
+            elif ai == b[j]:
+                row[k] = _val(i + 1, j + 1) + 1
             else:
-                dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
+                down = _val(i + 1, j)
+                right = _val(i, j + 1)
+                row[k] = max(down, right)
     pairs: dict[int, int] = {}
     i = j = 0
     while i < la and j < lb:
@@ -1312,11 +1699,64 @@ def _lcs_pair_map(
             pairs[i] = j
             i += 1
             j += 1
-        elif dp[i + 1][j] >= dp[i][j + 1]:
+        elif _val(i + 1, j) >= _val(i, j + 1):
             i += 1
         else:
             j += 1
     return pairs
+
+
+def _lcs_pair_map(
+    a: list[str],
+    b: list[str],
+) -> dict[int, int]:
+    """Longest-common-subsequence pairing of two line lists (issue #12).
+
+    Returns ``{a_index: b_index}`` for one maximal alignment — strictly
+    increasing on both sides, so the k-th surviving original maps to the
+    k-th surviving merge line. This is the canonical survivor alignment:
+    :func:`_merge_is_faithful` uses it to locate context anchors in the
+    merge, :func:`_lcs_matched` derives its survivor sets from it.
+
+    BOUNDED MEMORY (issue #12): the DP is capped at
+    :data:`_LCS_MAX_CELLS` cells. Inputs whose full table fits run the
+    exact DP; larger inputs run :func:`_lcs_pair_map_banded` with the
+    declared band — a documented approximation that can only be stricter
+    for the battery (see its docstring); and when even the banded table
+    cannot fit the budget, this raises ``ValueError`` naming the size and
+    the remedy ("edit a sub-symbol or narrow the span") instead of
+    silently building the multi-GB table that OOM-killed the process.
+    """
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return {}
+    if la * lb <= _LCS_MAX_CELLS:
+        dp = [[0] * (lb + 1) for _ in range(la + 1)]
+        for i in range(la - 1, -1, -1):
+            for j in range(lb - 1, -1, -1):
+                if a[i] == b[j]:
+                    dp[i][j] = dp[i + 1][j + 1] + 1
+                else:
+                    dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
+        pairs: dict[int, int] = {}
+        i = j = 0
+        while i < la and j < lb:
+            if a[i] == b[j]:
+                pairs[i] = j
+                i += 1
+                j += 1
+            elif dp[i + 1][j] >= dp[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return pairs
+    band_cells = (la + 1) * min(lb + 1, 2 * _LCS_BAND + 1)
+    if band_cells > _LCS_MAX_CELLS:
+        raise ValueError(
+            f"symbol too large for exact line matching ({max(la, lb)} lines); "
+            f"edit a sub-symbol or narrow the span"
+        )
+    return _lcs_pair_map_banded(a, b, _LCS_BAND)
 
 
 def _lcs_matched(
@@ -1534,6 +1974,11 @@ def _snippet_justifiable_removals(
       * **keyed capacity** — an original whose ``_replacement_key`` is
         shared by exactly one original and exactly one declared new line
         of the same segment (the unique-identity replacement rule);
+      * **complete-restatement replacement** (issue #6) — the one
+        uncovered original of a snippet that restates the whole span and
+        declares exactly one new line
+        (:func:`_complete_restatement_removals`), the same predicate the
+        content validator uses;
       * **positional capacity** — in a marker-bearing segment only, the
         marker-adjacent identity-free originals covered by the declared
         new lines: the first ``front_cap`` / last ``back_cap`` segment
@@ -1631,6 +2076,16 @@ def _snippet_justifiable_removals(
                 removable.add(lo + j)
             for j in range(min(back_cap, n)):
                 removable.add(hi - 1 - j)
+
+    # Complete-restatement replacement (issue #6): when the snippet
+    # restates every original content line except exactly one and declares
+    # exactly one new line, that uncovered line is the snippet's declared
+    # single-line replacement — the SAME predicate the content validator
+    # uses (:func:`_complete_restatement_removals`), so the trait gate and
+    # the content gate can never disagree about which removal the op
+    # declares. Crediting it here makes the trait arithmetic the exact
+    # replace-one-line-with-one-line arithmetic on structureless files.
+    removable.update(_complete_restatement_removals(orig, raw_tokens))
     return [orig_raw[i] for i in sorted(removable)]
 
 
@@ -1822,12 +2277,22 @@ def _merge_rejection_reason(
         )
         if not ok:
             return f"merged output does not parse as {language} ({reason})"
-    if _check_hallucinations(original_code, merged_code, snippet) != 1.0:
-        return (
-            "merged output failed the content-faithfulness check "
-            "(preserve-by-default violation: original lines dropped, "
-            "invented, reordered or a marker leaked)"
-        )
+    # Issue #6: the sanctioned single-line replacement is granted ONLY here,
+    # for a STRUCTURELESS file — there the text-window snippet IS the op spec
+    # (a whole-window restatement the flow itself built from the window's
+    # anchors), so a restatement-minus-one-line plus one new line is the one
+    # shape whose only consistent reading is "that line was replaced". A code
+    # span keeps the strict B4 preserve-by-default contract: without a
+    # marker, a one-line transform stays a refusal.
+    reason = _hallucination_reason(
+        original_code, merged_code, snippet,
+        allow_complete_replacement=structureless,
+    )
+    if reason is not None:
+        # Issue #12: name the first failing line and the rule instead of a
+        # bare "preserve-by-default violation" — a refused merge must be
+        # correctable from the message alone.
+        return f"merged output failed the content-faithfulness check ({reason})"
     if structureless:
         # D1 gate (req. 6): no grammar → the parse gate cannot run, so the
         # text-trait oracle validates instead. The op spec is the snippet
@@ -2740,9 +3205,12 @@ def chunked_merge(
                 # bypasses the validator.
                 _log.warning(
                     "Deterministic result for replace='%s' failed the "
-                    "content-faithfulness check; discarding it and "
+                    "content-faithfulness check (%s); discarding it and "
                     "falling through to the model path",
                     replace,
+                    _deterministic_result_unfaithful_reason(
+                        original_func, edited, snippet, prepend_signature_lines,
+                    ),
                 )
             # Direct-swap fast-path: when deterministic_edit can't anchor
             # (every body line changed), but the snippet is a complete
