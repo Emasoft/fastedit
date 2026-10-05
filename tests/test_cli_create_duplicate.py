@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CLI_MODULE = [sys.executable, "-m", "fastedit"]
 
@@ -167,6 +169,53 @@ class TestCLICreate:
         assert "NUL" in result.stderr
         assert not new_file.exists()
 
+    # ------------------------------------------------------------------
+    # Issue #10: `--content -` must read PIPED stdin, not write a
+    # literal '-' (edit documents the '-' convention; create honors it).
+    # ------------------------------------------------------------------
+
+    def test_create_reads_content_dash_from_stdin(self, tmp_path: Path) -> None:
+        """Issue #10: --content - reads the piped content; the literal '-'
+        must never be written as file content."""
+        new_file = tmp_path / "hello.py"
+        result = run_cli("create", str(new_file), "--content", "-", input_text="x = 1\n")
+        assert result.returncode == 0, result.stderr
+        assert new_file.read_text(encoding="utf-8") == "x = 1\n"
+        assert new_file.read_text(encoding="utf-8") != "-\n"
+
+    @pytest.mark.skipif(os.name != "posix", reason="pty is POSIX-only")
+    def test_create_content_dash_with_tty_stdin_errors_cleanly(self, tmp_path: Path) -> None:
+        """Issue #9 semantics shared by create: `--content -` on a TTY must
+        exit 1 fast with a clean error instead of blocking on the terminal,
+        and must not create the file."""
+        import pty
+
+        master, slave = pty.openpty()
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        new_file = tmp_path / "hello.py"
+        try:
+            proc = subprocess.Popen(
+                [*CLI_MODULE, "create", str(new_file), "--content", "-"],
+                stdin=slave,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        finally:
+            os.close(slave)
+        try:
+            _out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:  # pragma: no cover - only on a regression
+                proc.kill()
+                proc.communicate()
+            os.close(master)
+
+        assert proc.returncode == 1
+        assert b"requires piped stdin" in err
+        assert not new_file.exists()
+
     def test_create_reports_symbols_for_a_parseable_language(self, tmp_path: Path) -> None:
         """A supported language's new file gets a symbol report, not just a line count."""
         new_file = tmp_path / "hello.py"
@@ -181,6 +230,76 @@ class TestCLICreate:
         assert result.returncode == 0
         assert new_file.read_text(encoding="utf-8") == "hello\n"
         assert "no fastedit/tldr language support" in result.stdout
+
+
+class TestCLICreateAtFileContent:
+    """Issue #7 applied to --content: explicit '@path' file syntax, an
+    existing-file auto-detection with a stderr note, and
+    --content-is-literal to opt out and use the text verbatim."""
+
+    def test_create_content_atfile_reads_the_file(self, tmp_path: Path) -> None:
+        new_file = tmp_path / "hello.py"
+        content_file = tmp_path / "content.txt"
+        content_file.write_text("x = 1\n", encoding="utf-8")
+        result = run_cli("create", str(new_file), "--content", f"@{content_file}")
+        assert result.returncode == 0, result.stderr
+        assert new_file.read_text(encoding="utf-8") == "x = 1\n"
+        # The explicit @form is not magic: no resolution note on stderr.
+        assert "resolved to an existing file" not in result.stderr
+
+    def test_create_content_atfile_missing_file_errors_cleanly(self, tmp_path: Path) -> None:
+        new_file = tmp_path / "hello.py"
+        result = run_cli("create", str(new_file), "--content", f"@{tmp_path / 'nope.txt'}")
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "not found" in result.stderr
+        assert not new_file.exists()
+
+    def test_create_content_existing_path_autodetected_with_note(self, tmp_path: Path) -> None:
+        """A single-line --content naming an existing file is read from it,
+        with the stderr note pointing at --content-is-literal."""
+        new_file = tmp_path / "hello.py"
+        content_file = tmp_path / "content.txt"
+        content_file.write_text("x = 1\n", encoding="utf-8")
+
+        result = run_cli("create", str(new_file), "--content", str(content_file))
+
+        assert result.returncode == 0, result.stderr
+        assert new_file.read_text(encoding="utf-8") == "x = 1\n"
+        assert "note: --content resolved to an existing file" in result.stderr
+        assert "--content-is-literal" in result.stderr
+
+    def test_create_content_is_literal_keeps_path_string_verbatim(self, tmp_path: Path) -> None:
+        """file exists AND --content-is-literal → the PATH STRING is the
+        content, verbatim; the file's own content must NOT be read."""
+        new_file = tmp_path / "hello.py"
+        content_file = tmp_path / "content.txt"
+        content_file.write_text("x = 1\n", encoding="utf-8")
+
+        result = run_cli(
+            "create", str(new_file),
+            "--content", str(content_file),
+            "--content-is-literal",
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert new_file.read_text(encoding="utf-8") == str(content_file)
+        assert "resolved to an existing file" not in result.stderr
+
+    def test_create_content_multiline_text_is_never_detected_as_a_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Multi-line content can never name a file: it stays verbatim even
+        when a sibling file happens to share the first line's text."""
+        new_file = tmp_path / "hello.py"
+        content_file = tmp_path / "x = 1"
+        content_file.write_text("decoy\n", encoding="utf-8")
+
+        result = run_cli("create", str(new_file), "--content", "x = 1\ny = 2\n")
+
+        assert result.returncode == 0, result.stderr
+        assert new_file.read_text(encoding="utf-8") == "x = 1\ny = 2\n"
+        assert "resolved" not in result.stderr
 
 
 class TestCLIDuplicate:

@@ -83,6 +83,183 @@ def _locked_for_edit(path: Path):
 
 
 # ---------------------------------------------------------------------------
+# '-' (stdin) and '@file' argument handling (issues #9, #10, #7)
+# ---------------------------------------------------------------------------
+
+_DASH_STDIN_TIMEOUT_ENV = "FASTEDIT_STDIN_TIMEOUT_S"
+_DASH_STDIN_DEFAULT_TIMEOUT_S = 60.0
+_ATFILE_AUTODETECT_MAX_CHARS = 1024
+
+
+def _read_dash_stdin(flag_label: str, *, binary: bool = False):
+    """Single source of truth for reading a '-' value of a stdin flag.
+
+    Shared by --snippet, --content, --content-file, --edits and
+    --file-edits (issues #9/#10). Every '-' call site used to do a bare
+    ``sys.stdin.read()``, which blocks FOREVER when stdin never reaches
+    EOF -- an interactive terminal, or an agent harness that spawns
+    fastedit with a pipe it never closes. The command then sat with zero
+    output until it was killed.
+
+    Semantics:
+      * '-' means PIPED stdin. A TTY (or no stdin at all) is refused with
+        a clean exit 1 -- "requires piped stdin" -- instead of blocking on
+        the terminal waiting for Ctrl-D.
+      * The read happens exactly ONCE and is BOUNDED: a producer that
+        neither closes stdin nor sends data within
+        ``FASTEDIT_STDIN_TIMEOUT_S`` (default 60s) aborts with a clean
+        exit 1 instead of hanging.
+      * After the read, ``sys.stdin`` is replaced with an exhausted
+        stream, so no later consumer in this process can block on stdin
+        again ("after reading, never touch stdin again").
+
+    *binary* reads raw bytes (sys.stdin.buffer) for byte-exact consumers
+    such as ``create --content-file -``.
+    """
+    import io
+    import os
+    import threading
+
+    stdin = sys.stdin
+    is_tty = False
+    try:
+        is_tty = stdin is not None and stdin.isatty()
+    except (ValueError, OSError):
+        is_tty = False
+    if stdin is None or is_tty:
+        print(
+            f"Error: {flag_label} - requires piped stdin "
+            f"(e.g. `cat snippet.py | fastedit edit <file> {flag_label} -`)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not binary:
+        # Snippets are strict-decode text everywhere else in fastedit (B21):
+        # pin the stdin decode to UTF-8 so a C-locale parent process cannot
+        # turn a valid UTF-8 snippet into a decode error.
+        try:
+            stdin.reconfigure(encoding="utf-8", errors="strict")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+    try:
+        timeout_s = float(
+            os.environ.get(_DASH_STDIN_TIMEOUT_ENV) or _DASH_STDIN_DEFAULT_TIMEOUT_S
+        )
+    except ValueError:
+        timeout_s = _DASH_STDIN_DEFAULT_TIMEOUT_S
+
+    stream = stdin.buffer if binary else stdin
+    chunks: list = []
+    failure: list[BaseException] = []
+
+    def _pump() -> None:
+        try:
+            chunks.append(stream.read())
+        except BaseException as e:  # noqa: BLE001 -- surfaced as a clean CLI error below
+            failure.append(e)
+
+    reader = threading.Thread(target=_pump, name="fastedit-stdin-pump", daemon=True)
+    reader.start()
+    reader.join(timeout_s)
+    if reader.is_alive():
+        print(
+            f"Error: timed out after {timeout_s:g}s waiting for stdin for "
+            f"{flag_label} -. stdin never reached EOF; pipe the content in "
+            f"or set {_DASH_STDIN_TIMEOUT_ENV} to raise the limit.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if failure:
+        print(
+            f"Error: could not read stdin for {flag_label} -: {failure[0]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    data = chunks[0] if chunks else (b"" if binary else "")
+
+    # The single read is done -- retire stdin so nothing downstream (a merge
+    # helper, a prompt, a retry loop) can ever block on it again (issue #9).
+    sys.stdin = io.BytesIO(b"") if binary else io.StringIO("")
+
+    return data
+
+
+def _resolve_snippet_text_arg(raw: str, flag_label: str, literal: bool) -> str:
+    """Resolve a --snippet / --content text with @file syntax (issue #7).
+
+    Resolution order:
+      1. ``@<path>`` -- ALWAYS read that file; explicit, never magic. A
+         missing or undecodable file is a clean exit 1: the explicit form
+         must never silently fall back to splicing the literal "@<path>"
+         string into a file.
+      2. *literal* True -- return *raw* verbatim. This is the
+         ``--snippet-is-literal`` / ``--content-is-literal`` opt-out that
+         disables detection (and the way to pass text that starts with '@').
+      3. Auto-detection: a single-line value under
+         ``_ATFILE_AUTODETECT_MAX_CHARS`` chars that names an EXISTING
+         REGULAR file is read as the text, with a stderr note saying so.
+         This is the issue #7 guard: an agent that passed a path where
+         text was expected used to splice the path string into the file
+         and report success.
+
+    '-' (stdin) is handled by :func:`_read_dash_stdin` before this helper
+    and never reaches it.
+    """
+    if raw.startswith("@") and len(raw) > 1:
+        at_path = Path(raw[1:])
+        try:
+            return at_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            print(f"Error: {flag_label} @{at_path}: file not found", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error: {flag_label} @{at_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+        except UnicodeDecodeError as e:
+            print(
+                f"Error: {flag_label} @{at_path} is not valid UTF-8 text ({e})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if literal:
+        return raw
+
+    is_pathlike = (
+        bool(raw)
+        and "\n" not in raw
+        and "\r" not in raw
+        and len(raw) < _ATFILE_AUTODETECT_MAX_CHARS
+    )
+    if is_pathlike:
+        candidate = Path(raw)
+        try:
+            is_file = candidate.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
+            try:
+                text = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return raw  # undecodable/unreadable guess: keep the literal text
+            line_count = text.count("\n") + (
+                1 if text and not text.endswith("\n") else 0
+            )
+            print(
+                f"note: {flag_label} resolved to an existing file "
+                f"({raw}, {line_count} lines); pass {flag_label}-is-literal "
+                f"to use the text verbatim",
+                file=sys.stderr,
+            )
+            return text
+
+    return raw
+
+
+# ---------------------------------------------------------------------------
 # Subcommand handlers
 # ---------------------------------------------------------------------------
 
@@ -550,7 +727,17 @@ def _cmd_edit_locked(args):
     )
     from .write_gates import _all_chunks_rejected, _rejection_refusal
 
-    snippet = sys.stdin.read() if args.snippet == "-" else args.snippet
+    # Issue #9: '-' is read ONCE, bounded, via the shared helper (TTY
+    # refused, never hangs, stdin retired after the read). Issue #7:
+    # otherwise the text goes through @file resolution / existing-file
+    # auto-detection (--snippet-is-literal opts out).
+    snippet = (
+        _read_dash_stdin("--snippet")
+        if args.snippet == "-"
+        else _resolve_snippet_text_arg(
+            args.snippet, "--snippet", getattr(args, "snippet_is_literal", False),
+        )
+    )
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
@@ -756,7 +943,8 @@ def _cmd_batch_edit_locked(args):
     )
     from .write_gates import _all_chunks_rejected, _rejection_refusal
 
-    edits_json = sys.stdin.read() if args.edits == "-" else args.edits
+    # Issue #9: bounded single read via the shared '-' helper.
+    edits_json = _read_dash_stdin("--edits") if args.edits == "-" else args.edits
     try:
         edits_list = json_mod.loads(edits_json)
     except json_mod.JSONDecodeError as e:
@@ -853,7 +1041,10 @@ def cmd_multi_edit(args):
     """Apply edits across multiple files, writing nothing unless every file succeeds."""
     import json as json_mod
 
-    file_edits_json = sys.stdin.read() if args.file_edits == "-" else args.file_edits
+    # Issue #9: bounded single read via the shared '-' helper.
+    file_edits_json = (
+        _read_dash_stdin("--file-edits") if args.file_edits == "-" else args.file_edits
+    )
     try:
         file_edits_list = json_mod.loads(file_edits_json)
     except json_mod.JSONDecodeError as e:
@@ -1501,12 +1692,12 @@ def _report_symbols_after_write(file_str: str, content: str, total_lines: int) -
 def cmd_create(args):
     """Create a new text file with the given content.
 
-    Content comes from --content, --content-file (a path, or '-' for
-    stdin), or stdin directly when neither flag is given. Refuses to
-    overwrite an existing file unless --force is set, refuses a missing
-    parent directory unless --parents is set, and refuses content the
-    fastedit.filetype text/binary detector sniffs as binary
-    (never by extension).
+    Content comes from --content (text, '@path' to read a file, or '-' for
+    piped stdin), --content-file (a path, or '-' for piped stdin), or stdin
+    directly when neither flag is given. Refuses to overwrite an existing
+    file unless --force is set, refuses a missing parent directory unless
+    --parents is set, and refuses content the fastedit.filetype text/binary
+    detector sniffs as binary (never by extension).
     """
     from .filetype import is_text_file
     from .mcp.backup import BackupStore, _atomic_write
@@ -1529,9 +1720,24 @@ def cmd_create(args):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.content is not None:
-        raw = args.content.encode("utf-8")
+        # Issue #10: '-' reads PIPED stdin (issue #9 semantics: once,
+        # bounded, TTY refused) instead of writing a literal '-'. Issue #7:
+        # otherwise the text goes through @file resolution / existing-file
+        # auto-detection (--content-is-literal opts out).
+        content_text = (
+            _read_dash_stdin("--content")
+            if args.content == "-"
+            else _resolve_snippet_text_arg(
+                args.content, "--content", getattr(args, "content_is_literal", False),
+            )
+        )
+        raw = content_text.encode("utf-8")
     elif args.content_file is not None:
-        raw = sys.stdin.buffer.read() if args.content_file == "-" else Path(args.content_file).read_bytes()
+        raw = (
+            _read_dash_stdin("--content-file", binary=True)
+            if args.content_file == "-"
+            else Path(args.content_file).read_bytes()
+        )
     else:
         raw = sys.stdin.buffer.read()
 
@@ -2166,7 +2372,15 @@ def main():
              "(shows a caller-impact note when --replace changes a signature)",
     )
     edit_p.add_argument("file", help="Path to source file")
-    edit_p.add_argument("--snippet", required=True, help="Edit snippet or '-' for stdin")
+    edit_p.add_argument(
+        "--snippet", required=True,
+        help="Edit snippet, '@path' to read it from a file, or '-' for piped stdin",
+    )
+    edit_p.add_argument(
+        "--snippet-is-literal", action="store_true",
+        help="Use --snippet text verbatim: never resolve '@path' and never "
+             "auto-read a snippet that names an existing file",
+    )
     edit_p.add_argument("--after", default="", help="Insert new code after this symbol")
     edit_p.add_argument("--replace", default="", help="Replace this symbol with the snippet")
     edit_p.add_argument("--backend", choices=["mlx", "vllm"], default=None)
@@ -2283,7 +2497,14 @@ def main():
     create_p.add_argument(
         "--content",
         default=None,
-        help="File content (alternative: --content-file, or stdin if neither is given)",
+        help="File content, '@path' to read it from a file, or '-' for "
+             "piped stdin (alternative: --content-file, or stdin if neither "
+             "is given)",
+    )
+    create_p.add_argument(
+        "--content-is-literal", action="store_true",
+        help="Use --content text verbatim: never resolve '@path' and never "
+             "auto-read content that names an existing file",
     )
     create_p.add_argument(
         "--content-file",

@@ -446,6 +446,12 @@ def _atomic_write(
     :func:`_sweep_stale_temps`). A SIGKILL bypasses every exception-path
     unlink, so this is the only cleanup those temps ever get.
 
+    Permission mode (issue #11): an EXISTING destination keeps its current
+    permission mode -- the executable bit and group/other read bits survive
+    a rewrite instead of being silently dropped by os.replace keeping
+    mkstemp's private 0o600 temp mode. A NEW destination gets the standard
+    creat default, ``0o666 & ~umask``.
+
     Raises:
         UnsupportedEncodingError: str content that *encoding* cannot
             represent. Raised BEFORE any temp file is created and before
@@ -496,6 +502,34 @@ def _atomic_write(
         # B37: checked here, immediately before the rename, so the
         # read-to-write window is closed as tightly as userspace allows.
         _refuse_if_changed_on_disk(path, expected_stat)
+        # Issue #11: mkstemp creates the temp with 0o600 and os.replace
+        # keeps the TEMP's mode, so every rewrite used to silently drop the
+        # target's executable bit and group/other read bits (0755 -> 0600,
+        # 0644 -> 0600). Give the temp the mode the TARGET must end up
+        # with, chmod'ed before the rename so mode and content land
+        # together:
+        #   * target exists  -> its own current mode (chmod before replace,
+        #     so the rename lands the mode atomically with the content);
+        #   * target missing -> the standard creat default, 0o666 & ~umask,
+        #     exactly what `cat >`, `tee` or an editor would produce --
+        #     never mkstemp's private 0o600.
+        # The umask read is the portable os.umask(0)+restore dance; the
+        # window where the process umask reads 0 is microseconds and every
+        # caller of _atomic_write holds the per-file edit lock.
+        try:
+            target_mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mask = os.umask(0)
+            os.umask(mask)
+            target_mode = 0o666 & ~mask
+        try:
+            os.chmod(tmp, target_mode)
+        except OSError as e:
+            # Best-effort on platforms where chmod cannot express the mode:
+            # the content write itself must never fail because of it.
+            logger.warning(
+                "Could not set mode %#o on temp for %s: %s", target_mode, path, e,
+            )
         os.replace(tmp, path)  # atomic on POSIX
         _fsync_directory(path.parent)  # B39: durable rename (best-effort)
     except BaseException:

@@ -766,3 +766,90 @@ def test_non_utf8_path_backs_up_instead_of_crashing(tmp_path, monkeypatch):
     # longer fail after the backup is durable.
     meta = store._meta_path(surrogate_path)
     assert meta.read_bytes() == surrogate_path.encode("utf-8", "surrogateescape")
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue #11: _atomic_write must preserve the target's permission mode.
+#
+# mkstemp creates the temp with 0o600 and os.replace keeps the TEMP's mode,
+# so every rewrite used to silently drop the executable bit and group/other
+# read bits from the file it rewrote. Existing targets keep their mode; a
+# NEW target gets the standard creat default (0o666 & ~umask).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission-mode semantics")
+def test_atomic_write_preserves_mode_0755(tmp_path):
+    """Issue #11 repro: rewriting a 0o755 script keeps 0o755 — the
+    executable bit and group/other read survive the mkstemp+replace round
+    trip instead of collapsing to 0o600."""
+    target = tmp_path / "script.sh"
+    target.write_bytes(b"#!/bin/sh\necho hi\n")
+    os.chmod(target, 0o755)
+
+    _atomic_write(target, "#!/bin/sh\necho bye\n")
+
+    assert target.read_text(encoding="utf-8") == "#!/bin/sh\necho bye\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission-mode semantics")
+def test_atomic_write_preserves_mode_0644(tmp_path):
+    """A plain 0o644 source file keeps 0o644 across a rewrite."""
+    target = tmp_path / "f.py"
+    target.write_bytes(b"old = 1\n")
+    os.chmod(target, 0o644)
+
+    _atomic_write(target, "new = 2\n")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission-mode semantics")
+def test_atomic_write_preserves_mode_even_under_restrictive_umask(tmp_path):
+    """An existing target's mode comes from the FILE, never from the
+    process umask: 0o755 stays 0o755 even while umask 0o077 is in force
+    (the old 0o600 leak and a naive 0o644&~umask default would both fail)."""
+    target = tmp_path / "script.sh"
+    target.write_bytes(b"#!/bin/sh\necho hi\n")
+    os.chmod(target, 0o755)
+
+    old_umask = os.umask(0o077)
+    try:
+        _atomic_write(target, "#!/bin/sh\necho bye\n")
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission-mode semantics")
+def test_atomic_write_new_file_gets_creat_default_not_mkstemp_0600(tmp_path):
+    """A brand-new target gets the standard creat default — 0o666 & ~umask —
+    not mkstemp's 0o600. Under umask 0o027 that is 0o640 (rw-r-----)."""
+    target = tmp_path / "new.py"
+
+    old_umask = os.umask(0o027)
+    try:
+        _atomic_write(target, "x = 1\n")
+    finally:
+        os.umask(old_umask)
+
+    assert target.read_text(encoding="utf-8") == "x = 1\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission-mode semantics")
+def test_atomic_write_new_file_default_follows_the_current_umask(tmp_path):
+    """The new-file default tracks the umask in force at write time: under
+    the default 0o022 the file lands 0o644 (world/group readable), which is
+    what every standard tool (cat >, tee, touch) produces."""
+    target = tmp_path / "new2.py"
+
+    old_umask = os.umask(0o022)
+    try:
+        _atomic_write(target, "x = 1\n")
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644

@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
@@ -93,7 +94,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CLI_MODULE = [sys.executable, "-m", "fastedit"]
 
 
-def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = None):
+def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = None,
+            cwd: Path | None = None):
     """Run `python -m fastedit <args>` and return CompletedProcess."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
@@ -107,6 +109,7 @@ def run_cli(*args: str, input_text: str | None = None, env_extra: dict | None = 
         timeout=30,
         env=env,
         check=False,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -300,6 +303,335 @@ class TestCLIEdit:
         assert "--model-path" in result.stdout
         assert "--api-base" in result.stdout
         assert "--api-model" in result.stdout
+
+
+# ===================================================================
+# 2b. Issue #9: '-' stdin handling (bounded, TTY-safe, single read)
+# ===================================================================
+
+class TestDashStdinHelper:
+    """Unit tests for the shared '-' reader behind --snippet, --content,
+    --content-file, --edits and --file-edits (issue #9)."""
+
+    def test_reads_piped_stdin_once_and_retires_it(self, monkeypatch):
+        import io as io_mod
+
+        from fastedit import cli as cli_module
+
+        monkeypatch.setattr(sys, "stdin", io_mod.StringIO("def new(): pass\n"))
+        data = cli_module._read_dash_stdin("--snippet")
+        assert data == "def new(): pass\n"
+        # After the single read, stdin is exhausted: any later consumer gets
+        # EOF immediately instead of blocking ("never touch stdin again").
+        assert sys.stdin.read() == ""
+
+    def test_tty_stdin_is_refused_without_reading(self, monkeypatch, capsys):
+        from fastedit import cli as cli_module
+
+        class FakeTTY:
+            def isatty(self):
+                return True
+
+            def read(self, *a, **kw):  # pragma: no cover - must never run
+                raise AssertionError("stdin must never be read when it is a TTY")
+
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module._read_dash_stdin("--snippet")
+        assert exc_info.value.code == 1
+        assert "requires piped stdin" in capsys.readouterr().err
+
+    def test_missing_stdin_is_refused_cleanly(self, monkeypatch, capsys):
+        from fastedit import cli as cli_module
+
+        monkeypatch.setattr(sys, "stdin", None)
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module._read_dash_stdin("--snippet")
+        assert exc_info.value.code == 1
+        assert "requires piped stdin" in capsys.readouterr().err
+
+    def test_never_closing_pipe_times_out_instead_of_hanging(self, monkeypatch, capsys):
+        """A producer that never closes stdin (an agent harness holding the
+        pipe open) must abort within the configured bound, not hang forever."""
+        from fastedit import cli as cli_module
+
+        r, w = os.pipe()
+        stdin_obj = os.fdopen(r, "r", encoding="utf-8")
+        monkeypatch.setattr(sys, "stdin", stdin_obj)
+        monkeypatch.setenv("FASTEDIT_STDIN_TIMEOUT_S", "0.3")
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                cli_module._read_dash_stdin("--snippet")
+        finally:
+            os.close(w)  # EOF unblocks the pump thread; it exits as a daemon
+            stdin_obj.close()
+        assert exc_info.value.code == 1
+        assert "timed out" in capsys.readouterr().err
+
+    def test_binary_read_returns_bytes(self, monkeypatch):
+        import io as io_mod
+
+        from fastedit import cli as cli_module
+
+        class FakeStdin:
+            def __init__(self):
+                self.buffer = io_mod.BytesIO(b"x = 1\n")
+
+            def isatty(self):
+                return False
+
+        monkeypatch.setattr(sys, "stdin", FakeStdin())
+        data = cli_module._read_dash_stdin("--content-file", binary=True)
+        assert data == b"x = 1\n"
+
+
+class TestCLIEditStdinDash:
+    """End-to-end issue #9 behavior for `edit --snippet -`."""
+
+    def test_edit_snippet_dash_with_tty_stdin_fails_fast_cleanly(
+        self, tmp_path: Path, monkeypatch, capsys,
+    ):
+        """`--snippet -` with a TTY must exit 1 immediately with a clean
+        error -- never block on the terminal waiting for input."""
+        from fastedit import cli as cli_module
+
+        class FakeTTY:
+            def isatty(self):
+                return True
+
+            def read(self, *a, **kw):  # pragma: no cover - must never run
+                raise AssertionError("stdin must never be read when it is a TTY")
+
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        monkeypatch.setattr(
+            sys, "argv",
+            ["fastedit", "edit", str(target), "--snippet", "-", "--after", "greet"],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.main()
+
+        assert exc_info.value.code == 1
+        assert "requires piped stdin" in capsys.readouterr().err
+        # Nothing was edited.
+        assert target.read_text(encoding="utf-8") == SMALL_PYTHON_FILE
+
+    def test_edit_snippet_dash_never_closing_pipe_times_out_cleanly(self, tmp_path: Path):
+        """Issue #9 repro: a pipe that never reaches EOF (an agent harness
+        holding stdin open) must not hang forever -- the bounded read aborts
+        with a clean exit 1 within FASTEDIT_STDIN_TIMEOUT_S."""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        env["FASTEDIT_STDIN_TIMEOUT_S"] = "0.5"
+        env["FASTEDIT_NO_UPDATE_CHECK"] = "1"
+        target = tmp_path / "mod.md"
+        original = "# Title\n\nsome text\n"
+        target.write_text(original, encoding="utf-8")
+
+        r, w = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [*CLI_MODULE, "edit", str(target), "--snippet", "-"],
+                stdin=r,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        finally:
+            os.close(r)
+        started = time.monotonic()
+        try:
+            _out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:  # pragma: no cover - only on a hang regression
+                proc.kill()
+                proc.communicate()
+            os.close(w)
+        elapsed = time.monotonic() - started
+
+        assert proc.returncode == 1
+        assert "timed out" in err
+        assert elapsed < 20, f"the bounded read took {elapsed:.1f}s -- effectively a hang"
+        assert target.read_text(encoding="utf-8") == original
+
+
+# ===================================================================
+# 2c. Issue #7: @file syntax + existing-file auto-detection (--snippet)
+# ===================================================================
+
+class TestSnippetArgResolver:
+    """Unit tests for the shared --snippet/--content resolver (issue #7)."""
+
+    def test_atfile_reads_the_file_without_a_note(self, tmp_path: Path, capsys):
+        from fastedit import cli as cli_module
+
+        snippet_file = tmp_path / "repl.py"
+        snippet_file.write_text("def greet():\n    return 'from file'\n", encoding="utf-8")
+        text = cli_module._resolve_snippet_text_arg(f"@{snippet_file}", "--snippet", literal=False)
+        assert text == "def greet():\n    return 'from file'\n"
+        assert capsys.readouterr().err == ""
+
+    def test_atfile_missing_file_is_a_clean_error(self, tmp_path: Path, capsys):
+        from fastedit import cli as cli_module
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module._resolve_snippet_text_arg(
+                f"@{tmp_path / 'nope.py'}", "--snippet", literal=False,
+            )
+        assert exc_info.value.code == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_existing_single_line_path_is_autodetected_with_note(self, tmp_path: Path, capsys):
+        from fastedit import cli as cli_module
+
+        snippet_file = tmp_path / "repl.py"
+        snippet_file.write_text("def greet():\n    return 'from file'\n", encoding="utf-8")
+        text = cli_module._resolve_snippet_text_arg(str(snippet_file), "--snippet", literal=False)
+        assert text == "def greet():\n    return 'from file'\n"
+        err = capsys.readouterr().err
+        assert "note: --snippet resolved to an existing file" in err
+        assert "--snippet-is-literal" in err
+
+    def test_literal_flag_disables_detection_and_returns_raw(self, tmp_path: Path, capsys):
+        from fastedit import cli as cli_module
+
+        snippet_file = tmp_path / "repl.py"
+        snippet_file.write_text("def greet():\n    return 'from file'\n", encoding="utf-8")
+        text = cli_module._resolve_snippet_text_arg(str(snippet_file), "--snippet", literal=True)
+        assert text == str(snippet_file)
+        assert capsys.readouterr().err == ""
+
+    def test_multiline_text_is_never_treated_as_a_path(self, tmp_path: Path, capsys):
+        from fastedit import cli as cli_module
+
+        raw = "def greet():\n    return 1\n"
+        assert cli_module._resolve_snippet_text_arg(raw, "--snippet", literal=False) == raw
+        assert capsys.readouterr().err == ""
+
+    def test_nonexistent_path_text_is_verbatim_without_note(self, capsys):
+        from fastedit import cli as cli_module
+
+        raw = "def greet(): return 1"
+        assert cli_module._resolve_snippet_text_arg(raw, "--snippet", literal=False) == raw
+        assert capsys.readouterr().err == ""
+
+    def test_empty_text_is_verbatim(self, capsys):
+        from fastedit import cli as cli_module
+
+        assert cli_module._resolve_snippet_text_arg("", "--snippet", literal=False) == ""
+        assert capsys.readouterr().err == ""
+
+
+class TestCLIEditSnippetFileArgs:
+    """End-to-end issue #7 behavior for `edit --snippet`."""
+
+    def test_edit_snippet_atfile_reads_file_content(self, tmp_path: Path):
+        snippet_file = tmp_path / "replacement.py"
+        snippet_file.write_text(
+            "def greet(name: str) -> str:\n    return 'from file'\n", encoding="utf-8",
+        )
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", f"@{snippet_file}",
+            "--replace", "greet",
+        )
+
+        assert result.returncode == 0, result.stderr
+        content = target.read_text(encoding="utf-8")
+        assert "return 'from file'" in content
+        assert 'return f"Hello, {name}!"' not in content
+        # The literal '@path' string must never be spliced into the file.
+        assert f"@{snippet_file}" not in content
+
+    def test_edit_snippet_atfile_missing_file_is_clean_error(self, tmp_path: Path):
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", f"@{tmp_path / 'nope.py'}",
+            "--replace", "greet",
+        )
+
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "not found" in result.stderr
+        assert target.read_text(encoding="utf-8") == SMALL_PYTHON_FILE
+
+    def test_edit_snippet_existing_path_autodetected_with_note(self, tmp_path: Path):
+        """Issue #7 repro: the agent passed a PATH as the snippet text. The
+        path string must not replace the section; the referenced file's
+        content is used instead, with a stderr note."""
+        snippet_file = tmp_path / "replacement.py"
+        snippet_file.write_text(
+            "def greet(name: str) -> str:\n    return 'from file'\n", encoding="utf-8",
+        )
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", str(snippet_file),
+            "--replace", "greet",
+        )
+
+        assert result.returncode == 0, result.stderr
+        content = target.read_text(encoding="utf-8")
+        assert "return 'from file'" in content
+        # The path string itself must NOT have been spliced in.
+        assert str(snippet_file) not in content
+        assert "note: --snippet resolved to an existing file" in result.stderr
+        assert "--snippet-is-literal" in result.stderr
+
+    def test_edit_snippet_is_literal_uses_the_path_string_verbatim(self, tmp_path: Path):
+        """file exists AND --snippet-is-literal → verbatim: the PATH STRING
+        itself is the snippet (a valid Python expression statement), and the
+        referenced file's content must NOT be read."""
+        snippet_file = tmp_path / "repl.py"
+        snippet_file.write_text(
+            "def greet(name: str) -> str:\n    return 'from file'\n", encoding="utf-8",
+        )
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "repl.py",  # relative: a valid Python expression statement
+            "--after", "greet",
+            "--snippet-is-literal",
+            cwd=tmp_path,
+        )
+
+        assert result.returncode == 0, result.stderr
+        content = target.read_text(encoding="utf-8")
+        assert "repl.py" in content
+        assert "return 'from file'" not in content
+        assert "resolved to an existing file" not in result.stderr
+
+    def test_edit_multiline_snippet_is_never_detected_as_a_path(self, tmp_path: Path):
+        """A multi-line snippet stays verbatim even when its first line's
+        text names an existing file."""
+        (tmp_path / "def greet").write_text("decoy\n", encoding="utf-8")
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+        snippet = "def hello_world() -> str:\n    return 'Hi'\n"
+
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            "--after", "greet",
+            cwd=tmp_path,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "def hello_world" in target.read_text(encoding="utf-8")
+        assert "resolved to an existing file" not in result.stderr
 
 
 # ===================================================================

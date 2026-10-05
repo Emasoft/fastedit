@@ -103,7 +103,8 @@ COMMANDS: tuple[Command, ...] = (
                 (
                     "--replace splices the snippet over the symbol's span, signature",
                     "auto-preserved. Multi-line snippets with '# ... existing code ...' keep",
-                    "the rest of the body; '--snippet -' reads the snippet from stdin.",
+                    "the rest of the body; '--snippet @f.py' reads it from a file, '-' from",
+                    "piped stdin; '--snippet-is-literal' disables that resolution.",
                 ),
             ),
             Example(
@@ -242,7 +243,10 @@ COMMANDS: tuple[Command, ...] = (
             ),
             Example(
                 ("create", "docs/notes.md", "--content-file", "notes.md", "--parents"),
-                ("--content-file takes a path, or '-' for stdin.",),
+                (
+                    "--content-file takes a path, or '-' for piped stdin. '--content @f.py'",
+                    "reads content from a file; '--content-is-literal' uses the text verbatim.",
+                ),
             ),
         ),
     ),

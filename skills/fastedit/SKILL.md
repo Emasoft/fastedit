@@ -100,7 +100,12 @@ fastedit edit src/app.py --replace handle_request --snippet '
 
 - Full replacement — the snippet IS the new symbol, definition line included
   (also how you rename via `--replace`); a body-only snippet is refused for
-  definition targets: it would delete the signature. `--snippet -` = stdin.
+  definition targets: it would delete the signature. `--snippet @file.py`
+  reads the snippet from a file; `--snippet -` reads PIPED stdin (a terminal
+  is refused; never pass `-` without piping). A snippet that names an existing
+  file is auto-read from it (stderr note) — pass `--snippet-is-literal` to use
+  the text verbatim. Same `@file`/`-`/`--content-is-literal` convention applies
+  to `create --content`.
 
 ## Commands
 
