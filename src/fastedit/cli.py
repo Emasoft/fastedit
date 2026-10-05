@@ -497,6 +497,32 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     func_end = target_node.line_end  # exclusive
     original_func = "".join(original_lines[func_start:func_end])
 
+    # Issue #4: JSON key-level edits — a bare JSON VALUE snippet ("new",
+    # new, true, {"debug": true}) or a restated `"key": value` pair
+    # splices ONLY the pair's value (and the key on rename) instead of
+    # being refused, falling to the model, or wiping sibling keys. Any
+    # other shape declines and keeps the existing gates below.
+    if language == "json" and target_node.kind == "key":
+        from .inference.chunked_merge import _try_json_key_replace
+        json_fast = _try_json_key_replace(
+            original_code, snippet, replace_sym, target_node,
+        )
+        if json_fast is not None:
+            json_merged = _normalize_merged_eol(json_fast[0], original_code)
+            return ChunkedMergeResult(
+                merged_code=json_merged, parse_valid=json_fast[1],
+                chunks_used=0, chunk_regions=[], model_tokens=0, latency_ms=0.0,
+            )
+
+    # Issue #3: a snippet restating the doc comment ABOVE the symbol (the
+    # span starts at the definition line, so the comment above survived
+    # AND the snippet's copy was spliced in — the JSDoc twice) is stripped
+    # here before the text-match classifier or the direct swap sees it.
+    from .inference.chunked_merge import _strip_leading_doc_duplicate
+    snippet, _stripped_doc_lines = _strip_leading_doc_duplicate(
+        snippet, original_lines, func_start,
+    )
+
     # New/replaced content is normalized to the file's prevailing line
     # ending so the splice does not leave a mixed-ending seam; untouched
     # original_lines outside [func_start:func_end] are never touched.
@@ -2015,7 +2041,13 @@ def _decode_for_display(data: bytes, encoding: str | None) -> str:
 
 
 def cmd_diff(args):
-    """Show unified diff between the last backup and the current file content."""
+    """Show a unified diff of every change still in the file's undo history.
+
+    The diff base is the OLDEST surviving backup (the pre-state of the
+    whole still-undoable change set), so losses from earlier edits stay
+    visible after later edits land (issue #8) — diffing the newest backup
+    alone showed only the last edit's hunk.
+    """
     import difflib
 
     from .io_utils import UnsupportedEncodingError, read_source
@@ -2032,9 +2064,16 @@ def cmd_diff(args):
         print(f"No backup recorded for {args.file}. Run an edit command first.")
         return
 
-    # B38 layout: peek the NEWEST backup without popping -- diff must not
-    # consume the undo history.
-    backup_bytes = backups.peek(args.file)
+    # Issue #8: diff against the OLDEST surviving backup, not the newest.
+    # peek() (newest) is the LAST edit's pre-state, so a line an EARLIER
+    # edit had dropped was identical on both sides of that base and
+    # vanished from the rendered diff as soon as any later edit landed —
+    # the diff showed only the newest intended hunk, never the loss. The
+    # oldest backup is the pre-state of the whole still-undoable change
+    # set, so every change in the undo history is surfaced; adjacent
+    # hunks merge in the unified render and distant ones each print in
+    # full, so every changed line appears either way.
+    backup_bytes = backups.oldest(args.file)
 
     # Display-only decode (see _decode_for_display): both sides are decoded
     # with the codec the current file reads as, so a latin-1 file diffs

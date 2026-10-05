@@ -419,7 +419,343 @@ def _snippet_splice_covers_deleted_lines(
     }
     deleted = [ci for ri, ci in content_idx.items() if ri not in bound]
     new_lines = [c for c in classified if c[0] == "new"]
+
+    # Issue #8: a snippet ending MID-SENTENCE — its final content line a
+    # strict prefix of an original line the swap would delete — is a
+    # TRUNCATED restatement, not a complete re-declaration. The count
+    # arithmetic alone ratified the swap because the partial line counted
+    # as a declared new line "covering" the deletion, so the tail after
+    # the cut was dropped with exit 0 (the text-match editor declines the
+    # same shape as a rewrite conflict, leaving the direct swap as the
+    # only gate). Refuse when the snippet's last declared new line is a
+    # strict prefix of any deleted original content line. A complete
+    # rewrite is unaffected: its new lines are never strict prefixes of
+    # the originals they replace.
+    if new_lines:
+        last_new = (new_lines[-1][3] or "").strip()
+        if last_new:
+            bound_raw = {
+                c[2] for c in classified
+                if c[0] == "context" and c[2] in content_idx
+            }
+            for ri in content_idx:
+                if ri in bound_raw:
+                    continue
+                orig_line = raw_lines[ri].strip()
+                if orig_line.startswith(last_new) and len(last_new) < len(orig_line):
+                    return False
+
     return len(deleted) <= len(new_lines)
+
+
+def _strip_leading_doc_duplicate(
+    snippet: str,
+    original_lines: list[str],
+    span_start: int,
+) -> tuple[str, int]:
+    """Strip a snippet-restated doc comment above the replaced span (#3).
+
+    A symbol's replaced span starts at its DEFINITION line (``def`` /
+    ``function`` / ...); a doc comment above it is OUTSIDE the span. When
+    the snippet restates that comment along with the signature and body,
+    splicing it verbatim emitted the comment TWICE — the original above
+    the span survived and the snippet's copy landed with the function
+    (issue #3). The same restatement also broke the Python single-
+    definition refinement (the docstring statement counted as a second
+    top-level node), refusing a valid edit outright.
+
+    Returns ``(stripped_snippet, lines_removed)``. The snippet's leading
+    non-blank lines must restate a SUFFIX of the content block directly
+    above the span (the k lines closest to the span, blank-skip
+    comparison, stripped, in order — the most complete restatement wins);
+    blank padding between the restated comment and the definition line is
+    stripped with it. At least one snippet line always survives, nothing
+    is stripped when the span starts at the top of the file, and a
+    snippet whose head does not match the block above is returned
+    untouched — a genuinely NEW doc comment added by the snippet is
+    content, never stripped.
+
+    KNOWN LIMIT, deliberate: the match is on stripped non-blank lines, so
+    a snippet whose restatement differs from the file only in blank-line
+    placement inside the comment is not stripped — the existing gates
+    decide, never guess.
+    """
+    snippet_lines = snippet.splitlines(keepends=True)
+    if not snippet_lines or span_start <= 0 or span_start > len(original_lines):
+        return snippet, 0
+
+    # The content lines directly above the span, top-down (blank lines
+    # skipped; bounded scan).
+    _DOC_SCAN_WINDOW = 20
+    above: list[str] = []
+    p = span_start - 1
+    scanned = 0
+    while p >= 0 and scanned < _DOC_SCAN_WINDOW:
+        line = original_lines[p]
+        if line.strip():
+            above.append(line.strip())
+            scanned += 1
+        p -= 1
+    above.reverse()  # the scan walks upward; the block reads top-down
+    if not above:
+        return snippet, 0
+
+    # The snippet's leading non-blank lines restate a SUFFIX of the block
+    # above — the k lines closest to the span. Largest k wins (the most
+    # complete restatement); the snippet's last line never enters the
+    # head, so at least one line always survives.
+    snippet_nonblank = [
+        (si, ln.strip()) for si, ln in enumerate(snippet_lines[:-1])
+        if ln.strip()
+    ]
+    best_k = 0
+    for k in range(min(len(above), len(snippet_nonblank)), 0, -1):
+        if [s for _si, s in snippet_nonblank[:k]] == above[-k:]:
+            best_k = k
+            break
+    if best_k == 0:
+        return snippet, 0
+    consumed = snippet_nonblank[best_k - 1][0] + 1
+    # Blank padding between the restated comment and the definition line
+    # belongs to the duplicate prefix too (the file already carries it).
+    while consumed < len(snippet_lines) - 1 and not snippet_lines[consumed].strip():
+        consumed += 1
+    if consumed <= 0 or consumed >= len(snippet_lines):
+        return snippet, 0
+    return "".join(snippet_lines[consumed:]), consumed
+
+
+_JSON_SNIPPET_UNSET = object()
+"""Sentinel distinguishing "json.loads failed" from a parsed ``null``."""
+
+
+def _try_json_key_replace(
+    original_code: str,
+    snippet: str,
+    replace: str,
+    target_node: ASTNode | None = None,
+) -> tuple[str, bool] | None:
+    """JSON-aware ``replace=<key>`` splice: change ONE key's value (#4).
+
+    The generic ``replace=`` machinery is code-shaped: a bare value
+    snippet (``"new"``, ``new``, ``true``) was refused (not valid JSON /
+    no definition line), and a restated object snippet (``{"name":
+    "new"}``) direct-swapped over the pair's span — which on a compact
+    file (all pairs on one line) is the WHOLE document, wiping every
+    sibling key. This helper intercepts before those gates when the
+    target is a JSON ``pair`` symbol:
+
+      * **Bare JSON value** — the snippet is validated by ``json.loads``
+        alone (a document parse is never required) and ONLY the pair's
+        value node is spliced, so sibling keys, the surrounding comma
+        tokens, the pair's indentation, the file's trailing-newline state
+        and its compact/pretty style are preserved by construction (the
+        splice replaces exactly the value node's byte span, and a JSON
+        serializer never emits a comma).
+      * **Restated ``"key": value``** (the unbraced form, or a one-key
+        object whose key IS the target) — the value is spliced the same
+        way; the key node too when the restated key differs (a rename).
+      * **One-key object whose key is NOT the target** — treated as a
+        bare object VALUE for the target key (the key stays, the old
+        value is replaced wholesale). Changing one key of a nested
+        object is done by targeting the nested key (``config.debug``).
+        A snippet restating sibling keys of the TARGET keeps the
+        existing path, where ``definition_line_required`` and the
+        splice-completeness gate guard against wipes.
+
+    The merged document is validated strictly with ``json.loads``; a
+    file with PRE-EXISTING defects (a dangling comma) that strict
+    parsing rejects is validated relatively instead — the splice cannot
+    add or remove a comma token (the value span excludes them; the
+    serializer never emits one), so the edit is accepted only when the
+    merged diagnostics carry no NEW error trait relative to the
+    original's (the repo's req. 9 relative rule).
+
+    Returns ``(merged_code, parse_valid)`` or ``None`` to decline (the
+    caller then runs the existing gates unchanged).
+    """
+    import json as json_mod
+
+    from ..data_gen.ast_analyzer import parse_code, parse_diagnostics
+    from .ast_utils import _json_pair_name
+
+    text = snippet.strip()
+    if not text:
+        return None
+
+    try:
+        tree = parse_code(original_code, "json")
+    except Exception:  # noqa: BLE001 -- no json grammar: decline, never guess
+        return None
+
+    source_bytes = original_code.encode("utf-8")
+
+    # Dotted targets (``config.debug``) resolve by their LEAF key: the
+    # target node's span (matched below) disambiguates repeats.
+    leaf = replace.split(".")[-1] if replace else ""
+
+    def _pair_end_line(node) -> int:
+        end_row, end_col = node.end_point
+        return end_row if end_col == 0 else end_row + 1
+
+    matches: list = []
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "pair" and _json_pair_name(node, "json", source_bytes) == leaf:
+            matches.append(node)
+        stack.extend(node.children)
+    if target_node is not None:
+        matches = [
+            n for n in matches
+            if n.start_point[0] + 1 == target_node.line_start
+            and _pair_end_line(n) == target_node.line_end
+        ]
+    if len(matches) != 1:
+        # No such key, or an ambiguous repeat (two same-named keys in one
+        # span): the caller's existing resolution/refusal paths decide.
+        return None
+    pair = matches[0]
+    key_node = pair.child_by_field_name("key")
+    value_node = pair.child_by_field_name("value")
+    if key_node is None or value_node is None:
+        return None
+    old_key = _json_pair_name(pair, "json", source_bytes)
+    old_value_text = source_bytes[
+        value_node.start_byte:value_node.end_byte
+    ].decode("utf-8", errors="replace")
+
+    # (a) Classify the snippet WITHOUT parsing the document.
+    kind: tuple[str, str | None, object] | None = None
+    doc = _JSON_SNIPPET_UNSET
+    try:
+        doc = json_mod.loads(text)
+    except ValueError:
+        doc = _JSON_SNIPPET_UNSET
+    if doc is not _JSON_SNIPPET_UNSET and isinstance(doc, dict) and len(doc) == 1:
+        k, v = next(iter(doc.items()))
+        if k == old_key:
+            kind = ("pair", k, v)  # restated pair: value only (key identical)
+        else:
+            kind = ("value", None, doc)  # bare object value for the key
+    elif doc is not _JSON_SNIPPET_UNSET:
+        kind = ("value", None, doc)
+    else:
+        try:
+            wrapped = json_mod.loads("{" + text + "}")
+        except ValueError:
+            wrapped = None
+        if isinstance(wrapped, dict) and len(wrapped) == 1:
+            kind = ("pair", *next(iter(wrapped.items())))
+        elif not any(ch in text for ch in "{}[]\":,") and "\n" not in text:
+            # A bare unquoted token ("new") is the caller's spelling of a
+            # JSON string; validate it as one (still no document parse).
+            try:
+                kind = ("value", None, json_mod.loads(json_mod.dumps(text)))
+            except ValueError:
+                return None
+        else:
+            return None
+    if kind is None:
+        return None
+
+    splice_key_rename = False
+    if kind[0] == "pair":
+        new_key, value = kind[1], kind[2]
+        splice_key_rename = new_key != old_key
+    else:
+        value = kind[2]
+
+    # (b) Serialize the new value in the file's own style. Pretty iff the
+    # OLD value was pretty; the indent unit comes from the old value's
+    # own first nested line; the compact separator (", " vs ",") from the
+    # old value text.
+    pretty = "\n" in old_value_text
+    line_begin = source_bytes.rfind(b"\n", 0, pair.start_byte) + 1
+    prefix = source_bytes[line_begin:pair.start_byte].decode(
+        "utf-8", errors="replace",
+    )
+    pair_indent = prefix if not prefix.strip() else ""
+    unit = "  "
+    if pretty:
+        for ln in old_value_text.split("\n")[1:]:
+            if ln.strip():
+                lead = ln[: len(ln) - len(ln.lstrip())]
+                if lead.startswith(pair_indent) and len(lead) > len(pair_indent):
+                    unit = lead[len(pair_indent):]
+                break
+    comma_sep = ", " if ", " in old_value_text else ","
+    colon_sep = ": " if ": " in old_value_text else ":"
+    compact_separators = (comma_sep, colon_sep)
+
+    def _render(v, indent: str) -> str:
+        if isinstance(v, dict):
+            if not v:
+                return "{}"
+            pad = indent + unit
+            items = [
+                json_mod.dumps(k2, ensure_ascii=False) + ": " + _render(v2, pad)
+                for k2, v2 in v.items()
+            ]
+            if pretty:
+                return (
+                    "{\n"
+                    + ",\n".join(pad + item for item in items)
+                    + "\n" + indent + "}"
+                )
+            return "{" + ", ".join(items) + "}"
+        if isinstance(v, list):
+            if not v:
+                return "[]"
+            pad = indent + unit
+            items = [_render(v2, pad) for v2 in v]
+            if pretty:
+                return (
+                    "[\n"
+                    + ",\n".join(pad + item for item in items)
+                    + "\n" + indent + "]"
+                )
+            return "[" + ", ".join(items) + "]"
+        return json_mod.dumps(v, ensure_ascii=False)
+
+    if pretty:
+        new_value_text = _render(value, pair_indent)
+    else:
+        new_value_text = json_mod.dumps(
+            value, ensure_ascii=False, separators=compact_separators,
+        )
+
+    data = bytearray(source_bytes)
+    data[value_node.start_byte:value_node.end_byte] = new_value_text.encode("utf-8")
+    # Key rename (restated `"key": value` with a different key): the key
+    # node precedes the value node, so the splice above left its offsets
+    # valid.
+    if splice_key_rename:
+        data[key_node.start_byte:key_node.end_byte] = json_mod.dumps(
+            new_key, ensure_ascii=False,
+        ).encode("utf-8")
+    merged = bytes(data).decode("utf-8")
+
+    # (Dangling-)comma safety belt: the splice cannot introduce one (the
+    # value span excludes the comma tokens; the serializer never emits a
+    # comma), so a new ",," can only mean a bug — refuse.
+    if ",," in merged and ",," not in original_code:
+        return None
+
+    # (Validation) Strict first; relative fallback for files whose
+    # PRE-EXISTING defects strict parsing rejects (see docstring).
+    try:
+        json_mod.loads(merged)
+        return merged, True
+    except ValueError:
+        pass
+    ok, _reason = merged_is_acceptable(
+        parse_diagnostics(original_code, "json"),
+        parse_diagnostics(merged, "json"),
+    )
+    if ok:
+        return merged, True
+    return None
 
 
 def _classify_snippet_raw(
@@ -2229,6 +2565,40 @@ def chunked_merge(
             func_start = target_node.line_start - 1  # 0-indexed
             func_end = target_node.line_end  # 1-indexed inclusive
             original_func = "".join(original_lines[func_start:func_end])
+
+            # Issue #4: JSON key-level edits — a bare JSON VALUE snippet or
+            # a restated `"key": value` pair splices ONLY the pair's value
+            # (and the key on rename) instead of refusing, falling to the
+            # model, or wiping sibling keys. Anything else declines here
+            # and keeps the existing gates.
+            if language == "json" and target_node.kind == "key":
+                json_fast = _try_json_key_replace(
+                    original_code, snippet, replace, target_node,
+                )
+                if json_fast is not None:
+                    merged = _normalize_merged_eol(json_fast[0], original_code)
+                    _log.info(
+                        "JSON key replace for replace='%s': 0 model tokens "
+                        "(value-only splice)", replace,
+                    )
+                    return ChunkedMergeResult(
+                        merged_code=merged,
+                        parse_valid=json_fast[1],
+                        chunks_used=0,
+                        chunk_regions=[],
+                        model_tokens=0,
+                        latency_ms=0.0,
+                    )
+
+            # Issue #3: a snippet restating the doc comment ABOVE the
+            # symbol used to duplicate it (the span starts at the
+            # definition line; the comment above stayed AND the snippet's
+            # copy was spliced in). Strip the restated head before the
+            # classifier or the signature prepend sees it.
+            snippet, _stripped_doc_lines = _strip_leading_doc_duplicate(
+                snippet, original_lines, func_start,
+            )
+
             # B9: how many leading snippet lines ARE the auto-prepended
             # signature span (0 when no prepend happens). Threaded into
             # deterministic_edit so the span can be pinned as fixed context.

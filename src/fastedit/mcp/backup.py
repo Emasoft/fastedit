@@ -295,6 +295,24 @@ class BackupStore:
             raise KeyError(file_path)
         return paths[0].read_bytes()
 
+    def oldest(self, file_path: str) -> bytes:
+        """Return the OLDEST backup for *file_path* WITHOUT removing it.
+
+        The diff commands diff against this base (issue #8): peek's
+        NEWEST backup is the LAST edit's pre-state, so a line an EARLIER
+        edit had dropped was identical on both sides of that base and
+        vanished from the rendered diff as soon as any later edit landed
+        — `fastedit diff` showed only the newest intended hunk. The
+        oldest surviving backup is the pre-state of the whole still-
+        undoable change set, so every change in the undo history is
+        surfaced (undo pops walk the same chain one step at a time).
+        Raises KeyError when no backup exists.
+        """
+        paths = self._key_paths(file_path)
+        if not paths:
+            raise KeyError(file_path)
+        return paths[-1].read_bytes()
+
     def pop(self, file_path: str) -> bytes:
         """Return and remove the NEWEST backup for *file_path* (undo
         semantics: one pop = one step back), as the RAW BYTES stored (B22).
