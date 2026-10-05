@@ -2398,6 +2398,46 @@ def _validation_retries_metric(retries: int) -> str:
     return f", {retries} validation {unit}"
 
 
+_MAX_MERGE_PROMPT_CHARS = 200_000
+"""Character budget for any single text handed to the merge model (issue #13).
+
+Measured envelopes of the fastedit mlx-8bit model (Step A1,
+tests/test_real_llm_text.py): the context is 40,960 tokens, the generation
+cap 16,384 tokens, and a ~150-line prose chunk measured ~1,713 prompt
+tokens — about 11 characters per token. A span the model must re-emit
+WHOLE (the whole-file path's output is the whole file; a chunk's output is
+the chunk) therefore converges only under ~180,000 characters; anything
+larger is guaranteed truncation (B12) followed by 8 wasted retries — and,
+the reason this is a HARD gate, a prompt whose engine-side memory scales
+with the file: the issue #13 report measured the process climbing to
+80–97 GB on a 100 MB single-line file (``total_lines == 1`` sails past the
+150-LINE whole-file gate) because tokenize + prefill + the prompt KV cache
+all scale with ~25M tokens, on every one of the 8 retry attempts.
+
+Every ``merge_fn`` call site therefore checks the prompt it is about to
+send and raises a loud ``ValueError`` naming the size, the budget and the
+remedy BEFORE the model is invoked — never a silent multi-GB climb and
+never an OOM kill (exit 137). The issue #12 ``_lcs_pair_map`` cap remains
+as the last-resort guard on the VALIDATION side; this budget covers the
+MODEL side the LCS cap cannot see.
+"""
+
+_MAX_SNIPPET_CHARS = 8_000_000
+"""Character budget for a merge snippet (issue #13).
+
+A snippet is embedded in every prompt and classified line-by-line by the
+marker normalizer, whose string-span masker builds a per-character mutable
+copy (:func:`fastedit.split_join.mask_string_spans` — an O(n) list of char
+objects, ~8 bytes per ASCII char of pointer plus full string objects for
+non-latin-1 content), so an unbounded snippet turns that constant into a
+multi-GB spike before any other gate runs. 8 MB bounds that worst case to
+a few hundred MB while staying far above any plausible edit (a snippet
+larger than the model's 16,384-token output envelope cannot converge
+anyway). The prompt budget above bounds the snippet against the model
+independently of this sanity cap.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Core merge function — the only logic that remains in this file
 # ---------------------------------------------------------------------------
@@ -2844,6 +2884,17 @@ def chunked_merge(
             "preserve_siblings=True requires replace=ClassName. "
             "The flag controls how `replace=` behaves when the snippet "
             "describes only a subset of the class's members."
+        )
+
+    # Issue #13: bound the SNIPPET before the marker normalizer runs — its
+    # string-span masker builds a per-character mutable copy, so an unbounded
+    # snippet is a multi-GB spike before any other gate executes. Loud
+    # refusal with the remedy, never a silent climb.
+    if len(snippet) > _MAX_SNIPPET_CHARS:
+        raise ValueError(
+            f"snippet too large: {len(snippet):,} characters exceeds the "
+            f"{_MAX_SNIPPET_CHARS:,}-character limit. Split the edit into "
+            f"smaller snippets (one target per call)."
         )
 
     # Normalize short / Unicode marker forms (v0.2.4) → canonical long
@@ -3416,6 +3467,26 @@ def chunked_merge(
         safe_code = _escape_tags(original_code, tag_nonce)
         safe_snippet = _escape_tags(snippet, tag_nonce)
 
+        # Issue #13: the whole-file prompt must fit the model's re-emit
+        # envelope. The 150-LINE gate above cannot see a 100 MB SINGLE-LINE
+        # file (total_lines == 1) or a few-line file of megabyte-long lines —
+        # exactly the reported 80–97 GB shape: the whole file went to
+        # merge_fn on every retry attempt and the engine's tokenize/prefill/
+        # KV memory scaled with it. Fail loud with the remedy BEFORE any
+        # model call; the model path is never entered with a prompt the
+        # model cannot re-emit.
+        if len(safe_code) > _MAX_MERGE_PROMPT_CHARS:
+            raise ValueError(
+                f"file too large for a whole-file merge: {len(safe_code):,} "
+                f"characters exceeds the {_MAX_MERGE_PROMPT_CHARS:,}-character "
+                f"model budget (the model cannot re-emit a file this large; "
+                f"it would be truncated and rejected). Edit a smaller target "
+                f"instead: pass a snippet whose unique context lines anchor "
+                f"the edited window, use `after=`/`replace=` to scope the "
+                f"edit to one symbol, or split the file first "
+                f"(`fastedit split --lines N`)."
+            )
+
         # Step A2 unified retry-until-valid loop (req. 5 + req. 9). Replaces
         # the fixed initial-call + single corrective retry: EVERY attempt
         # runs the same battery (relative parse + content faithfulness; see
@@ -3531,6 +3602,23 @@ def chunked_merge(
         tag_nonce = _new_tag_nonce()
         raw_chunk = "".join(original_lines[start_idx:end_idx])
         escaped_chunk = _escape_tags(raw_chunk, tag_nonce)
+
+        # Issue #13: the chunk prompt must fit the model's re-emit envelope.
+        # Window chunks are line-bounded but not BYTE-bounded (megabyte-long
+        # lines), and a replace= chunk is a whole symbol. The size problem
+        # used to surface only AFTER the model had been called — at the
+        # issue #12 LCS DP gate — so the model burned its attempts first.
+        # Fail loud here, before merge_fn, with the remedy.
+        if len(escaped_chunk) > _MAX_MERGE_PROMPT_CHARS:
+            raise ValueError(
+                f"chunk {chunk.start_line}-{chunk.end_line} too large for a "
+                f"merge: {len(escaped_chunk):,} characters exceeds the "
+                f"{_MAX_MERGE_PROMPT_CHARS:,}-character model budget (the "
+                f"model would truncate it and every attempt would be "
+                f"rejected). Narrow the target: `replace=`/`after=` a "
+                f"sub-symbol, or anchor the snippet closer to the edited "
+                f"lines."
+            )
 
         # Use the appropriate snippet portion for this chunk. Step D2:
         # text-anchor windows each get the snippet PORTION scoped to their
