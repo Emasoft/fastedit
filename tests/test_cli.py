@@ -385,6 +385,105 @@ class TestDashStdinHelper:
         assert data == b"x = 1\n"
 
 
+class TestCreateStdinFallback:
+    """`fastedit create` with NEITHER --content nor --content-file reads its
+    content from piped stdin (issue #9 cross-check): the fallback must give
+    the SAME bounded, TTY-safe, single-read contract the '-' flag call sites
+    got -- not a bare sys.stdin.buffer.read() that blocks an interactive
+    terminal (or a harness pipe that never closes) forever with zero output."""
+
+    @staticmethod
+    def _args(target: Path):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            file=str(target), content=None, content_file=None,
+            force=False, parents=False,
+        )
+
+    def test_tty_stdin_is_refused_with_create_guidance(
+        self, tmp_path: Path, backup_dir, monkeypatch, capsys,
+    ):
+        from fastedit import cli as cli_module
+
+        class FakeTTY:
+            def isatty(self):
+                return True
+
+            def read(self, *a, **kw):  # pragma: no cover - must never run
+                raise AssertionError("stdin must never be read when it is a TTY")
+
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        target = tmp_path / "made.txt"
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module.cmd_create(self._args(target))
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "requires piped stdin" in err
+        # The guidance must name the create command, not the edit flag form.
+        assert "fastedit create" in err
+        assert not target.exists()
+
+    def test_piped_stdin_is_read_once_as_bytes(
+        self, tmp_path: Path, backup_dir, monkeypatch,
+    ):
+        import io as io_mod
+
+        from fastedit import cli as cli_module
+
+        class FakePipedStdin:
+            def __init__(self, data: bytes):
+                self.buffer = io_mod.BytesIO(data)
+
+            def isatty(self):
+                return False
+
+        monkeypatch.setattr(sys, "stdin", FakePipedStdin(b"hello from stdin\n"))
+        target = tmp_path / "made.txt"
+        cli_module.cmd_create(self._args(target))
+        assert target.read_text(encoding="utf-8") == "hello from stdin\n"
+
+
+class TestBatchEditCleanRefusals:
+    """batch-edit must report merge refusals the way edit and multi-edit do
+    (issue #13 cross-check): the merge raises ValueError for knowable
+    refusals (oversized snippet, oversized prompt, ambiguous symbol), and a
+    bare traceback is not a refusal."""
+
+    def test_oversized_snippet_is_a_clean_refusal_not_a_traceback(
+        self, tmp_path: Path, backup_dir, monkeypatch, capsys,
+    ):
+        import json as json_mod
+        from types import SimpleNamespace
+
+        from fastedit import cli as cli_module
+        from fastedit.inference.chunked_merge import _MAX_SNIPPET_CHARS
+
+        target = tmp_path / "notes.txt"
+        target.write_text("hello\n", encoding="utf-8")
+
+        def _fake_backend(args):
+            def _boom(*a, **kw):  # pragma: no cover - must never run
+                raise AssertionError("the model must never be called")
+
+            return "fake", SimpleNamespace(merge_auto=_boom)
+
+        monkeypatch.setattr(cli_module, "_make_backend_with_overrides", _fake_backend)
+        edits = json_mod.dumps([{"snippet": "x" * (_MAX_SNIPPET_CHARS + 1)}])
+        args = SimpleNamespace(
+            file=str(target), edits=edits, backend=None, model_path=None,
+            api_base=None, api_model=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module._cmd_batch_edit_locked(args)
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "snippet too large" in err
+        assert "Traceback" not in err
+        # Nothing was written.
+        assert target.read_text(encoding="utf-8") == "hello\n"
+
+
 class TestCLIEditStdinDash:
     """End-to-end issue #9 behavior for `edit --snippet -`."""
 
@@ -2013,3 +2112,254 @@ class TestCLIVersion:
                     assert not any(
                         isinstance(a, argparse_mod._VersionAction) for a in sub._actions
                     ), f"subcommand '{name}' must not carry a --version flag"
+
+
+# ---------------------------------------------------------------------------
+# Issue #5 — addressable test blocks, constructors, and the imports block
+# (printed slugs must be exactly the resolvable ones)
+# ---------------------------------------------------------------------------
+
+JEST_TS_FILE = (
+    'import { describe, it, expect } from "vitest";\n'
+    'import { createServer } from "./server";\n'
+    "\n"
+    "const PORT = 3111;\n"
+    "\n"
+    'describe("server", () => {\n'
+    '  it("renders correctly", () => {\n'
+    '    const el = renderBadge("hello");\n'
+    '    expect(el.textContent).toBe("hello");\n'
+    "  });\n"
+    "\n"
+    '  it("handles empty label", () => {\n'
+    '    expect(renderBadge("")).toBeNull();\n'
+    "  });\n"
+    "});\n"
+)
+
+TS_CLASS_FILE = (
+    "export class Server {\n"
+    "  readonly port: number;\n"
+    "\n"
+    "  constructor(port: number) {\n"
+    "    this.port = port;\n"
+    "  }\n"
+    "\n"
+    "  start(): void {\n"
+    "    console.log(this.port);\n"
+    "  }\n"
+    "}\n"
+)
+
+
+def _jest_read_file() -> str:
+    """A >100-line jest file so `fastedit read` takes the structure path."""
+    lines = [
+        'import { describe, it, expect } from "vitest";',
+        'import { createServer } from "./server";',
+        "",
+        'describe("server", () => {',
+    ]
+    for i in range(30):
+        lines += [
+            f'  it("test number {i}", () => {{',
+            f"    expect({i}).toBe({i});",
+            "  });",
+            "",
+        ]
+    lines += ["});", ""]
+    return "\n".join(lines)
+
+
+class TestCLIIssue5AddressableSymbols:
+    """`fastedit read` lists test blocks, constructors, and the imports
+    block; every listed slug resolves through --replace/--after."""
+
+    def test_read_lists_test_blocks_and_imports(self, tmp_path: Path):
+        target = tmp_path / "server.test.ts"
+        target.write_text(_jest_read_file(), encoding="utf-8")
+        result = run_cli("read", str(target))
+        assert result.returncode == 0, result.stderr
+        assert "describe:server" in result.stdout
+        assert "it:test-number-0" in result.stdout
+        # the imports block is shown with its line span and its name
+        assert "L1-2" in result.stdout
+        assert "imports" in result.stdout
+
+    def test_replace_test_block_byte_exact(self, tmp_path: Path):
+        target = tmp_path / "badge.test.ts"
+        target.write_text(JEST_TS_FILE, encoding="utf-8")
+        snippet = (
+            '  it("renders correctly", () => {\n'
+            '    const el = renderBadge("hi");\n'
+            '    expect(el.textContent).toBe("hi");\n'
+            "  });\n"
+        )
+        result = run_cli(
+            "edit", str(target),
+            "--replace", "it:renders-correctly",
+            "--snippet", snippet,
+        )
+        assert result.returncode == 0, result.stderr
+        expected = JEST_TS_FILE.replace(
+            'renderBadge("hello")', 'renderBadge("hi")'
+        ).replace('toBe("hello")', 'toBe("hi")')
+        assert target.read_text(encoding="utf-8") == expected
+
+    def test_replace_test_block_body_only_snippet_is_refused(self, tmp_path: Path):
+        """A body-only snippet would delete the naming it() line — the
+        definition-line guard must refuse it for a test-block target."""
+        target = tmp_path / "badge.test.ts"
+        target.write_text(JEST_TS_FILE, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--replace", "it:renders-correctly",
+            "--snippet", '    expect(renderBadge("hi")).toBeNull();\n',
+        )
+        assert result.returncode == 1
+        assert "has no definition" in result.stderr
+        assert target.read_text(encoding="utf-8") == JEST_TS_FILE
+
+    def test_replace_constructor(self, tmp_path: Path):
+        target = tmp_path / "server.ts"
+        target.write_text(TS_CLASS_FILE, encoding="utf-8")
+        snippet = (
+            "  constructor(port: number) {\n"
+            "    this.port = port * 2;\n"
+            "  }\n"
+        )
+        result = run_cli(
+            "edit", str(target),
+            "--replace", "constructor",
+            "--snippet", snippet,
+        )
+        assert result.returncode == 0, result.stderr
+        expected = TS_CLASS_FILE.replace(
+            "this.port = port;", "this.port = port * 2;"
+        )
+        assert target.read_text(encoding="utf-8") == expected
+
+    def test_after_imports_typescript(self, tmp_path: Path):
+        target = tmp_path / "server.test.ts"
+        target.write_text(JEST_TS_FILE, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--after-imports",
+            "--snippet", 'import { render } from "./test-utils";',
+        )
+        assert result.returncode == 0, result.stderr
+        expected = JEST_TS_FILE.replace(
+            'import { createServer } from "./server";\n',
+            'import { createServer } from "./server";\n\n'
+            'import { render } from "./test-utils";\n',
+        )
+        assert target.read_text(encoding="utf-8") == expected
+
+    def test_after_name_imports_works_too(self, tmp_path: Path):
+        """The import block is a plain resolvable symbol, so the documented
+        `--after imports` form anchors on it as well."""
+        target = tmp_path / "server.test.ts"
+        target.write_text(JEST_TS_FILE, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--after", "imports",
+            "--snippet", 'import { render } from "./test-utils";',
+        )
+        assert result.returncode == 0, result.stderr
+        expected = JEST_TS_FILE.replace(
+            'import { createServer } from "./server";\n',
+            'import { createServer } from "./server";\n\n'
+            'import { render } from "./test-utils";\n',
+        )
+        assert target.read_text(encoding="utf-8") == expected
+
+    def test_after_imports_python(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text(
+            "import os\nimport sys\n\n\ndef main() -> None:\n    print(os.name)\n",
+            encoding="utf-8",
+        )
+        result = run_cli(
+            "edit", str(target),
+            "--after-imports",
+            "--snippet", "import json",
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text(encoding="utf-8") == (
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "import json\n"
+            "\n"
+            "\n"
+            "def main() -> None:\n"
+            "    print(os.name)\n"
+        )
+
+    def test_after_imports_javascript(self, tmp_path: Path):
+        target = tmp_path / "app.js"
+        target.write_text(
+            'import a from "a";\nimport b from "b";\nfunction f() {\n  return a;\n}\n',
+            encoding="utf-8",
+        )
+        result = run_cli(
+            "edit", str(target),
+            "--after-imports",
+            "--snippet", 'import c from "c";',
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text(encoding="utf-8") == (
+            'import a from "a";\n'
+            'import b from "b";\n'
+            "\n"
+            'import c from "c";\n'
+            "\n"
+            "function f() {\n"
+            "  return a;\n"
+            "}\n"
+        )
+
+    def test_after_imports_without_imports_block_refuses(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--after-imports",
+            "--snippet", "import json",
+        )
+        assert result.returncode == 1
+        assert "Symbol 'imports' not found" in result.stderr
+        assert target.read_text(encoding="utf-8") == "def main() -> None:\n    pass\n"
+
+    def test_after_imports_conflicts_with_after(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text("import os\n\n\ndef main():\n    pass\n", encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--after", "main",
+            "--after-imports",
+            "--snippet", "import json",
+        )
+        assert result.returncode == 2
+
+    def test_batch_edit_after_imports(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text(
+            "import os\nimport sys\n\n\ndef main():\n    print(os.name)\n",
+            encoding="utf-8",
+        )
+        result = run_cli(
+            "batch-edit", str(target),
+            "--edits", '[{"snippet": "import json", "after": "imports"}]',
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text(encoding="utf-8") == (
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "import json\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    print(os.name)\n"
+        )

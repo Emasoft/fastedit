@@ -189,6 +189,35 @@ def test_single_line_oversized_file_refuses_before_model_call(tmp_path):
     assert fn.calls == []
 
 
+def test_whole_file_gate_fires_before_tag_escape(monkeypatch):
+    """The budget gate runs BEFORE the tag-escape copy (issue #13 recheck).
+
+    _escape_tags is a full-text transform of the original; on oversized
+    input it is wasted work (a full scan, and a full copy when the text
+    carries literal tags). Escape never shortens (the placeholders are
+    longer than the tags), so a file over budget is over budget escaped
+    too -- the gate must refuse before the escape runs at all.
+    """
+    import fastedit.inference.chunked_merge as cm
+
+    def _no_escape(text, nonce=""):  # pragma: no cover - must never run
+        raise AssertionError(
+            "tag escape must not run on input over the prompt budget"
+        )
+
+    monkeypatch.setattr(cm, "_escape_tags", _no_escape)
+    fn = _RecordingMergeFn()
+    with pytest.raises(ValueError, match="file too large for a whole-file merge"):
+        cm.chunked_merge(
+            original_code="x" * (cm._MAX_MERGE_PROMPT_CHARS + 1),
+            snippet="a brand new log line\n",
+            file_path="big.log",
+            merge_fn=fn,
+            language=None,
+        )
+    assert fn.calls == []
+
+
 def test_few_line_oversized_file_refuses_on_character_budget(tmp_path):
     """≤150 LINES but over the character budget: the char gate must catch it.
 

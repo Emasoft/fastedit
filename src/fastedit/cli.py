@@ -91,7 +91,9 @@ _DASH_STDIN_DEFAULT_TIMEOUT_S = 60.0
 _ATFILE_AUTODETECT_MAX_CHARS = 1024
 
 
-def _read_dash_stdin(flag_label: str, *, binary: bool = False):
+def _read_dash_stdin(
+    flag_label: str, *, binary: bool = False, usage_hint: str | None = None,
+):
     """Single source of truth for reading a '-' value of a stdin flag.
 
     Shared by --snippet, --content, --content-file, --edits and
@@ -115,6 +117,11 @@ def _read_dash_stdin(flag_label: str, *, binary: bool = False):
 
     *binary* reads raw bytes (sys.stdin.buffer) for byte-exact consumers
     such as ``create --content-file -``.
+
+    *usage_hint* overrides the piped-stdin guidance quoted in the TTY and
+    timeout refusals. The default names the ``<flag> -`` form; call sites
+    whose stdin use is not a '-' flag value (create's no-flag fallback)
+    pass their own so the guidance names their command.
     """
     import io
     import os
@@ -126,10 +133,12 @@ def _read_dash_stdin(flag_label: str, *, binary: bool = False):
         is_tty = stdin is not None and stdin.isatty()
     except (ValueError, OSError):
         is_tty = False
+    if usage_hint is None:
+        usage_hint = f"e.g. `cat snippet.py | fastedit edit <file> {flag_label} -`"
+
     if stdin is None or is_tty:
         print(
-            f"Error: {flag_label} - requires piped stdin "
-            f"(e.g. `cat snippet.py | fastedit edit <file> {flag_label} -`)",
+            f"Error: {flag_label} - requires piped stdin ({usage_hint})",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -166,7 +175,7 @@ def _read_dash_stdin(flag_label: str, *, binary: bool = False):
     if reader.is_alive():
         print(
             f"Error: timed out after {timeout_s:g}s waiting for stdin for "
-            f"{flag_label} -. stdin never reached EOF; pipe the content in "
+            f"{flag_label} -. stdin never reached EOF; {usage_hint} "
             f"or set {_DASH_STDIN_TIMEOUT_ENV} to raise the limit.",
             file=sys.stderr,
         )
@@ -344,6 +353,43 @@ def cmd_read(args):
         print(_format_small_file(args.file, content, total_lines))
         return
 
+    # Issue #5: the in-memory symbol map is the PRIMARY listing source — it
+    # is the same map `--replace`/`--after` resolve against, so every name
+    # read prints (jest it()/test()/describe() blocks as ``<callee>:<slug>``,
+    # class constructors, the ``imports`` block) is one an edit can address.
+    # The tldr daemon path stays as the fallback for languages the in-memory
+    # resolver cannot serve; its compact output truncates call symbols to
+    # ``it(…)``, a name no edit can target. The same-length bare-CR
+    # normalization keeps the reported line numbers valid against `content`
+    # (the same protection the edit pipeline applies).
+    from .data_gen.ast_analyzer import detect_language
+    from .inference.ast_utils import get_ast_map_from_source
+    from .split_join import normalize_bare_cr_for_ast
+
+    language = detect_language(path)
+    nodes = (
+        get_ast_map_from_source(normalize_bare_cr_for_ast(content), str(path), language)
+        if language else []
+    )
+    if nodes:
+        data = {
+            "language": language,
+            "files": [{
+                "definitions": [
+                    {
+                        "name": n.name,
+                        "kind": n.kind,
+                        "line_start": n.line_start,
+                        "line_end": n.line_end,
+                        "signature": "",
+                    }
+                    for n in nodes
+                ],
+            }],
+        }
+        print(_format_structure(args.file, data, total_lines))
+        return
+
     try:
         result = subprocess.run(
             ["tldr", "structure", args.file, "--format", "compact"],
@@ -452,6 +498,7 @@ def _snippet_is_single_matching_definition(snippet, target_node):
 def _try_deterministic_replace(path, original_code, original_lines, snippet, replace_sym, language, backups):
     from .data_gen.ast_analyzer import validate_parse
     from .inference.chunked_merge import (
+        _MAX_SNIPPET_CHARS,
         ChunkedMergeResult,
         _deterministic_result_unfaithful_reason,
         _normalize_merged_eol,
@@ -473,6 +520,20 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     )
 
     total_lines = len(original_lines)
+
+    # Issue #13 (gate placement): the model-side prompt gates run inside
+    # chunked_merge, but THIS deterministic path runs before it and
+    # classifies the snippet line-by-line (doc-strip scan, then
+    # deterministic_edit) — an unbounded snippet (e.g. `--snippet
+    # @huge.txt`) would spike memory here before any gate ever saw it.
+    # Same bound, same remedy, checked first.
+    if len(snippet) > _MAX_SNIPPET_CHARS:
+        raise ValueError(
+            f"snippet too large: {len(snippet):,} characters exceeds the "
+            f"{_MAX_SNIPPET_CHARS:,}-character limit. Split the edit into "
+            f"smaller snippets (one target per call)."
+        )
+
     # B3: parse the IN-MEMORY original first. get_ast_map consults the tldr
     # daemon, whose cache can hold pre-write line numbers for a file that
     # was just rewritten (B26 rationale) and which knows none of the B2/B3
@@ -620,12 +681,25 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # caller fixes the snippet. Generic across languages (no per-grammar
     # branch); skipped when the file has no detected language, matching the
     # other parse gates in this function.
+    #
+    # Issue #5: a MEMBER snippet (a class constructor, a method shorthand)
+    # is only grammatical INSIDE its container — a standalone
+    # ``constructor(...) {...}`` is a parse error at compilation-unit level
+    # BY DESIGN, so this gate asked it the wrong question and refused a
+    # well-formed wholesale replacement ("not valid typescript"). When the
+    # snippet parses inside the language's minimal member container
+    # (declared in ``_MEMBER_SNIPPET_CONTAINERS``), the question the
+    # snippet actually answers is "am I a well-formed member?" and the
+    # answer is yes — accept it. Languages without a declared container,
+    # and snippets that parse neither way, refuse exactly as before.
     if language and not validate_parse(snippet, language):
-        raise ValueError(
-            f"snippet for '{replace_sym}' is not valid {language} and cannot be "
-            f"applied as a replacement. Fix the snippet's syntax and retry -- "
-            f"fastedit will not guess at code that does not parse."
-        )
+        from .inference.snippet_analysis import _snippet_parses_as_member
+        if not _snippet_parses_as_member(snippet, language):
+            raise ValueError(
+                f"snippet for '{replace_sym}' is not valid {language} and cannot be "
+                f"applied as a replacement. Fix the snippet's syntax and retry -- "
+                f"fastedit will not guess at code that does not parse."
+            )
 
     # TRDD-8M0MXRJO. A body-only snippet for a definition-kind target (function/
     # method/class/...) splices over the FULL AST line span -- signature line
@@ -656,12 +730,21 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # body line the snippet did not restate, reported as success. Their
     # specs now declare the requirement (definition_line_required=True);
     # code languages keep the existing kind floor.
-    from .inference.ast_utils import _FORMAT_SYMBOL_SPECS
+    #
+    # Issue #5: call-expression symbols (jest it()/test()/describe() blocks)
+    # declare the SAME requirement on their ``_CallSymbolSpec`` row — the
+    # call's first line is the line that NAMES the block (``it("...", () => {``),
+    # so a body-only --replace snippet would delete it. The spec table, not
+    # the kind string, decides: one declarative lookup per language.
+    from .inference.ast_utils import _CALL_SYMBOL_SPECS, _FORMAT_SYMBOL_SPECS
     format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
-    definition_line_required = (
-        format_spec.definition_line_required if format_spec is not None
-        else target_node.kind in _DEFINITION_KINDS
-    )
+    call_spec = _CALL_SYMBOL_SPECS.get(language or "")
+    if format_spec is not None:
+        definition_line_required = format_spec.definition_line_required
+    elif call_spec is not None and target_node.kind == call_spec.kind:
+        definition_line_required = call_spec.definition_line_required
+    else:
+        definition_line_required = target_node.kind in _DEFINITION_KINDS
     has_def = _snippet_has_any_definition(
         snippet, ext=path.suffix, first_original_line=original_lines[func_start]
     )
@@ -824,6 +907,12 @@ def _cmd_edit_locked(args):
 
     replace_sym = args.replace or None
     after_sym = args.after or None
+    # Issue #5: --after-imports is --after imports spelled for the common
+    # case (the imports pseudo-symbol resolves like any symbol; without an
+    # imports block the normal not-found refusal fires). The argparse group
+    # already guarantees the two flags never combine.
+    if getattr(args, "after_imports", False):
+        after_sym = "imports"
 
     def _maybe_impact_note(merged_code: str) -> str:
         """Build the pre-flight impact note (VAL-M3-001) or empty str.
@@ -1058,13 +1147,23 @@ def _cmd_batch_edit_locked(args):
         sys.exit(1)
     language = detect_language(path)
 
-    result = batch_chunked_merge(
-        original_code=original_code,
-        edits=batch,
-        file_path=args.file,
-        merge_fn=backend.merge_auto,
-        language=language,
-    )
+    try:
+        result = batch_chunked_merge(
+            original_code=original_code,
+            edits=batch,
+            file_path=args.file,
+            merge_fn=backend.merge_auto,
+            language=language,
+        )
+    except ValueError as e:
+        # The merge raises ValueError for every knowable refusal — the
+        # issue #13 oversized-snippet/prompt gates, an ambiguous or missing
+        # symbol, the whole-file line limit — the same failures multi-edit
+        # catches in PHASE 2 and cmd_edit catches around chunked_merge. A
+        # bare traceback is not a refusal: print the reason plus the
+        # unchanged-file guidance (nothing has been written on this path).
+        _print_edit_refusal(str(e))
+        sys.exit(1)
     try:
         _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
     except ValueError as e:
@@ -1806,7 +1905,20 @@ def cmd_create(args):
             else Path(args.content_file).read_bytes()
         )
     else:
-        raw = sys.stdin.buffer.read()
+        # Issue #9 parity for the no-flag fallback: this used to be a bare
+        # ``sys.stdin.buffer.read()`` -- an interactive terminal, or an agent
+        # harness that holds the pipe open, blocked FOREVER with zero output,
+        # the exact defect the '-' call sites above were fixed for. Same
+        # contract here: a TTY is refused with create-specific guidance, and
+        # the single bounded read returns bytes for the binary sniff below.
+        raw = _read_dash_stdin(
+            "create",
+            binary=True,
+            usage_hint=(
+                "pipe the content in, e.g. `cat page.md | fastedit create "
+                "<file>`, or pass --content/--content-file"
+            ),
+        )
 
     detection = is_text_file(raw)
     if not detection.is_text:
@@ -2461,7 +2573,17 @@ def main():
         help="Use --snippet text verbatim: never resolve '@path' and never "
              "auto-read a snippet that names an existing file",
     )
-    edit_p.add_argument("--after", default="", help="Insert new code after this symbol")
+    # Issue #5: --after imports is the anchor callers reach for most (add an
+    # import), so it gets a dedicated flag. Mutually exclusive with --after:
+    # both name the SAME anchor slot, and the conflict is knowable from argv
+    # alone (argparse exits 2 before anything is read).
+    after_group = edit_p.add_mutually_exclusive_group()
+    after_group.add_argument("--after", default="", help="Insert new code after this symbol")
+    after_group.add_argument(
+        "--after-imports", dest="after_imports", action="store_true",
+        help="Insert the snippet directly after the file's import block "
+             "(equivalent to --after imports)",
+    )
     edit_p.add_argument("--replace", default="", help="Replace this symbol with the snippet")
     edit_p.add_argument("--backend", choices=["mlx", "vllm"], default=None)
     edit_p.add_argument("--model-path", default=None, help="MLX model path (overrides FASTEDIT_MODEL_PATH)")

@@ -231,6 +231,39 @@ class TestStructuralSafety:
             assert b == a, f"line {i + 1} changed without a declared edit: {b!r} -> {a!r}"
 
 
+    def test_flat_key_containing_a_dot_is_edited_literally(self):
+        """A JSON key that LITERALLY contains a dot (``"a.b"``) is one flat
+        key, not the nested path a.b: the dotted-target leaf split
+        (``config.debug`` -> leaf ``debug``) must not hide it from the
+        value-splice matcher. _resolve_symbol resolves the literal name
+        (B3 literal pass); the helper must match the pair by its FULL name
+        too."""
+        doc = '{\n  "a.b": 1,\n  "c": 2\n}\n'
+        merged = _edit(doc, '"new"', "a.b")
+        assert json.loads(merged) == {"a.b": "new", "c": 2}
+        # Sibling byte-exact.
+        assert '"c": 2' in merged
+
+    def test_flat_dotted_key_and_nested_leaf_coexist(self):
+        """replace="a.b" targets the LITERAL flat key even when a nested
+        a -> b pair also exists (the resolved target's span disambiguates)."""
+        doc = '{\n  "a.b": 1,\n  "a": {"b": 2}\n}\n'
+        merged = _edit(doc, '"flat"', "a.b")
+        doc_out = json.loads(merged)
+        assert doc_out["a.b"] == "flat"
+        assert doc_out["a"]["b"] == 2
+
+    def test_value_containing_double_comma_is_content_not_a_splice_bug(self):
+        """The dangling-comma safety belt must not refuse a value whose
+        STRING CONTENT contains ',,' — the belt hunts structural commas,
+        and string literals are content (the splice replaces exactly the
+        value span, so it cannot introduce a structural double comma)."""
+        merged = _edit(PRETTY, '"wait,, what"', "name")
+        doc = json.loads(merged)
+        assert doc["name"] == "wait,, what"
+        assert doc["config"]["level"] == 3
+
+
 # ---------------------------------------------------------------------------
 # The chunked_merge path (MCP route) gets the same fix
 # ---------------------------------------------------------------------------

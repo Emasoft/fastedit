@@ -16,7 +16,11 @@ import re
 from collections import Counter
 
 from ..lang_attributes import format_for_path
-from ..split_join import detect_line_ending, normalize_line_endings
+from ..split_join import (
+    detect_line_ending,
+    mask_string_spans,
+    normalize_line_endings,
+)
 from ..text_heuristics import (
     TOLERANCE_MODEL_PROSE,
     TextOp,
@@ -27,12 +31,15 @@ from ..text_heuristics import (
 # --- Re-export all public types and functions for backward compatibility ---
 # All existing `from .inference.chunked_merge import X` imports continue to work.
 from .ast_utils import (  # noqa: F401
+    _CALL_SYMBOL_SPECS,
+    _FORMAT_SYMBOL_SPECS,
     ASTNode,
     BatchEdit,
     ChunkedMergeResult,
     ChunkRegion,
     DeleteResult,
     MoveResult,
+    _call_symbol_snippet_top_level_names,
     _qualified_symbol_names,
     _resolve_symbol,
     get_ast_map,
@@ -707,7 +714,11 @@ def _try_json_key_replace(
     source_bytes = original_code.encode("utf-8")
 
     # Dotted targets (``config.debug``) resolve by their LEAF key: the
-    # target node's span (matched below) disambiguates repeats.
+    # target node's span (matched below) disambiguates repeats. A target
+    # that names a LITERAL dotted key (``"a.b": 1`` — the dot is part of
+    # the key, resolved by _resolve_symbol's B3 literal pass) must match
+    # its full name too: the leaf split alone never matches it, and the
+    # edit would silently decline to the generic gates.
     leaf = replace.split(".")[-1] if replace else ""
 
     def _pair_end_line(node) -> int:
@@ -718,8 +729,10 @@ def _try_json_key_replace(
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
-        if node.type == "pair" and _json_pair_name(node, "json", source_bytes) == leaf:
-            matches.append(node)
+        if node.type == "pair":
+            pair_name = _json_pair_name(node, "json", source_bytes)
+            if pair_name == leaf or (replace is not None and pair_name == replace):
+                matches.append(node)
         stack.extend(node.children)
     if target_node is not None:
         matches = [
@@ -854,8 +867,14 @@ def _try_json_key_replace(
 
     # (Dangling-)comma safety belt: the splice cannot introduce one (the
     # value span excludes the comma tokens; the serializer never emits a
-    # comma), so a new ",," can only mean a bug — refuse.
-    if ",," in merged and ",," not in original_code:
+    # comma), so a NEW STRUCTURAL ",," can only mean a bug — refuse. The
+    # check runs on the string-masked text: a value whose STRING CONTENT
+    # contains ",," ({"a": "wait,, what"}) is content, never a splice bug,
+    # and must not be refused.
+    if (
+        ",," in mask_string_spans(merged)
+        and ",," not in mask_string_spans(original_code)
+    ):
         return None
 
     # (Validation) Strict first; relative fallback for files whose
@@ -3294,6 +3313,23 @@ def chunked_merge(
                 snippet_balance = _bracket_balance(snippet)
                 span_balance = _bracket_balance(original_func)
                 snippet_is_complete = snippet_balance == span_balance
+                # Issue #5: for a call-symbol target (jest it()/test()/
+                # describe() blocks) the flat name list overcounts — the
+                # in-memory walker recurses INTO call bodies, so the
+                # snippet's inner constants surface as extra "definitions"
+                # even though they are members of the call being swapped.
+                # The completeness proof for a call target reads the
+                # snippet's PARENTLESS names instead (exactly one, named
+                # `replace`). The declarative spec table decides; code
+                # symbols keep the flat single-name check.
+                _call_spec = _CALL_SYMBOL_SPECS.get(language or "")
+                _call_snippet_swap = (
+                    _call_spec is not None
+                    and target_node.kind == _call_spec.kind
+                    and _call_symbol_snippet_top_level_names(
+                        snippet, file_path, language,
+                    ) == [replace]
+                )
                 if snippet_parse and not snippet_is_complete:
                     _log.info(
                         "Direct-swap declined for replace='%s': snippet "
@@ -3304,8 +3340,10 @@ def chunked_merge(
                 if (
                     snippet_parse
                     and snippet_is_complete
-                    and len(snippet_parse) == 1
-                    and snippet_parse[0] == replace
+                    and (
+                        (len(snippet_parse) == 1 and snippet_parse[0] == replace)
+                        or _call_snippet_swap
+                    )
                 ):
                     # Align snippet indent to match the target function's
                     # indent in the original.
@@ -3359,12 +3397,21 @@ def chunked_merge(
                     # lines — so the splice-completeness check supplies the
                     # missing proof. Failing it → decline to the validated
                     # model path, never write the mangled swap.
-                    from .ast_utils import _FORMAT_SYMBOL_SPECS
                     format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
-                    format_spec = _FORMAT_SYMBOL_SPECS.get(language or "")
+                    # Issue #5: a call-symbol swap carries the same
+                    # completeness burden as a format-symbol swap — the
+                    # spec row declares the naming line required, and the
+                    # splice-completeness check below proves no body line
+                    # was silently dropped.
+                    call_spec = _CALL_SYMBOL_SPECS.get(language or "")
+                    completeness_unproven = (
+                        format_spec is not None and format_spec.definition_line_required
+                    ) or (
+                        call_spec is not None
+                        and target_node.kind == call_spec.kind
+                    )
                     if (
-                        format_spec is not None
-                        and format_spec.definition_line_required
+                        completeness_unproven
                         and not _snippet_splice_covers_deleted_lines(
                             original_func, snippet_text,
                         )
@@ -3464,6 +3511,22 @@ def chunked_merge(
         # the model cannot collide with user text (e.g. a file that literally
         # contains the old fixed placeholder string).
         tag_nonce = _new_tag_nonce()
+        # Issue #13 (gate placement): bound the prompt BEFORE the tag-escape
+        # transform. Escape never shortens (placeholders are longer than the
+        # tags, lengths identical otherwise), so the ORIGINAL length is an
+        # exact lower bound of the escaped prompt's — this check refuses
+        # oversized input without paying the full-text escape scan/copy.
+        if len(original_code) > _MAX_MERGE_PROMPT_CHARS:
+            raise ValueError(
+                f"file too large for a whole-file merge: {len(original_code):,} "
+                f"characters exceeds the {_MAX_MERGE_PROMPT_CHARS:,}-character "
+                f"model budget (the model cannot re-emit a file this large; "
+                f"it would be truncated and rejected). Edit a smaller target "
+                f"instead: pass a snippet whose unique context lines anchor "
+                f"the edited window, use `after=`/`replace=` to scope the "
+                f"edit to one symbol, or split the file first "
+                f"(`fastedit split --lines N`)."
+            )
         safe_code = _escape_tags(original_code, tag_nonce)
         safe_snippet = _escape_tags(snippet, tag_nonce)
 
@@ -3601,6 +3664,19 @@ def chunked_merge(
         # placeholder-looking strings cannot collide with it.
         tag_nonce = _new_tag_nonce()
         raw_chunk = "".join(original_lines[start_idx:end_idx])
+        # Issue #13 (gate placement): the same pre-escape bound as the
+        # whole-file path — the original chunk's length lower-bounds the
+        # escaped prompt's, so refuse before paying the escape scan/copy.
+        if len(raw_chunk) > _MAX_MERGE_PROMPT_CHARS:
+            raise ValueError(
+                f"chunk {chunk.start_line}-{chunk.end_line} too large for a "
+                f"merge: {len(raw_chunk):,} characters exceeds the "
+                f"{_MAX_MERGE_PROMPT_CHARS:,}-character model budget (the "
+                f"model would truncate it and every attempt would be "
+                f"rejected). Narrow the target: `replace=`/`after=` a "
+                f"sub-symbol, or anchor the snippet closer to the edited "
+                f"lines."
+            )
         escaped_chunk = _escape_tags(raw_chunk, tag_nonce)
 
         # Issue #13: the chunk prompt must fit the model's re-emit envelope.

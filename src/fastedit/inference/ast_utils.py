@@ -7,6 +7,7 @@ using tldr's structure and extract commands.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -231,6 +232,10 @@ def get_ast_map_from_source(
     class_types = _CLASS_LIKE_NODE_TYPES.get(language, set())
     const_types = _CONST_LIKE_NODE_TYPES.get(language, set())
     format_spec = _FORMAT_SYMBOL_SPECS.get(language)
+    call_spec = _CALL_SYMBOL_SPECS.get(language)
+    import_node_types = _IMPORT_BLOCK_NODE_TYPES.get(language, set())
+    import_spans: list[tuple[int, int]] = []
+    call_name_counts: dict[str, int] = {}
 
     def _walk(node, parent_class: str | None) -> None:
         nonlocal trim_lines
@@ -338,6 +343,37 @@ def get_ast_map_from_source(
                 _add(name, "constant", start, end, parent_class)
             return
 
+        # Issue #5: call-expression symbols — jest/vitest it()/test()/
+        # describe() blocks, named the way the tldr structure pass already
+        # prints them so read, resolve, and the error suggestions share one
+        # vocabulary. Same-named calls get the daemon's #N suffix in file
+        # order (the second `it("same")` prints as `it:same#2`), and the
+        # matched call is walked with the symbol as parent so nested blocks
+        # qualify (describe > it).
+        if call_spec is not None and nt in call_spec.node_types:
+            call_name = _call_symbol_name(node, call_spec, source_bytes)
+            if call_name:
+                call_name_counts[call_name] = call_name_counts.get(call_name, 0) + 1
+                display = call_name
+                if call_name_counts[call_name] > 1:
+                    display = f"{call_name}#{call_name_counts[call_name]}"
+                _add(
+                    display,
+                    call_spec.kind,
+                    node.start_point[0] + 1,
+                    _line_end(node),
+                    parent_class,
+                )
+                for child in node.children:
+                    _walk(child, display)
+                return
+
+        # Issue #5: collect the file's import statements; after the walk the
+        # leading run becomes the one `imports` pseudo-symbol.
+        if nt in import_node_types:
+            import_spans.append((node.start_point[0] + 1, _line_end(node)))
+            return
+
         # Recurse structurally — needed for wrappers like TS
         # `export_statement` / `lexical_declaration` that contain the
         # actual definition one level down.
@@ -346,6 +382,27 @@ def get_ast_map_from_source(
 
     for top_child in root.children:
         _walk(top_child, None)
+
+    # Issue #5: the LEADING import run becomes one pseudo-symbol named
+    # `imports` — the --after-imports anchor and read's import-block row.
+    # An import that starts at or after the first listed symbol (a deferred
+    # import inside a function body) is layout, not part of the block.
+    if import_spans:
+        first_symbol_line = min(
+            (n.line_start for n in nodes), default=None,
+        )
+        leading = [
+            (start, end) for start, end in import_spans
+            if first_symbol_line is None or start < first_symbol_line
+        ]
+        if leading:
+            _add(
+                _IMPORTS_SYMBOL_NAME,
+                _IMPORTS_SYMBOL_KIND,
+                min(start for start, _ in leading),
+                max(end for _, end in leading),
+                None,
+            )
 
     nodes.sort(key=lambda n: n.line_start)
     return nodes
@@ -448,6 +505,185 @@ _CONST_LIKE_NODE_TYPES: dict[str, set[str]] = {
     # containing an `assignment`; we omit them here because tldr only
     # surfaces module-level UPPER_SNAKE as a "constant" heuristically,
     # and this path rarely targets Python constants by name.
+}
+
+
+# ---------------------------------------------------------------------------
+# Issue #5: call-expression symbols. Some languages address their test units
+# through CALLS, not definitions — a jest/vitest `it("...", () => {...})`
+# block is the addressable unit of a TS/JS test file exactly as a `def` is
+# for Python. The tldr structure pass already prints those calls as symbols
+# named ``<callee>:<slug>`` (so the error suggestions carry them), while the
+# in-memory map the edit pipeline resolves against did not — suggested slugs
+# returned "Symbol not found". One spec per grammar closes that gap: the
+# in-memory map lists the calls under the SAME names, so read, resolve, and
+# the error messages share one vocabulary.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _CallSymbolSpec:
+    """Declarative symbol semantics for call-expression symbols (issue #5).
+
+    Attributes:
+        node_types: tree-sitter node kinds that may carry such a call.
+        call_names: callee identifier names that count. A callee that is a
+            member expression (``test.only``, ``it.each``) is NOT a bare
+            identifier and is deliberately not a symbol — the declared
+            names address the plain forms.
+        kind: the ASTNode.kind label (``tldr structure`` reports ``call``;
+            staying with it keeps the two surfaces interchangeable).
+        callee_field / arguments_field: the grammar's conventional field
+            names for the callee and the argument list.
+        name_argument_index: which argument (0-based among the call's named
+            children) names the symbol. It must be a string literal — the
+            name is ``<callee>:<slug-of-text>``; when the argument is
+            missing or not a string the symbol is the bare callee, the same
+            spelling the daemon prints for nameless calls.
+        definition_line_required: the call's FIRST line is the line that
+            names it (``it("...", () => {``), so a ``replace=`` snippet
+            omitting it would delete the naming line — same contract as the
+            B3 format-spec flag of the same name.
+    """
+
+    node_types: tuple[str, ...]
+    call_names: frozenset[str]
+    kind: str = "call"
+    callee_field: str = "function"
+    arguments_field: str = "arguments"
+    name_argument_index: int = 0
+    definition_line_required: bool = True
+
+
+# tsx is the JSX/React grammar — react test files are covered by the same
+# row as plain typescript. No "javascript-react" grammar exists in the
+# resolver's language set.
+_JEST_CALL_NAMES = frozenset({"it", "test", "describe"})
+_CALL_SYMBOL_SPECS: dict[str, _CallSymbolSpec] = {
+    "typescript": _CallSymbolSpec(
+        node_types=("call_expression",),
+        call_names=_JEST_CALL_NAMES,
+    ),
+    "tsx": _CallSymbolSpec(
+        node_types=("call_expression",),
+        call_names=_JEST_CALL_NAMES,
+    ),
+    "javascript": _CallSymbolSpec(
+        node_types=("call_expression",),
+        call_names=_JEST_CALL_NAMES,
+    ),
+}
+
+_SLUG_SEPARATOR_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def _call_slug(text: str) -> str:
+    """The slug of a test name, in the shape ``tldr structure`` prints.
+
+    Reverse-engineered from the daemon's own call-symbol names so both
+    surfaces agree slug for slug: lowercase; every character outside
+    ``[a-z0-9-]`` becomes a separator dash (non-ASCII included, ``_`` too);
+    separator runs collapse; leading/trailing separators are trimmed.
+    ``renders <Header /> correctly!`` -> ``renders-header-correctly``; a
+    name that slugs to empty (``""``, ``"---"``) yields ``""``.
+    """
+    return _SLUG_SEPARATOR_RE.sub("-", text.lower()).strip("-")
+
+
+def _call_symbol_name(node, spec: _CallSymbolSpec, source_bytes: bytes) -> str:
+    """The addressable name of a call-expression symbol, or ``""``.
+
+    The callee must be a bare identifier in ``spec.call_names``. The name
+    comes from the string literal at ``spec.name_argument_index`` —
+    ``<callee>:<slug>`` — falling back to the bare callee when the argument
+    is missing or not a plain string literal (the daemon's nameless-call
+    spelling).
+    """
+    callee = node.child_by_field_name(spec.callee_field)
+    if callee is None or callee.type != "identifier":
+        return ""
+    callee_text = _node_text(callee, source_bytes)
+    if callee_text not in spec.call_names:
+        return ""
+    arguments = node.child_by_field_name(spec.arguments_field)
+    slug = ""
+    if arguments is not None:
+        named_args = [child for child in arguments.children if child.is_named]
+        if len(named_args) > spec.name_argument_index:
+            name_arg = named_args[spec.name_argument_index]
+            if name_arg.type == "string":
+                slug = _call_slug(
+                    _strip_quote_pair(_node_text(name_arg, source_bytes)),
+                )
+    return f"{callee_text}:{slug}" if slug else callee_text
+
+
+def _call_symbol_snippet_top_level_names(
+    snippet: str,
+    file_path: str,
+    language: str | None,
+) -> list[str]:
+    """The snippet's PARENTLESS symbol names, in the file's own vocabulary.
+
+    Issue #5 companion to the direct-swap completeness check: a call-symbol
+    replacement snippet (``it("...", () => { ... })``) IS the whole new
+    call, and the in-memory walker deliberately recurses INTO call bodies
+    (nested describe > it) — so the snippet's inner constants/functions are
+    the call's MEMBERS, not additional top-level symbols. The flat name
+    list ``_try_tldr_snippet_parse`` returns therefore overcounts; the
+    direct-swap "exactly one definition named ``replace``" proof must read
+    the parentless names instead. Returns [] on any parse failure (the
+    caller keeps its existing decline).
+    """
+    try:
+        nodes = get_ast_map_from_source(snippet, file_path, language)
+    except Exception:  # noqa: BLE001 -- arbitrary snippet text degrades to "declines"
+        return []
+    return [n.name for n in nodes if n.name and n.parent is None]
+
+
+# ---------------------------------------------------------------------------
+# Issue #5: the imports block as one addressable pseudo-symbol. Per-language
+# import node types; the file's LEADING import run (everything before the
+# first listed symbol — a deferred import inside a function body is layout,
+# not part of the block) becomes a single ASTNode named ``imports`` so
+# ``--after imports`` / ``--after-imports`` anchor next to the imports and
+# `fastedit read` shows the block with its line span.
+# ---------------------------------------------------------------------------
+
+_IMPORTS_SYMBOL_NAME = "imports"
+_IMPORTS_SYMBOL_KIND = "imports"
+_IMPORT_BLOCK_NODE_TYPES: dict[str, set[str]] = {
+    "python": {
+        "import_statement", "import_from_statement", "future_import_statement",
+    },
+    "javascript": {"import_statement"},
+    "typescript": {"import_statement"},
+    "tsx": {"import_statement"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Issue #5: member-shaped snippets. A class constructor (a method shorthand,
+# generally) is only grammatical INSIDE its container — a standalone
+# ``constructor(...) {...}`` is a parse error at compilation-unit level, so
+# every snippet-side parse (definition names, the standalone validate gate)
+# judges a well-formed member replacement invalid. One row per language: a
+# minimal container that turns a member snippet into a parseable compilation
+# unit, so the snippet parsers can ask the grammar the question the snippet
+# actually answers ("is this a well-formed member definition?").
+# ---------------------------------------------------------------------------
+
+_MEMBER_SNIPPET_CONTAINER_NAME = "__FastEditSnippetContainer__"
+_MEMBER_SNIPPET_CONTAINERS: dict[str, tuple[str, str]] = {
+    "typescript": (
+        f"class {_MEMBER_SNIPPET_CONTAINER_NAME} {{\n", "}\n",
+    ),
+    "tsx": (
+        f"class {_MEMBER_SNIPPET_CONTAINER_NAME} {{\n", "}\n",
+    ),
+    "javascript": (
+        f"class {_MEMBER_SNIPPET_CONTAINER_NAME} {{\n", "}\n",
+    ),
 }
 
 

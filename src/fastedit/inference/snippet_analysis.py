@@ -272,6 +272,60 @@ def _top_level_extras(
     return extras
 
 
+def _member_snippet_parse_names(snippet: str, file_name: str) -> list[str]:
+    """The definition names ``snippet`` defines when read as a MEMBER.
+
+    Issue #5: a member snippet (a class constructor, a method shorthand) is
+    only grammatical INSIDE its container — the compilation-unit parse the
+    bare helper runs sees an error node where the definition should be.
+    Wrapping it in the language's minimal container (declared in
+    ``_MEMBER_SNIPPET_CONTAINERS``) asks the grammar the question the
+    snippet actually answers. Returns [] for languages without a declared
+    container and for snippets that do not parse as a member either — the
+    synthetic container itself is never reported.
+    """
+    try:
+        from ..data_gen.ast_analyzer import detect_language
+        from .ast_utils import (
+            _MEMBER_SNIPPET_CONTAINER_NAME,
+            _MEMBER_SNIPPET_CONTAINERS,
+            get_ast_map_from_source,
+        )
+        language = detect_language(file_name)
+        container = _MEMBER_SNIPPET_CONTAINERS.get(language or "")
+        if container is None:
+            return []
+        prefix, suffix = container
+        nodes = get_ast_map_from_source(prefix + snippet + suffix, file_name)
+    except Exception:  # noqa: BLE001 -- arbitrary snippet text degrades to "defines nothing"
+        return []
+    return [
+        n.name for n in nodes
+        if n.name and n.name != _MEMBER_SNIPPET_CONTAINER_NAME
+    ]
+
+
+def _snippet_parses_as_member(snippet: str, language: str) -> bool:
+    """True when ``snippet`` parses as a member definition of ``language``.
+
+    Issue #5: the standalone validate-parse gate asks a member snippet the
+    wrong question — ``constructor(...) {...}`` is ungrammatical at
+    compilation-unit level BY DESIGN. Re-asking inside the language's
+    minimal container accepts exactly the well-formed member replacements.
+    """
+    from ..data_gen.ast_analyzer import validate_parse
+    from .ast_utils import _MEMBER_SNIPPET_CONTAINERS
+
+    container = _MEMBER_SNIPPET_CONTAINERS.get(language)
+    if container is None:
+        return False
+    prefix, suffix = container
+    try:
+        return validate_parse(prefix + snippet + suffix, language)
+    except Exception:  # noqa: BLE001 -- a wedged/unknown grammar cannot validate the snippet
+        return False
+
+
 def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
     """Return the definition names a parser sees in ``snippet``.
 
@@ -283,6 +337,12 @@ def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
     whose symbols B3 wired. The ``tldr structure`` daemon stays as a
     fallback for the historical surface in case an in-memory map comes
     back empty for a language the daemon knows.
+
+    Issue #5: when neither the bare in-memory parse nor the daemon sees a
+    definition, the snippet is re-read as a MEMBER of its language's
+    minimal container (:func:`_member_snippet_parse_names`) — a
+    ``constructor(...) {...}`` replacement defines ``constructor``, it is
+    not "defines nothing".
     """
     names: list[str] = []
     try:
@@ -293,6 +353,10 @@ def _try_tldr_snippet_parse(snippet: str, ext: str) -> list[str]:
         names = []
     if names:
         return names
+
+    member_names = _member_snippet_parse_names(snippet, f"snippet{ext}")
+    if member_names:
+        return member_names
 
     tmp_path = None
     try:
@@ -487,9 +551,15 @@ def _find_import_region(
     if not import_lines:
         return None
 
-    # Restrict to lines before the first AST definition
-    if ast_nodes:
-        first_def = min(n.line_start for n in ast_nodes)
+    # Restrict to lines before the first AST definition. The `imports`
+    # pseudo-symbol (issue #5) IS the import block, not a definition —
+    # counting it as the first definition would push the boundary above
+    # the imports and filter the whole region away.
+    definition_starts = [
+        n.line_start for n in ast_nodes if n.kind != "imports"
+    ]
+    if definition_starts:
+        first_def = min(definition_starts)
         import_lines = {ln for ln in import_lines if ln < first_def}
 
     if not import_lines:

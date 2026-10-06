@@ -21,7 +21,11 @@ Each test pins one defect the golden matrix exposed, at unit level:
 7. the snippet parser consults fastedit's in-memory resolver first, so
    direct-swap works for formats the tldr daemon has never heard of;
 8. an explicit language hint drives get_ast_map_from_source for the
-   extension-unwired all-grammars languages.
+   extension-unwired all-grammars languages;
+9. issue #5: jest it()/test()/describe() blocks, class constructors, and
+   the file's import block are addressable symbols, named exactly the way
+   the tldr structure pass already prints them — so every slug read (or an
+   error message) suggests is one --replace/--after can resolve.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from __future__ import annotations
 import pytest
 
 from fastedit.inference.ast_utils import (
+    _call_slug,
     _resolve_symbol,
     get_ast_map_from_source,
 )
@@ -36,7 +41,11 @@ from fastedit.inference.chunked_merge import (
     _extract_signature_via_ast,
     _snippet_has_target_signature,
 )
-from fastedit.inference.snippet_analysis import _try_tldr_snippet_parse
+from fastedit.inference.snippet_analysis import (
+    _find_import_region,
+    _snippet_parses_as_member,
+    _try_tldr_snippet_parse,
+)
 
 # ---------------------------------------------------------------------------
 # 1. the declarative per-format symbol maps
@@ -302,6 +311,308 @@ def test_explicit_hint_wins_over_suffix_detection():
     suffix also resolves (yaml content in a .txt file, say)."""
     nodes = get_ast_map_from_source(FIXTURE_YAML, "cfg.txt", "yaml")
     assert [n.name for n in nodes][:2] == ["name", "version"]
+
+
+# ---------------------------------------------------------------------------
+# 9. issue #5: test blocks, constructors, and the imports block are symbols
+# ---------------------------------------------------------------------------
+
+FIXTURE_JEST_TS = (
+    'import { describe, it, expect } from "vitest";\n'
+    'import { createServer } from "./server";\n'
+    "\n"
+    "const PORT = 3111;\n"
+    "\n"
+    'describe("constructor", () => {\n'
+    '  it("should create server with correct", () => {\n'
+    "    const server = createServer(PORT);\n"
+    "    expect(server.port).toBe(PORT);\n"
+    "  });\n"
+    "\n"
+    '  it("renders correctly", () => {\n'
+    '    expect(true).toBe(true);\n'
+    "  });\n"
+    "});\n"
+)
+
+FIXTURE_TS_CLASS = (
+    "export class Server {\n"
+    "  readonly port: number;\n"
+    "\n"
+    "  constructor(port: number) {\n"
+    "    this.port = port;\n"
+    "  }\n"
+    "\n"
+    "  start(): void {\n"
+    "    console.log(this.port);\n"
+    "  }\n"
+    "}\n"
+)
+
+FIXTURE_IMPORTS_PY = (
+    "import os\n"
+    "import sys\n"
+    "from pathlib import Path\n"
+    "\n"
+    "\n"
+    "def alpha():\n"
+    "    import json  # deferred — layout, not part of the top block\n"
+    "    return os\n"
+)
+
+
+def test_jest_blocks_are_addressable_symbols():
+    """it()/test()/describe() calls are symbols named <callee>:<slug>."""
+    nodes = get_ast_map_from_source(FIXTURE_JEST_TS, "server.test.ts")
+    by_name = {n.name: n for n in nodes}
+    assert "describe:constructor" in by_name
+    assert "it:should-create-server-with-correct" in by_name
+    assert "it:renders-correctly" in by_name
+    it_node = by_name["it:should-create-server-with-correct"]
+    assert it_node.kind == "call"
+    # nesting: the it() block sits inside its describe, so the qualified
+    # form disambiguates same-named tests in different suites
+    assert it_node.parent == "describe:constructor"
+    describe_node = by_name["describe:constructor"]
+    assert describe_node.line_start < it_node.line_start
+    assert describe_node.line_end >= it_node.line_end
+
+
+def test_jest_blocks_resolve_as_printed():
+    """Every slug the map lists resolves — bare and qualified."""
+    nodes = get_ast_map_from_source(FIXTURE_JEST_TS, "server.test.ts")
+    node = _resolve_symbol("it:renders-correctly", nodes)
+    assert node is not None and node.kind == "call"
+    qualified = _resolve_symbol("describe:constructor.it:renders-correctly", nodes)
+    assert qualified is node
+
+
+@pytest.mark.parametrize(
+    ("name", "slug"),
+    [
+        ("renders correctly", "renders-correctly"),
+        ("Should Create Server", "should-create-server"),
+        ("should   create   server", "should-create-server"),
+        ("renders <Header /> correctly!", "renders-header-correctly"),
+        ("renders_user_profile", "renders-user-profile"),
+        ("UPPER CASE NAME", "upper-case-name"),
+        ("don't fail", "don-t-fail"),
+        ("a-b-c", "a-b-c"),
+        ("hello, world: the sequel", "hello-world-the-sequel"),
+        ("tab\tseparated", "tab-separated"),
+        ("  trimmed  ", "trimmed"),
+        ("multiple  spaces & symbols!!", "multiple-spaces-symbols"),
+        ("héllo wörld", "h-llo-w-rld"),
+        ("123 numbers 456", "123-numbers-456"),
+        ("CamelCaseWord another", "camelcaseword-another"),
+    ],
+)
+def test_call_slug_matches_the_tldr_structure_shape(name, slug):
+    """The slug shape is the one `tldr structure` prints for jest calls —
+    read, the error suggestions, and resolve must agree on it slug for slug."""
+    assert _call_slug(name) == slug
+
+
+def test_duplicate_test_names_dedupe_like_tldr():
+    """Same-named tests get the daemon's #N suffix, in file order, so the
+    second block stays addressable instead of refusing as ambiguous."""
+    src = (
+        'describe("one", () => {\n'
+        '  it("same", () => { expect(1).toBe(1); });\n'
+        "});\n"
+        'describe("two", () => {\n'
+        '  it("same", () => { expect(2).toBe(2); });\n'
+        "});\n"
+    )
+    names = [n.name for n in get_ast_map_from_source(src, "dup.test.ts")]
+    assert names == ["describe:one", "it:same", "describe:two", "it:same#2"]
+
+
+def test_nameless_test_call_falls_back_to_the_bare_callee():
+    """`it(() => ...)` has no string argument — the daemon names it after
+    the callee alone; resolve must agree with that printed form."""
+    nodes = get_ast_map_from_source('it(() => {\n  expect(1).toBe(1);\n});\n', "a.test.ts")
+    assert [(n.name, n.kind) for n in nodes] == [("it", "call")]
+
+
+def test_imports_pseudo_symbol_spans_the_leading_import_block():
+    nodes = get_ast_map_from_source(FIXTURE_IMPORTS_PY, "app.py")
+    blocks = [n for n in nodes if n.kind == "imports"]
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block.name == "imports"
+    assert (block.line_start, block.line_end) == (1, 3)
+    # the deferred import inside alpha() is layout, not part of the block
+    assert block.line_end < 7
+    # ... and it resolves like any symbol, so --after imports anchors on it
+    assert _resolve_symbol("imports", nodes) is block
+
+
+def test_imports_pseudo_symbol_multiline_python_imports():
+    src = (
+        "from os import (\n"
+        "    path,\n"
+        ")\n"
+        "import sys\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    return path\n"
+    )
+    nodes = get_ast_map_from_source(src, "app.py")
+    block = next(n for n in nodes if n.kind == "imports")
+    assert (block.line_start, block.line_end) == (1, 4)
+
+
+@pytest.mark.parametrize(
+    ("ext", "language"),
+    [("ts", "typescript"), ("tsx", "tsx"), ("js", "javascript")],
+)
+def test_imports_pseudo_symbol_per_js_family_language(ext, language):
+    src = (
+        'import a from "a";\n'
+        'import b from "b";\n'
+        "\n"
+        "class C {}\n"
+    )
+    nodes = get_ast_map_from_source(src, f"app.{ext}", language)
+    block = next(n for n in nodes if n.kind == "imports")
+    assert (block.line_start, block.line_end) == (1, 2)
+
+
+def test_no_imports_pseudo_symbol_without_imports():
+    nodes = get_ast_map_from_source(FIXTURE_PYTHON, "original.py")
+    assert all(n.kind != "imports" for n in nodes)
+
+
+def test_import_region_ignores_the_pseudo_symbol():
+    """_find_import_region measures 'imports before the first definition';
+    counting the imports pseudo-symbol itself as the first definition would
+    filter the whole region away."""
+    nodes = get_ast_map_from_source(FIXTURE_IMPORTS_PY, "app.py")
+    assert _find_import_region(FIXTURE_IMPORTS_PY, "python", nodes) == (1, 3)
+
+
+CONSTRUCTOR_SNIPPET = "constructor(port: number) {\n    this.port = port * 2;\n  }\n"
+
+
+def test_constructor_snippet_surfaces_its_own_name():
+    """A bare `constructor(...) {...}` has no compilation-unit parse; the
+    snippet-name parser must still report the member it defines."""
+    assert _try_tldr_snippet_parse(CONSTRUCTOR_SNIPPET, ".ts") == ["constructor"]
+
+
+def test_constructor_snippet_parses_as_member():
+    assert _snippet_parses_as_member(CONSTRUCTOR_SNIPPET, "typescript")
+    assert not _snippet_parses_as_member("constructor(port: number) {", "typescript")
+    assert not _snippet_parses_as_member("def broken(:", "typescript")
+
+
+def test_snippet_signature_check_accepts_the_constructor_line():
+    assert _snippet_has_target_signature("constructor(port: number) {", "constructor")
+
+
+def test_constructor_replace_reaches_the_deterministic_swap():
+    """`--replace constructor` with a constructor(...) snippet must land
+    deterministically (0 model tokens), never refuse as 'not valid
+    typescript' nor fall to the model backend."""
+    from fastedit.inference.chunked_merge import chunked_merge
+
+    def _no_model(*_a, **_kw):
+        raise AssertionError("model path ran")
+
+    snippet = "  constructor(port: number) {\n    this.port = port * 2;\n  }\n"
+    result = chunked_merge(
+        original_code=FIXTURE_TS_CLASS,
+        snippet=snippet,
+        file_path="tmp/server.ts",
+        merge_fn=_no_model,
+        language="typescript",
+        replace="constructor",
+    )
+    assert result.model_tokens == 0
+    assert result.parse_valid
+    assert "this.port = port * 2;" in result.merged_code
+    assert "console.log(this.port);" in result.merged_code
+
+
+def test_test_block_replace_reaches_the_deterministic_swap():
+    """`--replace it:<slug>` with a restated it()-line snippet lands
+    byte-exact on the block, deterministically."""
+    from fastedit.inference.chunked_merge import chunked_merge
+
+    def _no_model(*_a, **_kw):
+        raise AssertionError("model path ran")
+
+    original = (
+        'import { describe, it, expect } from "vitest";\n'
+        "\n"
+        'describe("badge", () => {\n'
+        '  it("renders correctly", () => {\n'
+        '    const el = renderBadge("hello");\n'
+        '    expect(el.textContent).toBe("hello");\n'
+        "  });\n"
+        "\n"
+        '  it("handles empty label", () => {\n'
+        '    expect(renderBadge("")).toBeNull();\n'
+        "  });\n"
+        "});\n"
+    )
+    snippet = (
+        '  it("renders correctly", () => {\n'
+        '    const el = renderBadge("hi");\n'
+        '    expect(el.textContent).toBe("hi");\n'
+        "  });\n"
+    )
+    result = chunked_merge(
+        original_code=original,
+        snippet=snippet,
+        file_path="tmp/badge.test.ts",
+        merge_fn=_no_model,
+        language="typescript",
+        replace="it:renders-correctly",
+    )
+    assert result.model_tokens == 0
+    expected = original.replace('renderBadge("hello")', 'renderBadge("hi")').replace(
+        'toBe("hello")', 'toBe("hi")'
+    )
+    assert result.merged_code == expected
+
+
+def test_after_imports_anchors_on_the_last_import_line():
+    """after= over the `imports` pseudo-symbol splices after the LAST import
+    with the standard after= blank-line separators."""
+    from fastedit.inference.chunked_merge import chunked_merge
+
+    def _no_model(*_a, **_kw):
+        raise AssertionError("model path ran")
+
+    result = chunked_merge(
+        original_code=(
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    print(os.name)\n"
+        ),
+        snippet="import json\n",
+        file_path="tmp/app.py",
+        merge_fn=_no_model,
+        language="python",
+        after="imports",
+    )
+    assert result.model_tokens == 0
+    assert result.merged_code == (
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "import json\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    print(os.name)\n"
+    )
 
 
 # ---------------------------------------------------------------------------
