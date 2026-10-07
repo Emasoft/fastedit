@@ -65,6 +65,7 @@ from .indent import (
 from .markers import (  # noqa: F401  -- re-exported for backward compat
     _MARKER_PHRASES,
     is_marker_line,
+    is_marker_text,
     normalize_markers,
 )
 from .snippet_analysis import (  # noqa: F401
@@ -1802,13 +1803,33 @@ def _raw_content_lines(s: str) -> tuple[list[str], list[str]]:
     index-aligned. The raw view exists for the B14 indentation check,
     which must see the leading whitespace the stripped content view
     deliberately discards.
+
+    PERFORMANCE (governor mission, PART 1): the classification runs per
+    validation attempt over the whole chunk/file; this used to pay one
+    ``strip`` per line plus up to five regex ``match`` calls per line for
+    the marker predicate. The rewrite fast-paths the common content line:
+    a line whose FIRST character is neither whitespace nor a marker head
+    (``#/.<…`` — the exact first-character condition every marker phrase
+    and marker regex shares) is provably content, decided without the
+    exact predicate. Everything else — blank lines, whitespace-led and
+    marker-head-led lines — takes the original exact path with the strip
+    computed once and reused.
     """
     content: list[str] = []
     raw: list[str] = []
     for line in s.splitlines():
-        if not line.strip() or _is_marker_line(line):
+        c0 = line[:1]
+        if c0 and not c0.isspace() and c0 not in "#/.<…":
+            # Fast path: stripped[0] == line[0] (nothing to strip), the line
+            # is non-blank, and no marker form can begin with this
+            # character — exactly what the old body concluded, cheaper.
+            content.append(line.strip())
+            raw.append(line)
             continue
-        content.append(line.strip())
+        stripped = line.strip()
+        if not stripped or is_marker_text(stripped):
+            continue
+        content.append(stripped)
         raw.append(line)
     return content, raw
 

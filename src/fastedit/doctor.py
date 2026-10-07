@@ -201,6 +201,47 @@ def _check_tldr(r: Report) -> None:
     r.add("tldr", OK, f"{path} (v{version})")
 
 
+def _check_resource_hub(r: Report) -> None:
+    """The global resource governor's limits + live holders (read-only).
+
+    Diagnostics, never a gate: a malformed limits.json or an unreadable hub
+    directory is a WARN row (the governor itself fails loud at acquisition
+    time; here the report must survive any hub state). Holders are listed
+    one per row — pid, slot, target file — so a stuck run can be identified
+    (and killed) from this report alone.
+    """
+    from . import resource_hub
+
+    try:
+        limits = resource_hub.load_limits()
+    except ValueError as e:
+        r.add("limits", WARN, f"malformed limits: {e}")
+        return
+    r.add(
+        "limits",
+        OK,
+        f"max_model_instances={limits.max_model_instances} "
+        f"max_heavy_jobs={limits.max_heavy_jobs} "
+        f"heavy_file_bytes={limits.heavy_file_bytes} "
+        f"queue_wait={limits.slot_wait_timeout_s:g}s",
+    )
+    try:
+        holders = resource_hub.read_hub_state()
+    except OSError as e:
+        r.add("hub state", WARN, f"unreadable hub dir: {e}")
+        return
+    if not holders:
+        r.add("active holders", OK, "none")
+        return
+    for h in holders:
+        file_note = f" file={h.get('file')}" if h.get("file") else ""
+        r.add(
+            f"{h['kind']}-{h['slot']}",
+            OK,
+            f"pid={h.get('pid')} since epoch {h.get('started_epoch')}{file_note}",
+        )
+
+
 def run_doctor() -> int:
     r = Report()
 
@@ -218,6 +259,8 @@ def run_doctor() -> int:
     _check_mcp_config(r)
     r.section("helpers")
     _check_tldr(r)
+    r.section("resource hub")
+    _check_resource_hub(r)
 
     print()
     if r.failed_required:

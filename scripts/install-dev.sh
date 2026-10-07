@@ -1146,6 +1146,48 @@ check_report() {
   fi
   echo ""
 
+  echo "== resource hub =="
+  # The global governor's state (read-only): limits + live slot holders.
+  # Read through the fastedit module so the report cannot drift from the
+  # acquisition logic; a missing/broken install degrades to a note, never
+  # a failure (--check installs nothing and must not fail on diagnostics).
+  if [[ -x "$tool_python" ]]; then
+    if ! "$tool_python" -c "import fastedit.resource_hub" 2>/dev/null; then
+      echo "  fastedit.resource_hub not importable in the tool environment — hub section unavailable"
+    else
+      "$tool_python" - <<'PYHUB'
+from fastedit import resource_hub
+
+try:
+    limits = resource_hub.load_limits()
+except ValueError as e:
+    print(f"  limits: MALFORMED ({e})")
+else:
+    print(
+        f"  limits: max_model_instances={limits.max_model_instances} "
+        f"max_heavy_jobs={limits.max_heavy_jobs} "
+        f"heavy_file_bytes={limits.heavy_file_bytes} "
+        f"slot_wait_timeout_s={limits.slot_wait_timeout_s:g}"
+    )
+    print(f"  hub dir: {resource_hub.hub_dir()}")
+try:
+    holders = resource_hub.read_hub_state()
+except OSError as e:
+    print(f"  hub state: unreadable ({e})")
+else:
+    if holders:
+        for h in holders:
+            file_note = f" file={h.get('file')}" if h.get("file") else ""
+            print(f"  active: {h['kind']}-{h['slot']} pid={h.get('pid')}{file_note}")
+    else:
+        print("  active holders: none")
+PYHUB
+    fi
+  else
+    echo "  (no tool python — run an install first to see hub state)"
+  fi
+  echo ""
+
   echo "== local clone =="
   if [[ "$HAVE_LOCAL_TREE" -eq 1 ]]; then
     echo "  local clone: ${REPO_ROOT}"

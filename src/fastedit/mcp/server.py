@@ -79,20 +79,37 @@ class ModelPool:
 
     @contextlib.asynccontextmanager
     async def acquire(self):
-        await self._ensure_loaded()
-        await self._semaphore.acquire()
-        # B40: hand out engines round-robin instead of always engines[0].
-        # Read and advance the index under the existing lock so the handout
-        # is atomic; the lock is held only for the handout, the lease is
-        # still bounded by the semaphore, and lazy creation uses the same
-        # lock so index arithmetic can never race engine creation.
-        async with self._lock:
-            engine = self._engines[self._next_engine % len(self._engines)]
-            self._next_engine += 1
+        # GLOBAL GOVERNOR: the model slot is taken BEFORE the pool's own
+        # semaphore and held across the whole lease — spanning engine loads
+        # (this pool's lazy _ensure_loaded) and the merge work the caller
+        # runs inside the lease. The flock lives in ~/.fastedit (the hub
+        # shared with every CLI run), so N fastedit PROCESSES can never
+        # load more than max_model_instances models concurrently, and an
+        # over-subscribed caller queues with a status line until a slot
+        # frees or the queue budget elapses (loud SlotWaitTimeout). The
+        # flock attempts are non-blocking (the hub polls), so the wait
+        # runs on a worker thread: a blocked event loop would stall every
+        # other MCP request for the whole queue wait.
+        from ..resource_hub import acquire_slot
+
+        lease = await asyncio.to_thread(acquire_slot, "model")
         try:
-            yield engine
+            await self._ensure_loaded()
+            await self._semaphore.acquire()
+            # B40: hand out engines round-robin instead of always engines[0].
+            # Read and advance the index under the existing lock so the handout
+            # is atomic; the lock is held only for the handout, the lease is
+            # still bounded by the semaphore, and lazy creation uses the same
+            # lock so index arithmetic can never race engine creation.
+            async with self._lock:
+                engine = self._engines[self._next_engine % len(self._engines)]
+                self._next_engine += 1
+            try:
+                yield engine
+            finally:
+                self._semaphore.release()
         finally:
-            self._semaphore.release()
+            lease.release()
 
 
 @contextlib.asynccontextmanager

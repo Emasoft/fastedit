@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Annotated
@@ -27,6 +28,52 @@ from .server import ConcurrentModificationError, _atomic_write, mcp
 # successful edit response so the host LLM can relay it to the human.
 _UPDATE_NOTICE_SHOWN = False
 _update_notice_lock = asyncio.Lock()
+
+
+@contextlib.asynccontextmanager
+async def heavy_window_or_refusal(path: Path):
+    """MCP heavy-slot guard for one target file (the global governor).
+
+    Yields ``None`` when the file is small (below ``heavy_file_bytes`` — the
+    overwhelmingly common case pays nothing) or when the heavy slot was
+    acquired; yields the refusal MESSAGE when every slot was busy for longer
+    than the queue budget (the tools return ``Error: ...`` strings, never
+    raise at the host LLM). The flock attempt loop is non-blocking, so the
+    wait runs on a worker thread and the event loop keeps serving.
+    """
+    from ..resource_hub import SlotWaitTimeout, acquire_slot, is_heavy_file
+
+    if not is_heavy_file(path):
+        yield None
+        return
+    try:
+        lease = await asyncio.to_thread(
+            acquire_slot, "heavy", str(path),
+        )
+    except SlotWaitTimeout as e:
+        yield str(e)
+        return
+    try:
+        yield None
+    finally:
+        lease.release()
+
+
+def _merge_under_model_slot(merge_callable, /, **kwargs):
+    """Run one merge under a global model slot (the non-pool backends).
+
+    The mlx backend serializes through ``ModelPool.acquire`` (which wraps
+    the hub's model slot around engine load + merge). Backend kinds with no
+    pool — vllm (an HTTP engine) and llm — bypass the pool, so their merge
+    call sites wrap THIS helper instead: the slot spans exactly the model
+    work, keeping the machine-wide instance ceiling true for every backend.
+    Runs inside a worker thread (the caller's ``asyncio.to_thread``), so the
+    hub's queue poll never blocks the event loop.
+    """
+    from ..resource_hub import acquire_slot
+
+    with acquire_slot("model"):
+        return merge_callable(**kwargs)
 
 
 async def _maybe_append_update_notice(message: str) -> str:
@@ -206,11 +253,19 @@ async def fast_edit(
         or (replace and preserve_siblings)
     )
 
-    # Two lock layers: the in-process asyncio lock (concurrent requests to
-    # THIS server) and the cross-process flock (a CLI run or a second MCP
-    # server instance) — the latter was the audit gap: CLI↔MCP writers were
-    # never serialized. Same wording the CLI exits with.
-    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+    # Three lock layers: the in-process asyncio lock (concurrent requests to
+    # THIS server), the cross-process per-file flock (a CLI run or a second
+    # MCP server instance), and the GLOBAL governor's heavy window for a
+    # big file (a no-op for small files). The heavy guard yields the
+    # queue-timeout refusal instead of raising — same shape as the edit
+    # lock's refusal below.
+    async with (
+        file_locks[file_path],
+        heavy_window_or_refusal(path) as _heavy_refusal,
+        edit_lock_or_refusal(path) as _lock_refusal,
+    ):
+        if _heavy_refusal:
+            return f"Error: {_heavy_refusal}"
         if _lock_refusal:
             return f"Error: {_lock_refusal}"
         # B21: strict-decode read -- an undecodable byte must never become
@@ -278,11 +333,13 @@ async def fast_edit(
                         )
                 else:
                     result = await asyncio.to_thread(
-                        chunked_merge,
+                        _merge_under_model_slot,
+                        lambda **kw: chunked_merge(
+                            merge_fn=backend.merge_auto, **kw,
+                        ),
                         original_code=original_code,
                         snippet=edit_snippet,
                         file_path=file_path,
-                        merge_fn=backend.merge_auto,
                         language=language,
                         after=after or None,
                         replace=replace or None,
@@ -469,8 +526,15 @@ async def fast_batch_edit(
             preserve_siblings=bool(entry.get("preserve_siblings", False)),
         ))
 
-    # In-process asyncio lock + cross-process flock (see fast_edit).
-    async with file_locks[file_path], edit_lock_or_refusal(path) as _lock_refusal:
+    # In-process asyncio lock + cross-process per-file flock + the GLOBAL
+    # governor's heavy window (see fast_edit above).
+    async with (
+        file_locks[file_path],
+        heavy_window_or_refusal(path) as _heavy_refusal,
+        edit_lock_or_refusal(path) as _lock_refusal,
+    ):
+        if _heavy_refusal:
+            return f"Error: {_heavy_refusal}"
         if _lock_refusal:
             return f"Error: {_lock_refusal}"
         # B21: strict-decode read; UTF-16/binary refused before the merge.
@@ -499,11 +563,13 @@ async def fast_batch_edit(
                     )
             else:
                 result = await asyncio.to_thread(
-                    batch_chunked_merge,
+                    _merge_under_model_slot,
+                    lambda **kw: batch_chunked_merge(
+                        merge_fn=backend.merge_auto, **kw,
+                    ),
                     original_code=original_code,
                     edits=batch,
                     file_path=file_path,
-                    merge_fn=backend.merge_auto,
                     language=language,
                 )
         except ValueError as e:
@@ -644,8 +710,20 @@ async def fast_multi_edit(
                 preserve_siblings=bool(entry.get("preserve_siblings", False)),
             ))
 
-        # Lock each file individually as we process it sequentially
-        async with file_locks[fp], edit_lock_or_refusal(path) as _lock_refusal:
+        # Lock each file individually as we process it sequentially, plus
+        # the GLOBAL governor's heavy window per big target (a no-op for
+        # small files).
+        async with (
+            file_locks[fp],
+            heavy_window_or_refusal(path) as _heavy_refusal,
+            edit_lock_or_refusal(path) as _lock_refusal,
+        ):
+            if _heavy_refusal:
+                # Queue budget exhausted for a big target: refuse it like
+                # any other gated target; the remaining targets still write.
+                results.append(f"{fp}: {_heavy_refusal}")
+                refused_files += 1
+                continue
             if _lock_refusal:
                 # Another fastedit process holds this target: refuse it like
                 # any other gated target; the remaining targets still write.
@@ -678,11 +756,13 @@ async def fast_multi_edit(
                         )
                 else:
                     result = await asyncio.to_thread(
-                        batch_chunked_merge,
+                        _merge_under_model_slot,
+                        lambda **kw: batch_chunked_merge(
+                            merge_fn=backend.merge_auto, **kw,
+                        ),
                         original_code=original_code,
                         edits=batch,
                         file_path=fp,
-                        merge_fn=backend.merge_auto,
                         language=language,
                     )
             except ValueError as e:

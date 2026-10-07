@@ -82,6 +82,73 @@ def _locked_for_edit(path: Path):
         sys.exit(1)
 
 
+@contextlib.contextmanager
+def _global_edit_windows(paths: list[Path]):
+    """Hold the GLOBAL governor's windows for this command's targets.
+
+    Two slot kinds, both cross-process flocks under ``~/.fastedit`` (the
+    hub coordinates ALL fastedit instances — CLI, MCP, batch — so memory
+    and CPU have a machine-wide ceiling):
+
+      * the HEAVY window per big target (size ≥ ``heavy_file_bytes``):
+        serializes big-file read→merge→write cycles across processes.
+        Small files skip the hub entirely (the overwhelmingly common case
+        pays nothing).
+      * the MODEL window, taken by the merge call sites while model work
+        (engine load + merge) actually runs — see :func:`_model_merge_fn`.
+
+    Queues with a one-line stderr status when every slot is busy; raises
+    :class:`resource_hub.SlotWaitTimeout` (exits 1, loud) when the queue
+    budget elapses. Stacked with — never a replacement for — the per-file
+    edit lock (which is per-path correctness; this is global capacity).
+    """
+    from .resource_hub import SlotWaitTimeout, acquire_heavy_slot_for_path
+
+    try:
+        with contextlib.ExitStack() as stack:
+            for path in dict.fromkeys(paths):  # unique, order-stable
+                stack.enter_context(acquire_heavy_slot_for_path(path))
+            yield
+    except SlotWaitTimeout as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+@contextlib.contextmanager
+def _model_merge_window(args):
+    """Yield a ``merge_fn`` that runs under ONE global model slot.
+
+    The slot is acquired lazily — only when a merge actually invokes the
+    model (the deterministic paths never call ``merge_fn``, so they never
+    take a slot or build an engine). The lease spans the ENGINE LOAD and
+    every merge call the site makes, so at most ``max_model_instances``
+    engines are loaded machine-wide across ALL fastedit processes.
+    Deterministic results therefore never queue; model work does.
+    """
+    from .resource_hub import SlotWaitTimeout, acquire_slot
+
+    state: dict = {}
+
+    def merge_fn(*a, **kw):
+        if "merge_fn" not in state:
+            try:
+                lease = acquire_slot("model")
+            except SlotWaitTimeout as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            state["lease"] = lease
+            _, engine = _make_backend_with_overrides(args)
+            state["engine"] = engine
+        return state["engine"].merge_auto(*a, **kw)
+
+    try:
+        yield merge_fn
+    finally:
+        lease = state.get("lease")
+        if lease is not None:
+            lease.release()
+
+
 # ---------------------------------------------------------------------------
 # '-' (stdin) and '@file' argument handling (issues #9, #10, #7)
 # ---------------------------------------------------------------------------
@@ -852,14 +919,17 @@ def cmd_edit(args):
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
-    # Cross-process lock (both code paths below write this file): held from
-    # here through the final write, released on every exit path.
-    with _locked_for_edit(path):
+    # Two stacked windows: the GLOBAL governor (a heavy slot when this
+    # target is big; the model slot is taken later, lazily, only if the
+    # model actually runs) and the per-file cross-process edit lock
+    # (per-path correctness — a different axis than global capacity).
+    with _global_edit_windows([path]), _locked_for_edit(path):
         _cmd_edit_locked(args)
 
 
 def _cmd_edit_locked(args):
-    """cmd_edit's body, under the file's cross-process edit lock."""
+    """cmd_edit's body, under the file's cross-process edit lock and the
+    global governor's heavy window (if the target is big)."""
 
     from .data_gen.ast_analyzer import detect_language
     from .inference.caller_safety import (
@@ -974,29 +1044,26 @@ def _cmd_edit_locked(args):
             )
             return
 
-    # Lazy backend: only loaded when merge_fn is actually called.
-    # Deterministic paths (after=, replace= with text-match) never call merge_fn.
-    _backend_cache = {}
-
-    def _lazy_merge_fn(*a, **kw):
-        if "engine" not in _backend_cache:
-            _, engine = _make_backend_with_overrides(args)
-            _backend_cache["engine"] = engine
-        return _backend_cache["engine"].merge_auto(*a, **kw)
-
-    try:
-        result = chunked_merge(
-            original_code=original_code,
-            snippet=snippet,
-            file_path=args.file,
-            merge_fn=_lazy_merge_fn,
-            language=language,
-            after=after_sym,
-            replace=replace_sym,
-        )
-    except ValueError as e:
-        _print_edit_refusal(str(e))
-        sys.exit(1)
+    # Lazy backend, wrapped in the GLOBAL model-slot window: only loaded
+    # when merge_fn is actually called (deterministic paths — after=,
+    # replace= with text-match — never call it, so they never queue, never
+    # load an engine, never take a slot). When the model DOES run, the
+    # lease spans engine load + every merge attempt of the validation loop,
+    # so at most max_model_instances engines are loaded machine-wide.
+    with _model_merge_window(args) as merge_fn:
+        try:
+            result = chunked_merge(
+                original_code=original_code,
+                snippet=snippet,
+                file_path=args.file,
+                merge_fn=merge_fn,
+                language=language,
+                after=after_sym,
+                replace=replace_sym,
+            )
+        except ValueError as e:
+            _print_edit_refusal(str(e))
+            sys.exit(1)
 
     try:
         _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
@@ -1076,8 +1143,9 @@ def cmd_batch_edit(args):
         sys.exit(1)
     # Per-file scope (this command has exactly one target): the lock spans
     # the read→merge→write window, not "the whole batch" — but for a single
-    # file those are the same window.
-    with _locked_for_edit(path):
+    # file those are the same window. The GLOBAL governor's heavy window
+    # wraps it (big targets serialize machine-wide; small skip the hub).
+    with _global_edit_windows([path]), _locked_for_edit(path):
         _cmd_batch_edit_locked(args)
 
 
@@ -1136,7 +1204,6 @@ def _cmd_batch_edit_locked(args):
         print(f"Error: file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
 
-    _backend_kind, backend = _make_backend_with_overrides(args)
     backups = BackupStore()
     # B21/B23: strict-decode read; the codec flows to the write below. B37:
     # the read-time stat guards the write against an external change.
@@ -1147,22 +1214,35 @@ def _cmd_batch_edit_locked(args):
         sys.exit(1)
     language = detect_language(path)
 
+    # Backend construction + the whole batch merge run under ONE global
+    # model slot (engine load + every chunk's merge attempts), so a batch
+    # never exceeds the machine-wide model-instance ceiling. The heavy
+    # window for a big target is already held (cmd_batch_edit).
+    from .resource_hub import SlotWaitTimeout, acquire_slot
+
     try:
-        result = batch_chunked_merge(
-            original_code=original_code,
-            edits=batch,
-            file_path=args.file,
-            merge_fn=backend.merge_auto,
-            language=language,
-        )
-    except ValueError as e:
-        # The merge raises ValueError for every knowable refusal — the
-        # issue #13 oversized-snippet/prompt gates, an ambiguous or missing
-        # symbol, the whole-file line limit — the same failures multi-edit
-        # catches in PHASE 2 and cmd_edit catches around chunked_merge. A
-        # bare traceback is not a refusal: print the reason plus the
-        # unchanged-file guidance (nothing has been written on this path).
-        _print_edit_refusal(str(e))
+        with acquire_slot("model"):
+            _backend_kind, backend = _make_backend_with_overrides(args)
+            try:
+                result = batch_chunked_merge(
+                    original_code=original_code,
+                    edits=batch,
+                    file_path=args.file,
+                    merge_fn=backend.merge_auto,
+                    language=language,
+                )
+            except ValueError as e:
+                # The merge raises ValueError for every knowable refusal —
+                # the issue #13 oversized-snippet/prompt gates, an ambiguous
+                # or missing symbol, the whole-file line limit — the same
+                # failures multi-edit catches in PHASE 2 and cmd_edit catches
+                # around chunked_merge. A bare traceback is not a refusal:
+                # print the reason plus the unchanged-file guidance (nothing
+                # has been written on this path).
+                _print_edit_refusal(str(e))
+                sys.exit(1)
+    except SlotWaitTimeout as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     try:
         _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
@@ -1224,18 +1304,48 @@ def cmd_multi_edit(args):
     # that target — that file's whole read→merge→write window, which is why
     # the locks must span the phases rather than sit inside one of them. A
     # conflict exits 1 before anything is read or written.
+    #
+    # The GLOBAL governor's heavy windows ride the same stack: every big
+    # target (size >= heavy_file_bytes) takes a heavy slot for the whole
+    # run, so concurrent big-file multi-edits serialize machine-wide; small
+    # targets take nothing. Queue-then-timeout semantics are the hub's.
     with contextlib.ExitStack() as _target_locks:
         entries = file_edits_list if isinstance(file_edits_list, list) else []
+        heavy_paths: list[Path] = []
         for entry in entries:
             if isinstance(entry, dict) and isinstance(entry.get("file_path"), str):
                 target = Path(entry["file_path"])
                 if target.exists():
-                    _target_locks.enter_context(_locked_for_edit(target))
-        _cmd_multi_edit_locked(args, file_edits_list)
+                    heavy_paths.append(target)
+        with _global_edit_windows(heavy_paths):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("file_path"), str):
+                    target = Path(entry["file_path"])
+                    if target.exists():
+                        _target_locks.enter_context(_locked_for_edit(target))
+            _cmd_multi_edit_locked(args, file_edits_list)
 
 
 def _cmd_multi_edit_locked(args, file_edits_list):
     """cmd_multi_edit's phases, under every target's cross-process edit lock."""
+
+
+    # ONE global model slot spans the WHOLE multi-file run (backend load +
+    # every target's merges): multi-edit never loads more than the
+    # machine-wide model-instance ceiling allows, and its merges queue like
+    # every other fastedit process's.
+    from .resource_hub import SlotWaitTimeout, acquire_slot
+
+    try:
+        with acquire_slot("model"):
+            _cmd_multi_edit_model_window(args, file_edits_list)
+    except SlotWaitTimeout as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cmd_multi_edit_model_window(args, file_edits_list):
+    """_cmd_multi_edit_locked's body, under the global model slot."""
     import hashlib
     import os
 

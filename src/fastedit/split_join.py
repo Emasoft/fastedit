@@ -11,6 +11,7 @@ below) and therefore read-only: split only, no join.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from pathlib import Path
@@ -117,44 +118,129 @@ def mask_string_spans(text: str, mask: str = "\x00") -> str:
     where consuming the pair is harmless). The delimiter characters
     themselves stay unmasked, so a line whose FIRST character is masked
     begins inside a string and its leading whitespace is string content.
+    Escaped characters inside a string stay unmasked too (the scanner skips
+    the whole pair), and so do ``\\r``/``\\n`` everywhere.
 
     Over-masking (a stray unpaired delimiter) only makes the transform more
     conservative — content is preserved as-is; it can never corrupt it.
+
+    PERFORMANCE (global-governor mission, PART 1): this used to build a
+    per-character mutable copy (``list(text)`` — one Python object per
+    character: ~40 MB of pointers for a 5 MB ASCII file, far more for
+    multi-byte content) and walk it char by char in Python. Measured on a
+    5 MB single-line input: 1.73 s wall / 42.9 MB peak allocation BEFORE,
+    driven by exactly that list + per-char loop. The rewrite below is
+    behavior-identical (byte-for-byte equivalence is asserted against a
+    reference copy of the old scanner in tests/test_resource_hub.py,
+    including a seeded 500-case fuzz over quote/escape/CRLF/multi-byte
+    soup) but scans with compiled regexes and masks whole runs at C speed:
+    the masked regions are collected as ``(start, end)`` spans where every
+    character is provably maskable (the regex alternation matches escape
+    pairs, closing delimiters and terminators FIRST, so a span never
+    contains one), and the output is assembled from slices plus
+    ``mask * run_length``. No per-character Python objects are ever built.
     """
 
-    def string_end(start: int, delim: str, multi_line: bool) -> int:
-        """Index just past the closing ``delim`` scanning from ``start``."""
-        i = start
-        while i < len(text):
-            c = text[i]
-            if c == "\\":
-                i += 2  # escaped char (quote, backslash, newline, ...)
-                continue
-            if text.startswith(delim, i):
-                return i + len(delim)
-            if not multi_line and c == "\n":
-                return i  # unterminated single-line string ends at the break
-            if c not in "\r\n":
-                chars[i] = mask
-            i += 1
-        return len(text)  # unterminated multi-line span runs to EOF
-
-    chars = list(text)
-    i = 0
     n = len(text)
+    if n == 0:
+        return text
+    # Maskable runs collected as [start, end) spans. The interior scanner's
+    # regex matches escape pairs, closing delimiters and terminators FIRST,
+    # so a span never contains one and ``mask * span_length`` is exact.
+    spans: list[tuple[int, int]] = []
+
+    i = 0
     while i < n:
-        c = text[i]
-        if c == "\\":
-            i += 2  # escaped pair — never a delimiter start
+        m = _OUTER_TOKEN_RE.search(text, i)
+        if m is None:
+            break
+        tok = m.group(0)
+        if tok[0] == "\\":
+            # Escape pair (or bare trailing backslash): both characters stay
+            # unmasked, and the scan resumes past them — never a delimiter
+            # start (the old scanner's ``i += 2``).
+            i = m.end()
             continue
-        if text.startswith(('"""', "'''"), i):
-            delim = text[i:i + 3]
-            i = string_end(i + 3, delim, multi_line=True)
-        elif c in "\"'`":
-            i = string_end(i + 1, c, multi_line=c == "`")
-        else:
-            i += 1
-    return "".join(chars)
+        # tok is a quote delimiter: """ / ''' (triple, multi-line) or one of
+        # " ' ` (backtick multi-line, the others single-line).
+        multi_line = len(tok) == 3 or tok == "`"
+        i = _mask_string_interior(text, m.end(), tok, multi_line, spans)
+
+    out: list[str] = []
+    pos = 0
+    for start, end in spans:
+        out.append(text[pos:start])
+        out.append(mask * (end - start))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+_OUTER_TOKEN_RE = re.compile(r'\\.|"""|\'\'\'|["\'`]', re.DOTALL)
+"""Tokens the outside-a-string scanner reacts to: an escape pair (``\\.``
+with DOTALL also swallows an escaped newline — the C line continuation), a
+triple-quote opener (tried BEFORE the single-quote alternative, exactly like
+the old ``startswith(('\"\"\"', \"'''\"))`` check), or any quote character. A
+bare trailing backslash matches none of them and is simply skipped unmasked
+(the old ``i += 2`` clamping past EOF)."""
+
+
+@functools.cache
+def _interior_close_re(delim: str, multi_line: bool) -> re.Pattern[str]:
+    """The inside-a-string event regex for ``delim``.
+
+    Alternation order is load-bearing: an escape pair wins over the closing
+    delimiter (``\\"`` must not close), the delimiter over the terminators,
+    and a bare trailing backslash (``\\\\Z``) comes last — it only fires when
+    ``\\.`` failed, i.e. the backslash is the final character. Terminators
+    are alternatives so they pass through unmasked; in a single-line string
+    ``\\n`` CLOSES (handled by the caller via the ``multi_line`` flag).
+    """
+    parts = [r"\\.", re.escape(delim)]
+    if multi_line:
+        parts.append(r"\r\n|\r|\n")
+    else:
+        parts.append(r"\n")
+        parts.append(r"\r")  # lone CR passes through unmasked, never closes
+    parts.append(r"\\\Z")
+    return re.compile("|".join(parts), re.DOTALL)
+
+
+def _mask_string_interior(
+    text: str,
+    i: int,
+    delim: str,
+    multi_line: bool,
+    spans: list[tuple[int, int]],
+) -> int:
+    """Mask string-interior characters from ``i``; return the resume index.
+
+    The gap before each regex event is a maskable run (it contains no
+    escape pair, no delimiter, no terminator — the regex would have matched
+    it first) and is appended to *spans*. Closing events — the delimiter
+    itself, or the line break that terminates a single-line string — end
+    the string; escapes and (multi-line) terminators pass through unmasked
+    and scanning continues. The resume index sits just past the closing
+    delimiter or past the closing line break (the old scanner returned the
+    break's own index and the outer loop then stepped over it — the same
+    resume point), or at EOF for an unterminated multi-line span.
+    """
+    n = len(text)
+    close_re = _interior_close_re(delim, multi_line)
+    while True:
+        m = close_re.search(text, i)
+        if m is None:
+            if i < n:
+                spans.append((i, n))
+            return n
+        if m.start() > i:
+            spans.append((i, m.start()))
+        tok = m.group(0)
+        if tok == delim:
+            return m.end()
+        if tok == "\n" and not multi_line:
+            return m.end()
+        i = m.end()
 
 
 STRING_MASK = "\x00"

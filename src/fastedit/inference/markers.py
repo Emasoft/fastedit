@@ -92,6 +92,36 @@ _EXACT_SHORT_MARKERS = ("#...", "//...", "…", "#…", "//…")
 # back, keeping ``snippet_analysis._MARKER_RE`` importable).
 _MARKER_RE = re.compile(r'^\s*(?:#|//|/\*)\s*\.\.\..*(?:existing|rest).*\.\.\.')
 
+# Hot-path indexes over the phrase table (governor mission, PART 1):
+# ``stripped in _MARKER_PHRASES`` scanned a 6-tuple per line and the regex
+# chain ran up to five ``.match`` calls per line on EVERY content line of
+# every chunk (``_raw_content_lines`` runs per validation attempt). Both
+# checks have exact necessary-condition fast paths: every marker phrase and
+# every regex form begins with one of five characters, so a line whose
+# stripped head is anything else is decided False without touching the
+# table or the regexes.
+_MARKER_PHRASE_SET = frozenset(_MARKER_PHRASES)
+_MARKER_FIRST_CHARS = frozenset("#/.<…")
+
+
+def is_marker_text(stripped: str) -> bool:
+    """True when the ALREADY-STRIPPED ``stripped`` is a marker line.
+
+    The engine behind :func:`is_marker_line` — same verdict, one ``strip``
+    cheaper for callers that already stripped the line (the hot
+    ``_raw_content_lines`` path in chunked_merge runs this per line).
+    """
+    if not stripped or stripped[0] not in _MARKER_FIRST_CHARS:
+        return False
+    return (
+        stripped in _MARKER_PHRASE_SET
+        or bool(_SHORT_HASH_RE.match(stripped))
+        or bool(_SHORT_SLASH_RE.match(stripped))
+        or bool(_UNICODE_ELLIPSIS_RE.match(stripped))
+        or bool(_LONG_HTML_RE.match(stripped))
+        or bool(_SHORT_HTML_RE.match(stripped))
+    )
+
 
 def is_marker_line(line: str) -> bool:
     """True when ``line`` IS a keep-marker line (line-anchored, B15).
@@ -110,18 +140,7 @@ def is_marker_line(line: str) -> bool:
     marker lines correctly instead of writing them into the file
     literally (TRDD-CMRMA2YG).
     """
-    stripped = line.strip()
-    return (
-        stripped in _MARKER_PHRASES
-        or bool(_SHORT_HASH_RE.match(stripped))
-        or bool(_SHORT_SLASH_RE.match(stripped))
-        or bool(_UNICODE_ELLIPSIS_RE.match(stripped))
-        # HTML/XML comment forms (issue #1 hole 2): the canonical long form
-        # is in _MARKER_PHRASES (stripped exact match); the regexes cover
-        # spacing variants of the long form and the short ``<!--...-->``.
-        or bool(_LONG_HTML_RE.match(stripped))
-        or bool(_SHORT_HTML_RE.match(stripped))
-    )
+    return is_marker_text(line.strip())
 
 
 def normalize_markers(snippet: str) -> str:
@@ -161,7 +180,29 @@ def normalize_markers(snippet: str) -> str:
     implies the marker text itself is unmasked — masking cannot forge the
     ``#``/``.``/``…`` characters of a marker — so the indent taken from the
     masked body is genuine when a rewrite fires.
+
+    PERFORMANCE (governor mission, PART 1): masking the whole snippet is
+    the expensive half (a same-length scan over every byte). Every rewrite
+    form — exact short forms, spacing variants, the HTML forms — begins
+    with ``#``, ``/``, ``<`` or ``…`` after leading-whitespace strip (the
+    leading whitespace itself is never masked, so ``mask_string_spans``
+    preserves it exactly), so a snippet whose lines carry none of those
+    heads after their indent returns verbatim WITHOUT paying the mask. One
+    cheap pre-scan, byte-identical outcome.
     """
+    # Cheap pre-scan (see docstring): any line that could possibly be
+    # rewritten must carry a marker head character after its indent. The
+    # first non-space/tab character of a masked line equals the first
+    # non-space/tab character of the raw line for any input.
+    could_rewrite = False
+    for raw in snippet.splitlines():
+        stripped = raw.lstrip(" \t")
+        if stripped[:1] in ("#", "/", "<", "…"):
+            could_rewrite = True
+            break
+    if not could_rewrite:
+        return snippet
+
     # Masked copy: in-string characters become NUL, structure unchanged.
     masked_lines = mask_string_spans(snippet).splitlines(keepends=True)
     out: list[str] = []
