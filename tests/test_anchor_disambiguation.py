@@ -267,6 +267,101 @@ def test_narrow_high_overlap_cuts_at_block_edges():
     )
 
 
+# Issue #12 e2e follow-up: the first matched line has NO enclosing block
+# (top-level statement of the method body), but a LATER matched line sits
+# inside a small try block. The narrow must walk forward through the
+# matched lines instead of falling back to the FULL node.
+
+
+def _ts_like_source_with_top_level_context() -> list[str]:
+    """A 208-line function whose tail carries a small try block.
+
+    Lines (1-indexed): def=1, total=2, for i=3 (body 4..103), phase_two=104,
+    for j=105 (body 106..202), phase_three=203 (top level, NO block),
+    try opener=204, body=205, handler=206..207, return=208.
+    The try block spans 204..207 — inside it only ``final_step()`` and
+    ``recover()`` are matched lines.
+    """
+    lines = ["def big():", "    total = 0"]
+    lines.append("    for i in range(100):")
+    lines += [f"        step({i})" for i in range(100)]
+    lines.append("    phase_two()")
+    lines.append("    for j in range(100):")
+    lines += [f"        step2({j})" for j in range(97)]
+    lines.append("    phase_three()")       # top-level, right before the try
+    lines.append("    try:")
+    lines.append("        final_step()")
+    lines.append("    except Boom:")
+    lines.append("        recover()")
+    lines.append("    return total")
+    return lines
+
+
+def test_narrow_walks_to_a_later_matched_line_when_the_first_has_no_block():
+    """The C3 anchor's enclosing-block lookup must not give up on the node.
+
+    The snippet's first matched line is the method's top-level statement
+    (no for/if/while/try encloses it — the first-block lookup returns
+    None), while a LATER matched line sits inside a small try block. The
+    old code returned the FULL node when the FIRST matched line had no
+    block; it must walk forward through the remaining matched lines and
+    cut at the block the snippet actually targets.
+    """
+    lines = _ts_like_source_with_top_level_context()
+    node = ASTNode(
+        name="big", kind="function",
+        line_start=1, line_end=len(lines), signature="def big():",
+    )
+    snippet = (
+        "    phase_three()\n"     # top-level statement — NO enclosing block
+        "    try:\n"              # the small block the snippet targets
+        "        final_step()\n"
+        "    except Boom:\n"
+        "        recover()\n"
+        "        # ... existing code ...\n"
+    )
+
+    result = _narrow_large_node(
+        node, snippet, lines,
+        original_code="\n".join(lines) + "\n", language="python",
+    )
+
+    assert result != (1, len(lines)), (
+        f"narrow returned the full node {result} although a later matched "
+        f"line pins the try block — the model must never see the whole "
+        f"2,499-line symbol for a 5-line anchored edit"
+    )
+    start, end = result
+    assert end - start < 40, (
+        f"narrow cut {result} is not a small sub-block; expected the "
+        f"try block the snippet's later matched lines pin"
+    )
+
+
+def test_narrow_still_rejects_when_no_matched_line_has_a_block():
+    """Negative control for the walk: with NO matched line inside any
+    block, the narrow still returns the full node (no raw-line cut)."""
+    lines = _ts_like_source_with_top_level_context()
+    node = ASTNode(
+        name="big", kind="function",
+        line_start=1, line_end=len(lines), signature="def big():",
+    )
+    snippet = (
+        "    total = 0\n"
+        "    phase_one()\n"
+    )
+
+    result = _narrow_large_node(
+        node, snippet, lines,
+        original_code="\n".join(lines) + "\n", language="python",
+    )
+
+    assert result == (1, len(lines)), (
+        f"no-block snippet narrowed to {result}; the full node must be "
+        f"returned when no matched line sits inside a block"
+    )
+
+
 def test_narrow_without_enclosing_block_rejected():
     """No enclosing block → no raw-line fallback window; full node returned.
 

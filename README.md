@@ -252,7 +252,16 @@ fastedit move-to-file foo src/a.py src/b.py
 
 # Undo last edit / show diff
 fastedit undo src/app.py
-fastedit diff src/app.py
+fastedit diff src/app.py            # base: the newest backup = the last edit's change
+fastedit diff src/app.py --base all # every change still in the undo history —
+                                    # use this to detect losses across multiple edits
+
+# Hermetic line primitives — 0 tokens, no model (issue #14):
+# insert next to a UNIQUE line (full stripped content must match exactly)
+fastedit edit src/lib.rs --snippet '    audit_trail.record(x);' --insert-after 'let x = audit(a);'
+fastedit edit src/lib.rs --snippet '    audit_trail.begin();' --insert-before 'let x = audit(a);'
+# delete an inclusive 1-indexed line range
+fastedit edit src/app.py --lines 12:14 --delete
 ```
 
 ## MCP server

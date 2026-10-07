@@ -11,6 +11,24 @@ Usage:
     fastedit diff src/app.py
     fastedit undo src/app.py
     fastedit search "query" src/
+
+Hermetic line primitives (issue #14) — deterministic, 0 tokens, no model.
+These exist for the additive/mixed edits inside big functions that used to
+fall to the model chunk-merge only to be rejected by its faithfulness
+battery (refusal classes: one-line insertion inside a large function; pure
+line-range deletion):
+
+    fastedit edit src/app.py --snippet '...' --insert-after 'return ok();'
+    fastedit edit src/app.py --snippet '...' --insert-before 'let x = 1;'
+    fastedit edit src/app.py --lines 12:14 --delete
+
+The --insert-after/--insert-before literal matches the FULL STRIPPED
+content of a line (unique match enforced: 0 matches and >1 matches refuse
+with exit 1) and splices the snippet immediately after/before it. The
+docstring/leading-comment and module-constant edit shapes (the remaining
+model-path refusal classes) are served by anchoring an insert on the
+first line or import line literally, or by --after/--after-imports —
+no separate flag was added for them.
 """
 
 from __future__ import annotations
@@ -913,6 +931,235 @@ def _refuse_if_edit_broke_parse(path, original_code, merged_code, language):
         f"The file is unchanged."
     )
 
+
+# ---------------------------------------------------------------------------
+# Hermetic literal line primitives (issue #14)
+#
+# Four refusal classes reach the model chunk-merge only to be rejected by
+# its faithfulness battery; the reported root cause is that additive /
+# mixed edits inside BIG functions interleave preserved lines with new
+# lines in shapes the classifier mislabels. Two of the classes are not
+# rewrites at all — a one-line insertion anchored on a unique literal, and
+# a pure line-range deletion — so they get deterministic, hermetic, 0-token
+# primitives here, BEFORE any model path is reachable. Both funnel the
+# final bytes through _normalize_merged_eol (the established EOL /
+# trailing-state policy) and write via _atomic_write (backup, codec, BOM,
+# mode, B37 lost-update guard — exactly like every other edit verb).
+# ---------------------------------------------------------------------------
+
+def _check_line_mode_conflicts(args, has_snippet: bool) -> None:
+    """Refuse flag combinations the hermetic line primitives cannot mean.
+
+    Every check is argv-only — nothing has been read, so a conflict exits 1
+    before any I/O. The inserts are mutually exclusive, never combine with
+    the symbol-anchored modes (--after/--after-imports/--replace) or with
+    the deletion mode (--lines+--delete); the deletion mode never carries a
+    snippet (it deletes, it does not insert). With --lines the missing
+    --delete stays a refusal here so a caller cannot fall through to a
+    model edit by omitting a safety flag.
+    """
+    insert_after = getattr(args, "insert_after", None)
+    insert_before = getattr(args, "insert_before", None)
+    lines_spec = getattr(args, "lines", None)
+    wants_delete = bool(getattr(args, "delete", False))
+    after_sym = args.after or getattr(args, "after_imports", False) or None
+    replace_sym = args.replace or None
+
+    if insert_after and insert_before:
+        _print_edit_refusal(
+            "--insert-after and --insert-before are mutually exclusive; "
+            "pass exactly one anchor literal."
+        )
+        sys.exit(1)
+    if (insert_after or insert_before) and (after_sym or replace_sym):
+        _print_edit_refusal(
+            "--insert-after/--insert-before cannot be combined with "
+            "--after/--after-imports/--replace: the literal anchor already "
+            "fixes the insertion point. Drop the symbol flag and retry."
+        )
+        sys.exit(1)
+    if lines_spec is not None:
+        if not wants_delete:
+            _print_edit_refusal(
+                f"--lines {lines_spec} without --delete would do nothing "
+                "here. Pass --delete to remove that line range, or drop "
+                "--lines and edit with --snippet."
+            )
+            sys.exit(1)
+        if has_snippet:
+            _print_edit_refusal(
+                "--lines with --delete is a pure deletion and takes no "
+                "--snippet. Drop --snippet, or use --snippet with the "
+                "insert/replace modes instead."
+            )
+            sys.exit(1)
+    if wants_delete and lines_spec is None:
+        _print_edit_refusal(
+            "--delete requires --lines FROM:TO naming the range to remove. "
+            "Nothing was changed."
+        )
+        sys.exit(1)
+
+
+def _parse_lines_range(lines_spec: str, total_lines: int) -> tuple[int, int]:
+    """Parse ``FROM:TO`` (1-indexed, inclusive) and bound it to the file.
+
+    Raises ValueError with the caller-facing reason for every malformed,
+    reversed, or out-of-bounds spec; the caller turns that into a refusal.
+    """
+    parts = lines_spec.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"invalid --lines range {lines_spec!r}: expected FROM:TO "
+            "(1-indexed, inclusive), e.g. --lines 12:14 --delete"
+        )
+    try:
+        start, end = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"invalid --lines range {lines_spec!r}: FROM and TO must be "
+            "integers"
+        ) from None
+    if start < 1 or end < start:
+        raise ValueError(
+            f"invalid --lines range {lines_spec!r}: FROM must be >= 1 and "
+            f"TO must be >= FROM (got {start}:{end})"
+        )
+    if end > total_lines:
+        raise ValueError(
+            f"invalid --lines range {lines_spec!r}: the file has "
+            f"{total_lines} line(s); 1:{total_lines} is the whole file"
+        )
+    return start, end
+
+
+def _resolve_line_literal(
+    original_lines: list[str], literal: str, flag_label: str,
+) -> int:
+    """Index of the UNIQUE line whose stripped content equals *literal*.
+
+    Full-line matching (stripped, so the caller need not reproduce the
+    file's indentation) with an enforced unique match — 0 matches and >1
+    matches both refuse with the remedy spelled out. Returns the 0-indexed
+    line position for the splice.
+    """
+    matches = [
+        i for i, line in enumerate(original_lines)
+        if line.strip() == literal.strip()
+    ]
+    if not matches:
+        _print_edit_refusal(
+            f"literal not found: {literal.strip()} -- the {flag_label} "
+            "anchor matches a line's full stripped content; check `fastedit "
+            "read` for the exact line."
+        )
+        sys.exit(1)
+    if len(matches) > 1:
+        _print_edit_refusal(
+            f"literal matches {len(matches)} lines: {literal.strip()} -- "
+            "include more context or use --lines FROM:TO --delete to target "
+            "the occurrence precisely."
+        )
+        sys.exit(1)
+    return matches[0]
+
+
+def _apply_insert_after_before(
+    path: Path,
+    original_code: str,
+    original_lines: list[str],
+    snippet: str,
+    literal: str,
+    *,
+    before: bool,
+    backups,
+    encoding: str,
+    read_stat,
+) -> None:
+    """Splice the snippet lines after/before the UNIQUE literal line.
+
+    Hermetic by construction: pure line splicing, no AST, no model. The
+    snippet is normalized to the file's line-ending convention and the
+    whole result funnels through _normalize_merged_eol so the file's EOL
+    convention and trailing-newline state are preserved (CRLF stays CRLF;
+    a file without a trailing terminator stays without one). Writes via
+    _atomic_write with the read-time stat, so the usual backup, codec,
+    BOM, permission-mode, and lost-update guards all apply.
+    """
+    from .inference.chunked_merge import _normalize_merged_eol
+    from .mcp.backup import _atomic_write
+    from .split_join import detect_line_ending, normalize_line_endings
+
+    anchor_idx = _resolve_line_literal(original_lines, literal, "--insert")
+    line_ending = detect_line_ending(original_code)
+    snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n")
+    if not snippet_text:
+        _print_edit_refusal(
+            "the snippet is empty; there is nothing to insert. Pass the "
+            "line(s) to insert via --snippet, @path, or piped stdin."
+        )
+        sys.exit(1)
+    snippet_lines = [
+        ln + line_ending for ln in snippet_text.split("\n")
+    ]
+    insert_at = anchor_idx if before else anchor_idx + 1
+    result_lines = (
+        original_lines[:insert_at] + snippet_lines + original_lines[insert_at:]
+    )
+    merged = _normalize_merged_eol("".join(result_lines), original_code)
+    _atomic_write(
+        path, merged, backups=backups, encoding=encoding, expected_stat=read_stat,
+    )
+    anchor_display = f"L{anchor_idx + 1}"
+    print(
+        f"Inserted {len(snippet_lines)} line(s) "
+        f"{'before' if before else 'after'} {anchor_display} "
+        f"({literal.strip()}) in {path}. "
+        f"latency: 0ms, 0 tok/s, 0 tokens"
+    )
+
+
+def _apply_lines_delete(
+    path: Path,
+    original_code: str,
+    original_lines: list[str],
+    lines_spec: str,
+    backups,
+    encoding: str,
+    read_stat,
+) -> None:
+    """Delete the 1-indexed inclusive FROM:TO line range. No model.
+
+    Refuses when the range would empty the file: a delete-to-nothing is a
+    remove, not an edit, and this primitive deliberately does not own it.
+    """
+    from .inference.chunked_merge import _normalize_merged_eol
+    from .mcp.backup import _atomic_write
+
+    try:
+        start, end = _parse_lines_range(lines_spec, len(original_lines))
+    except ValueError as e:
+        _print_edit_refusal(str(e))
+        sys.exit(1)
+    result_lines = (
+        original_lines[: start - 1] + original_lines[end:]
+    )
+    if not any(ln.strip() for ln in result_lines):
+        _print_edit_refusal(
+            f"deleting lines {start}-{end} would leave the file empty; "
+            "refusing. Use a file-management command to remove the file."
+        )
+        sys.exit(1)
+    merged = _normalize_merged_eol("".join(result_lines), original_code)
+    _atomic_write(
+        path, merged, backups=backups, encoding=encoding, expected_stat=read_stat,
+    )
+    print(
+        f"Deleted lines {start}-{end} ({end - start + 1} line(s)) from "
+        f"{path}. latency: 0ms, 0 tok/s, 0 tokens"
+    )
+
+
 def cmd_edit(args):
     """Apply an edit snippet to a file using the FastEdit model."""
     path = Path(args.file)
@@ -945,17 +1192,35 @@ def _cmd_edit_locked(args):
     )
     from .write_gates import _all_chunks_rejected, _rejection_refusal
 
-    # Issue #9: '-' is read ONCE, bounded, via the shared helper (TTY
-    # refused, never hangs, stdin retired after the read). Issue #7:
-    # otherwise the text goes through @file resolution / existing-file
-    # auto-detection (--snippet-is-literal opts out).
-    snippet = (
-        _read_dash_stdin("--snippet")
-        if args.snippet == "-"
-        else _resolve_snippet_text_arg(
-            args.snippet, "--snippet", getattr(args, "snippet_is_literal", False),
+    # Issue #14: argv-only mode gate, before ANY I/O. The pure deletion
+    # mode (--lines FROM:TO --delete) carries no snippet by design; every
+    # other mode requires one, and a missing --snippet must refuse with
+    # the same clean exit-1 the old argparse required=True produced.
+    lines_spec = getattr(args, "lines", None)
+    wants_delete = bool(getattr(args, "delete", False))
+    snippet_free_delete = lines_spec is not None and wants_delete
+    if args.snippet is None:
+        if snippet_free_delete:
+            snippet = ""
+        else:
+            _print_edit_refusal(
+                "--snippet is required (text, '@path', or '-' for piped "
+                "stdin); the only snippet-free form is "
+                "--lines FROM:TO --delete."
+            )
+            sys.exit(1)
+    else:
+        # Issue #9: '-' is read ONCE, bounded, via the shared helper (TTY
+        # refused, never hangs, stdin retired after the read). Issue #7:
+        # otherwise the text goes through @file resolution / existing-file
+        # auto-detection (--snippet-is-literal opts out).
+        snippet = (
+            _read_dash_stdin("--snippet")
+            if args.snippet == "-"
+            else _resolve_snippet_text_arg(
+                args.snippet, "--snippet", getattr(args, "snippet_is_literal", False),
+            )
         )
-    )
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
@@ -983,6 +1248,30 @@ def _cmd_edit_locked(args):
     # already guarantees the two flags never combine.
     if getattr(args, "after_imports", False):
         after_sym = "imports"
+
+    # Issue #14: the hermetic literal line primitives run FIRST — before
+    # any symbol resolution or model path — so the two reported refusal
+    # classes (a one-line insertion anchored on a unique literal; a pure
+    # line-range deletion) never reach the model chunk-merge at all. The
+    # conflict gate runs before them on argv alone, so a mis-keyed command
+    # refuses without touching the file.
+    _check_line_mode_conflicts(args, has_snippet=bool(snippet))
+    insert_after_lit = getattr(args, "insert_after", None)
+    insert_before_lit = getattr(args, "insert_before", None)
+    if insert_after_lit or insert_before_lit:
+        _apply_insert_after_before(
+            path, original_code, original_lines, snippet,
+            insert_after_lit or insert_before_lit,
+            before=insert_before_lit is not None,
+            backups=backups, encoding=encoding, read_stat=read_stat,
+        )
+        return
+    if snippet_free_delete:
+        _apply_lines_delete(
+            path, original_code, original_lines, lines_spec,
+            backups=backups, encoding=encoding, read_stat=read_stat,
+        )
+        return
 
     def _maybe_impact_note(merged_code: str) -> str:
         """Build the pre-flight impact note (VAL-M3-001) or empty str.
@@ -2304,12 +2593,17 @@ def _decode_for_display(data: bytes, encoding: str | None) -> str:
 
 
 def cmd_diff(args):
-    """Show a unified diff of every change still in the file's undo history.
+    """Show a unified diff between a pre-edit backup and the current file.
 
-    The diff base is the OLDEST surviving backup (the pre-state of the
-    whole still-undoable change set), so losses from earlier edits stay
-    visible after later edits land (issue #8) — diffing the newest backup
-    alone showed only the last edit's hunk.
+    The diff BASE is explicit and stated on the surface (issue #15):
+
+      * ``--base last`` (the DEFAULT) diffs against the NEWEST backup —
+        exactly the last edit's change, what an agent verifying an edit
+        expects to see;
+      * ``--base all`` diffs against the OLDEST surviving backup — every
+        change still in the undo history, so losses from earlier edits
+        stay visible after later edits land (issue #8's loss-detection
+        view; see BackupStore.oldest for the rationale).
     """
     import difflib
 
@@ -2327,16 +2621,16 @@ def cmd_diff(args):
         print(f"No backup recorded for {args.file}. Run an edit command first.")
         return
 
-    # Issue #8: diff against the OLDEST surviving backup, not the newest.
-    # peek() (newest) is the LAST edit's pre-state, so a line an EARLIER
-    # edit had dropped was identical on both sides of that base and
-    # vanished from the rendered diff as soon as any later edit landed —
-    # the diff showed only the newest intended hunk, never the loss. The
-    # oldest backup is the pre-state of the whole still-undoable change
-    # set, so every change in the undo history is surfaced; adjacent
-    # hunks merge in the unified render and distant ones each print in
-    # full, so every changed line appears either way.
-    backup_bytes = backups.oldest(args.file)
+    # Issue #15: the base is a choice, not an implication. LAST (default)
+    # = peek() = the NEWEST backup, i.e. the last edit's pre-state — the
+    # rendered diff is exactly the last edit's change. ALL = oldest() =
+    # the pre-state of the whole still-undoable change set (issue #8):
+    # every change in the undo history is surfaced, so a loss from an
+    # EARLIER edit stays visible no matter how many later edits landed.
+    if getattr(args, "base", "last") == "all":
+        backup_bytes = backups.oldest(args.file)
+    else:
+        backup_bytes = backups.peek(args.file)
 
     # Display-only decode (see _decode_for_display): both sides are decoded
     # with the codec the current file reads as, so a latin-1 file diffs
@@ -2664,8 +2958,27 @@ def main():
     search_p.add_argument("--regex-filter", default="", help="Regex filter for hybrid mode")
 
     # --- diff (no model) ---
-    diff_p = sub.add_parser("diff", help="Show diff between last backup and current file")
+    diff_p = sub.add_parser(
+        "diff",
+        help="Show diff between a pre-edit backup and the current file "
+             "(default base: newest backup = the last edit's change)",
+    )
     diff_p.add_argument("file", help="Path to source file")
+    # Issue #15: the diff BASE must be stated on the surface, not implied.
+    # `last` (the default) diffs against the NEWEST backup — exactly the
+    # last edit's change, what an agent verifying an edit expects. `all`
+    # diffs against the OLDEST surviving backup — every change still in
+    # the undo history — which is the issue-#8 loss-detection view.
+    diff_p.add_argument(
+        "--base",
+        choices=["last", "all"],
+        default="last",
+        help="Which pre-edit backup to diff against: 'last' (default) = "
+             "the NEWEST backup, i.e. exactly the last edit's change; "
+             "'all' = the OLDEST backup, i.e. every change still in the "
+             "undo history — use this to detect losses across multiple "
+             "edits",
+    )
 
     # --- edit (model) ---
     edit_p = sub.add_parser(
@@ -2674,14 +2987,47 @@ def main():
              "(shows a caller-impact note when --replace changes a signature)",
     )
     edit_p.add_argument("file", help="Path to source file")
+    # Required for every mode except the pure deletion (--lines FROM:TO
+    # --delete), which has no payload to carry; the enforcement (and the
+    # clean exit-1 refusal naming --snippet) lives in _cmd_edit_locked's
+    # argv gate, which also keeps the deletion mode snippet-free.
     edit_p.add_argument(
-        "--snippet", required=True,
-        help="Edit snippet, '@path' to read it from a file, or '-' for piped stdin",
+        "--snippet", default=None,
+        help="Edit snippet, '@path' to read it from a file, or '-' for "
+             "piped stdin (required unless --lines FROM:TO --delete is "
+             "given)",
     )
     edit_p.add_argument(
         "--snippet-is-literal", action="store_true",
         help="Use --snippet text verbatim: never resolve '@path' and never "
              "auto-read a snippet that names an existing file",
+    )
+    # Issue #14: hermetic literal line primitives — insert after/before a
+    # UNIQUE full-line literal, or delete an inclusive 1-indexed line
+    # range. Deterministic, 0 tokens, never reach the model. The anchor
+    # literal matches the line's stripped content, so the caller need not
+    # reproduce the file's indentation; 0 and >1 matches refuse loudly.
+    edit_p.add_argument(
+        "--insert-after", default=None, dest="insert_after",
+        help="Insert the snippet immediately AFTER the first line whose "
+             "full stripped content equals this literal (unique match "
+             "enforced). Hermetic: 0 tokens, no model.",
+    )
+    edit_p.add_argument(
+        "--insert-before", default=None, dest="insert_before",
+        help="Insert the snippet immediately BEFORE the first line whose "
+             "full stripped content equals this literal (unique match "
+             "enforced). Hermetic: 0 tokens, no model.",
+    )
+    edit_p.add_argument(
+        "--lines", default=None, dest="lines",
+        help="With --delete: remove lines FROM:TO (1-indexed, inclusive), "
+             "e.g. --lines 12:14 --delete. Pure deletion, no model.",
+    )
+    edit_p.add_argument(
+        "--delete", action="store_true", dest="delete",
+        help="With --lines FROM:TO: delete that line range (required so a "
+             "line range never silently becomes a deletion).",
     )
     # Issue #5: --after imports is the anchor callers reach for most (add an
     # import), so it gets a dedicated flag. Mutually exclusive with --after:

@@ -2363,3 +2363,588 @@ class TestCLIIssue5AddressableSymbols:
             "def main():\n"
             "    print(os.name)\n"
         )
+
+
+# ===================================================================
+# 18. Issue #15 — `fastedit diff --base {last,all}` (default: last)
+# ===================================================================
+
+PY_ORIGINAL_DIFF = """def target():
+    a = 1
+
+def helper():
+    b = 2
+"""
+
+
+class TestCLIDiffBaseFlag:
+    """Issue #15: `fastedit diff` used to diff against the OLDEST backup
+    (the issue-#8 loss-detection choice) so agents verifying an edit saw
+    EVERY still-undoable hunk, not the one their edit just made.
+
+    New contract: `--base last` (the DEFAULT) diffs against the NEWEST
+    backup — exactly the last edit's change, what a verification step
+    expects. `--base all` keeps the issue-#8 behavior: every change still
+    in the undo history, for loss detection across multiple edits. The
+    --help text states the baseline explicitly."""
+
+    def _delete_helper(self, target: Path):
+        deleted = run_cli("delete", str(target), "helper")
+        assert deleted.returncode == 0, (
+            f"stdout: {deleted.stdout!r} stderr: {deleted.stderr!r}"
+        )
+
+    def _rewrite_target(self, target: Path):
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "def target():\n    a = 2\n",
+            "--replace", "target",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+
+    def test_default_base_is_last_shows_only_the_newest_hunk(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+        target = tmp_path / "app.py"
+        target.write_text(PY_ORIGINAL_DIFF)
+
+        self._delete_helper(target)     # edit 1: removes the helper function
+        self._rewrite_target(target)    # edit 2: a = 1 -> a = 2
+
+        diff = run_cli("diff", str(target))
+        assert diff.returncode == 0, diff.stderr
+        # The last edit's hunk IS shown...
+        assert "-    a = 1" in diff.stdout, diff.stdout
+        assert "+    a = 2" in diff.stdout, diff.stdout
+        # ...and the earlier edit's removal is NOT: those lines were still
+        # present in the newest backup (edit 2's pre-state).
+        assert "-def helper():" not in diff.stdout, diff.stdout
+        assert "-    b = 2" not in diff.stdout, diff.stdout
+
+    def test_base_last_flag_is_accepted_explicitly(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """`--base last` spelled out behaves exactly like the default."""
+        monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+        target = tmp_path / "app.py"
+        target.write_text(PY_ORIGINAL_DIFF)
+
+        self._delete_helper(target)
+        self._rewrite_target(target)
+
+        diff = run_cli("diff", str(target), "--base", "last")
+        assert diff.returncode == 0, diff.stderr
+        assert "-    a = 1" in diff.stdout, diff.stdout
+        assert "+    a = 2" in diff.stdout, diff.stdout
+        assert "-def helper():" not in diff.stdout, diff.stdout
+        assert "-    b = 2" not in diff.stdout, diff.stdout
+
+    def test_base_all_shows_every_still_undoable_change(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """`--base all` keeps the issue-#8 loss-detection behavior: the
+        diff base is the OLDEST surviving backup, so the removal from the
+        EARLIER edit stays visible alongside the newest hunk."""
+        monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+        target = tmp_path / "app.py"
+        target.write_text(PY_ORIGINAL_DIFF)
+
+        self._delete_helper(target)
+        self._rewrite_target(target)
+
+        diff = run_cli("diff", str(target), "--base", "all")
+        assert diff.returncode == 0, diff.stderr
+        # The removal from the EARLIER edit appears even though the newest
+        # edit's pre-state still contained it.
+        assert "-def helper():" in diff.stdout, diff.stdout
+        assert "-    b = 2" in diff.stdout, diff.stdout
+        # The newest edit's change is surfaced too.
+        assert "-    a = 1" in diff.stdout, diff.stdout
+        assert "+    a = 2" in diff.stdout, diff.stdout
+
+    def test_base_last_after_single_edit_shows_that_edit(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """One edit in history: `--base last` shows exactly that edit —
+        the common verify-after-edit flow."""
+        monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+        target = tmp_path / "app.py"
+        target.write_text(PY_ORIGINAL_DIFF)
+
+        self._rewrite_target(target)
+
+        diff = run_cli("diff", str(target))
+        assert diff.returncode == 0, diff.stderr
+        assert "-    a = 1" in diff.stdout, diff.stdout
+        assert "+    a = 2" in diff.stdout, diff.stdout
+
+    def test_invalid_base_choice_is_rejected_by_argparse(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        monkeypatch.setenv("FASTEDIT_BACKUP_DIR", str(tmp_path / "backups"))
+        target = tmp_path / "app.py"
+        target.write_text(PY_ORIGINAL_DIFF)
+        result = run_cli("diff", str(target), "--base", "oldest")
+        assert result.returncode == 2
+
+    def test_diff_help_states_the_baseline_explicitly(self):
+        """`--help` must say which backup is the diff base — agents could
+        not tell whether diff showed the last edit or the whole history."""
+        result = run_cli("diff", "--help")
+        assert result.returncode == 0
+        assert "--base" in result.stdout
+        help_text = result.stdout.lower()
+        assert "last" in help_text
+        assert "all" in help_text
+        assert "newest" in help_text
+        assert "oldest" in help_text
+
+
+# ===================================================================
+# 19. Issue #14 — hermetic literal line primitives on `fastedit edit`
+# ===================================================================
+
+RUST_BIG_FN = (
+    "fn process_item(item: &Item) -> Result<(), Error> {\n"
+    "    let raw = item.as_raw();\n"
+    "    let checked = validate(&raw)?;\n"
+    "    let parsed = parse(&checked)?;\n"
+    "    let normalized = normalize(parsed);\n"
+    "    let scored = score(&normalized);\n"
+    "    let ranked = rank(scored);\n"
+    "    let filtered = filter_valid(ranked);\n"
+    "    let staged = stage(filtered);\n"
+    "    let committed = commit(staged)?;\n"
+    "    let indexed = index(committed);\n"
+    "    let stored = store(indexed);\n"
+    "    let packed = pack(stored);\n"
+    "    let sealed = seal(packed);\n"
+    "    let shipped = ship(sealed);\n"
+    "    let logged = log(shipped);\n"
+    "    let audited = audit(logged);\n"
+    "    let archived = archive(audited);\n"
+    "    let completed = finalize(archived);\n"
+    "    Ok(completed)\n"
+    "}\n"
+)
+
+RUST_UNIQUE_CLOSER = "    let audited = audit(logged);\n"
+
+
+class TestCLIEditInsertAfterBefore:
+    """Issue #14 refusal class 4 (one-line insertion inside a big Rust
+    function): a hermetic, zero-model, deterministic line-insertion
+    primitive keyed on a UNIQUE full-line literal.
+
+    Semantics: the snippet (--snippet/@path/-) is spliced immediately
+    AFTER (--insert-after) or BEFORE (--insert-before) the first line
+    whose full stripped content equals the literal. 0 matches and >1
+    matches are loud exit-1 refusals with the remedy spelled out."""
+
+    def _literal(self, target: Path, flag: str, literal: str, snippet: str):
+        return run_cli(
+            "edit", str(target),
+            "--snippet", snippet,
+            flag, literal,
+        )
+
+    def test_rust_shaped_one_line_insertion_lands_zero_tokens(
+        self, tmp_path: Path, backup_dir,
+    ):
+        """The issue's acceptance shape: a 200+-line function, one new line
+        after a unique `...;` statement line. Lands with exit 0, 0 model
+        tokens, and everything else byte-identical."""
+        big = "fn big(x: i32) -> i32 {\n" + "".join(
+            f"    let step_{i} = step_{i - 1} + 1;\n" for i in range(1, 199)
+        ) + "    let result = step_198;\n    result\n}\n"
+        assert len(big.splitlines()) >= 200
+        target = tmp_path / "big.rs"
+        target.write_text(big)
+        unique = "    let step_42 = step_41 + 1;\n"
+
+        result = self._literal(
+            target, "--insert-after", "let step_42 = step_41 + 1;",
+            "    let checkpoint = step_42;\n",
+        )
+
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        content = target.read_text()
+        lines = content.splitlines(keepends=True)
+        idx = lines.index(unique)
+        assert lines[idx + 1] == "    let checkpoint = step_42;\n"
+        # Byte-identical apart from the one inserted line.
+        assert content == big.replace(
+            unique, unique + "    let checkpoint = step_42;\n",
+        )
+        # Hermetic: no model work happened.
+        assert "0 tokens" in result.stdout, result.stdout
+
+    def test_insert_after_uses_snippet_as_payload(
+        self, tmp_path: Path, backup_dir,
+    ):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = self._literal(
+            target, "--insert-after", "let audited = audit(logged);",
+            "    audit_trail.record(audited);\n",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        content = target.read_text(encoding="utf-8")
+        assert content == RUST_BIG_FN.replace(
+            RUST_UNIQUE_CLOSER,
+            RUST_UNIQUE_CLOSER + "    audit_trail.record(audited);\n",
+        )
+        assert "0 tokens" in result.stdout
+
+    def test_insert_before_puts_snippet_above_the_literal(
+        self, tmp_path: Path, backup_dir,
+    ):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = self._literal(
+            target, "--insert-before", "let audited = audit(logged);",
+            "    audit_trail.begin();\n",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        content = target.read_text(encoding="utf-8")
+        assert content == RUST_BIG_FN.replace(
+            RUST_UNIQUE_CLOSER,
+            "    audit_trail.begin();\n" + RUST_UNIQUE_CLOSER,
+        )
+        assert "0 tokens" in result.stdout
+
+    def test_literal_match_is_full_line_and_indent_insensitive(
+        self, tmp_path: Path, backup_dir,
+    ):
+        """The literal matches the line's STRIPPED content — the caller
+        need not reproduce the file's exact indentation."""
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = self._literal(
+            target, "--insert-after", "let audited = audit(logged);",
+            "    audit_trail.record(audited);\n",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        content = target.read_text(encoding="utf-8")
+        assert "    audit_trail.record(audited);\n" in content
+
+    def test_zero_matches_refused_with_guidance(
+        self, tmp_path: Path, backup_dir,
+    ):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = self._literal(
+            target, "--insert-after", "let missing = absent();",
+            "    x();\n",
+        )
+        assert result.returncode == 1
+        assert "literal not found: let missing = absent();" in result.stderr
+        assert "The edit was refused" in result.stderr
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_multiple_matches_refused_with_remedy(
+        self, tmp_path: Path, backup_dir,
+    ):
+        """Two identical statement lines: ambiguous — refuse with the
+        add-context / --lines remedy, never guess."""
+        code = (
+            "fn f() {\n"
+            "    let a = 1;\n"
+            "    let a = 1;\n"
+            "}\n"
+        )
+        target = tmp_path / "dup.py"
+        target.write_text(code, encoding="utf-8")
+        result = self._literal(
+            target, "--insert-after", "let a = 1;", "    b();\n",
+        )
+        assert result.returncode == 1
+        assert "literal matches 2 lines" in result.stderr
+        assert "include more context" in result.stderr
+        assert "--lines" in result.stderr
+        assert target.read_text(encoding="utf-8") == code
+
+    def test_insert_after_conflicts_with_replace(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "x\n",
+            "--insert-after", "let audited = audit(logged);",
+            "--replace", "process_item",
+        )
+        assert result.returncode == 1
+        assert "--replace" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_insert_after_conflicts_with_after(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "x\n",
+            "--insert-after", "let audited = audit(logged);",
+            "--after", "process_item",
+        )
+        assert result.returncode == 1
+        assert "--after" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_insert_after_conflicts_with_after_imports(self, tmp_path: Path):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "x\n",
+            "--insert-after", "let audited = audit(logged);",
+            "--after-imports",
+        )
+        assert result.returncode == 1
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_insert_after_and_insert_before_are_mutually_exclusive(
+        self, tmp_path: Path,
+    ):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "x\n",
+            "--insert-after", "let audited = audit(logged);",
+            "--insert-before", "let audited = audit(logged);",
+        )
+        assert result.returncode == 1
+        assert "--insert" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_missing_snippet_with_insert_flag_refused(
+        self, tmp_path: Path, backup_dir, monkeypatch, capsys,
+    ):
+        """The insertion flags are the mode; the snippet is the payload.
+        With neither, the command cannot mean anything — refuse cleanly."""
+        from fastedit import cli as cli_module
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        argv_backup = sys.argv
+        sys.argv = [
+            "fastedit", "edit", str(target),
+            "--insert-after", "let audited = audit(logged);",
+        ]
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                cli_module.main()
+        finally:
+            sys.argv = argv_backup
+        assert exc_info.value.code == 1
+        assert "--snippet" in capsys.readouterr().err
+        assert target.read_text(encoding="utf-8") == RUST_BIG_FN
+
+    def test_snippet_dash_stdin_works_with_insert_after(
+        self, tmp_path: Path, backup_dir,
+    ):
+        target = tmp_path / "app.py"
+        target.write_text(RUST_BIG_FN, encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "-",
+            "--insert-after", "let audited = audit(logged);",
+            input_text="    audit_trail.record(audited);\n",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        content = target.read_text(encoding="utf-8")
+        assert content == RUST_BIG_FN.replace(
+            RUST_UNIQUE_CLOSER,
+            RUST_UNIQUE_CLOSER + "    audit_trail.record(audited);\n",
+        )
+
+
+class TestCLIEditLinesDelete:
+    """Issue #14 refusal class 1: pure line-range deletion, no model.
+    `--lines FROM:TO --delete` removes lines FROM..TO (1-indexed,
+    inclusive); `--delete` is required so a malformed range can never
+    silently become a deletion."""
+
+    def test_lines_delete_removes_the_inclusive_range(
+        self, tmp_path: Path, backup_dir,
+    ):
+        lines = [f"line {i}\n" for i in range(1, 11)]
+        target = tmp_path / "doc.txt"
+        target.write_text("".join(lines), encoding="utf-8")
+
+        result = run_cli("edit", str(target), "--lines", "3:5", "--delete")
+
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        expected = "".join(
+            ln for i, ln in enumerate(lines, start=1) if i not in (3, 4, 5)
+        )
+        assert target.read_text(encoding="utf-8") == expected
+        assert "Deleted lines 3-5" in result.stdout, result.stdout
+        assert "0 tokens" in result.stdout
+
+    def test_lines_delete_single_line_range(self, tmp_path: Path, backup_dir):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "2:2", "--delete")
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert target.read_text(encoding="utf-8") == "one\nthree\n"
+        assert "Deleted lines 2-2" in result.stdout
+
+    def test_lines_delete_creates_backup_for_undo(
+        self, tmp_path: Path, backup_dir,
+    ):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "2:2", "--delete")
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        undo = run_cli("undo", str(target))
+        assert undo.returncode == 0, undo.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_requires_delete_flag(self, tmp_path: Path):
+        """--lines without --delete must not guess at a deletion."""
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "2:2")
+        assert result.returncode == 1
+        assert "--delete" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_requires_lines_flag(self, tmp_path: Path):
+        """--delete without --lines is an incomplete mode — refuse."""
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--delete")
+        assert result.returncode == 1
+        assert "--lines" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_rejects_reversed_range(self, tmp_path: Path):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "5:3", "--delete")
+        assert result.returncode == 1
+        assert "invalid --lines range" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_rejects_out_of_bounds_range(self, tmp_path: Path):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "2:99", "--delete")
+        assert result.returncode == 1
+        assert "invalid --lines range" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_rejects_malformed_spec(self, tmp_path: Path):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        for bad in ("2", "2:3:4", "a:b", "2:"):
+            result = run_cli("edit", str(target), "--lines", bad, "--delete")
+            assert result.returncode == 1, bad
+            assert "invalid --lines" in result.stderr, (bad, result.stderr)
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_conflicts_with_snippet(self, tmp_path: Path):
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli(
+            "edit", str(target),
+            "--lines", "2:2", "--delete",
+            "--snippet", "x\n",
+        )
+        assert result.returncode == 1
+        assert "--snippet" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_empty_result_refused(self, tmp_path: Path):
+        """Deleting every line of the file is not an edit, it's a remove —
+        refuse (a future rm-style verb can own that)."""
+        target = tmp_path / "doc.txt"
+        target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+        result = run_cli("edit", str(target), "--lines", "1:3", "--delete")
+        assert result.returncode == 1
+        assert "empty" in result.stderr, result.stderr
+        assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+    def test_lines_delete_preserves_crlf_endings(self, tmp_path: Path):
+        """EOL/trailing-state preservation: a CRLF file keeps CRLF on every
+        surviving line."""
+        target = tmp_path / "crlf.txt"
+        target.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+        result = run_cli("edit", str(target), "--lines", "2:2", "--delete")
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert target.read_bytes() == b"one\r\nthree\r\n"
+
+    def test_lines_delete_no_trailing_newline_preserved(
+        self, tmp_path: Path,
+    ):
+        """A file without a trailing terminator stays without one."""
+        target = tmp_path / "tail.txt"
+        target.write_bytes(b"one\ntwo\nthree")
+        result = run_cli("edit", str(target), "--lines", "1:1", "--delete")
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert target.read_bytes() == b"two\nthree"
+
+
+class TestCLIEditInsertEolPreservation:
+    """EOL/trailing-state preservation for the insertion primitives."""
+
+    def test_insert_after_preserves_crlf(self, tmp_path: Path):
+        target = tmp_path / "crlf.py"
+        target.write_bytes(b"def f():\r\n    a = 1\r\n    b = 2\r\n")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "    audit = true;\r\n",
+            "--insert-after", "a = 1",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert target.read_bytes() == (
+            b"def f():\r\n    a = 1\r\n    audit = true;\r\n    b = 2\r\n"
+        )
+
+    def test_insert_after_no_trailing_newline_state_kept(self, tmp_path: Path):
+        target = tmp_path / "tail.py"
+        target.write_bytes(b"def f():\n    a = 1\n    b = 2")
+        result = run_cli(
+            "edit", str(target),
+            "--snippet", "    audit = true;\n",
+            "--insert-after", "a = 1",
+        )
+        assert result.returncode == 0, (
+            f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
+        )
+        assert target.read_bytes() == (
+            b"def f():\n    a = 1\n    audit = true;\n    b = 2"
+        )
+
+
+class TestCLIEditLiteralHelp:
+    def test_edit_help_lists_insert_and_lines_flags(self):
+        result = run_cli("edit", "--help")
+        assert result.returncode == 0
+        for flag in ("--insert-after", "--insert-before", "--lines", "--delete"):
+            assert flag in result.stdout, flag

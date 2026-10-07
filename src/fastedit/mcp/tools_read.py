@@ -182,31 +182,61 @@ def _compact_search(text: str) -> str:
     description=(
         "Show a unified diff of changes made by the last fast_edit or "
         "fast_batch_edit call on this file. Returns a compact diff — much "
-        "cheaper than re-reading the whole file to verify an edit."
+        "cheaper than re-reading the whole file to verify an edit. "
+        "base='last' (default) diffs against the NEWEST pre-edit snapshot, "
+        "i.e. exactly the last edit's change; base='all' diffs against the "
+        "OLDEST backup — every change still in the undo history, for loss "
+        "detection across multiple edits."
     ),
 )
-def fast_diff(file_path: str) -> str:
-    """Show the diff between the pre-edit snapshot and current file."""
+def fast_diff(file_path: str, base: str = "last") -> str:
+    """Show the diff between a pre-edit snapshot and the current file.
+
+    base='last' (default) = the NEWEST backup (the last edit's change);
+    base='all' = the OLDEST backup (every change still in the undo
+    history) — the CLI's `fastedit diff --base` semantics, so both
+    surfaces agree (issue #15).
+    """
+    if base not in ("last", "all"):
+        return f"Error: base must be 'last' or 'all', got: {base!r}"
     ctx = mcp.get_context()
     snapshots: dict = ctx.request_context.lifespan_context["snapshots"]
+    backups = ctx.request_context.lifespan_context["backups"]
 
     path = Path(file_path)
     if not path.exists():
         return f"Error: file not found: {file_path}"
 
-    if file_path not in snapshots:
+    # base='last' prefers the MCP session's in-memory snapshot (the last
+    # fast_edit call THIS server made, even before any backup existed);
+    # it falls back to the NEWEST on-disk backup so the surface matches
+    # the CLI's default after external or previous-session edits.
+    # base='all' always reads the OLDEST on-disk backup — the pre-state of
+    # the whole still-undoable change set (issue #8's loss-detection view).
+    original_bytes: bytes | None = None
+    if base == "last" and file_path in snapshots:
+        original_text = snapshots[file_path]
+        original_bytes = original_text.encode("utf-8")
+    elif file_path in backups:
+        try:
+            original_bytes = (
+                backups.oldest(file_path) if base == "all"
+                else backups.peek(file_path)
+            )
+        except KeyError:
+            original_bytes = None
+    if original_bytes is None:
         return f"No prior edit recorded for {file_path}. Call fast_edit first."
 
-    original = snapshots[file_path]
-    # The snapshot holds read_source's STRICT decode of the file (B21/B23);
-    # the old read_text(errors="replace") compared a different decode model,
-    # so a latin-1 file's diff was a full-file wall of U+FFFD and a .docx
-    # container diffed binary garbage. read_source gives the same model the
-    # snapshot was captured with and refuses what it must (utf-16/binary).
+    # Display decode mirrors _decode_for_display: the snapshot/backup bytes
+    # are decoded with the codec the current file reads as (or UTF-8 with
+    # replacement), so the diff compares like-for-like text and the bytes
+    # are never rewritten.
     try:
-        current = read_source(path)[0]
+        current, display_encoding = read_source(path)
     except UnsupportedEncodingError as e:
         return f"Error: {e}"
+    original = original_bytes.decode(display_encoding or "utf-8", errors="replace")
 
     if original == current:
         return f"No changes detected in {file_path}."

@@ -608,6 +608,23 @@ def _narrow_large_node(
     attempt was rejected to exhaustion). Anchoring on the first matched
     line is a no-op for snippets whose first line is a real context match
     (the whole-symbol wrap shapes).
+
+    Issue #12 e2e follow-up (first-matched-line-has-no-block walk + matched
+    span extension): the first matched line is not always INSIDE a block —
+    the issue's real shape had it as a top-level statement of the method
+    body (``ops.push('step-2489');`` at body level), with the snippet's
+    later matched lines inside a small ``try`` block. Two defects followed:
+    the old single-anchor lookup returned None and the narrow fell back to
+    the FULL node — a 2,499-line / 66 KB chunk handed to a 1.7B model,
+    whose speculative verification memory then scaled with the chunk and
+    got the process OOM-killed mid-merge (the issue's exit-137,
+    reproduced). Fix 1: walk the best window's matched lines FIRST onward
+    and cut at the first one that sits inside a block; only when NO
+    matched line has a block does the narrow stay rejected (full node,
+    unchanged contract). Fix 2: the cut extends to cover every matched
+    context line of the window (snippet-anchored, never raw ±padding), so
+    a declared anchor above the block is inside the chunk instead of being
+    misread by the battery as a declared-new line missing from the merge.
     """
     node_size = node.line_end - node.line_start + 1
     if node_size <= max_lines:
@@ -627,14 +644,11 @@ def _narrow_large_node(
     if not snippet_lines:
         return (node.line_start, node.line_end)
 
-    # Sliding window to find best match position. Besides the window's
-    # score, the FIRST MATCHED line inside the best window is tracked: the
-    # cut must anchor on a line the snippet actually aligns with (C3 fix —
-    # see the docstring's wrong-sub-block-cut note), never on a leading
-    # snippet line that matched nothing.
+    # Sliding window to find best match position. The whole window's
+    # matched-line set is kept (not just its first hit): the enclosing-block
+    # lookup walks forward through these candidates (issue #12 follow-up).
     best_score = 0.0
     best_offset = 0
-    best_first_match = 0
     window = min(len(snippet_lines), 10)
 
     for offset in range(len(node_lines) - window + 1):
@@ -647,16 +661,11 @@ def _narrow_large_node(
         if score > best_score:
             best_score = score
             best_offset = offset
-            best_first_match = next(
-                (i for i, hit in enumerate(hit_flags) if hit), 0,
-            )
 
     if best_score < _MIN_NARROW_SCORE:
         # B27: a window the snippet barely overlaps is not evidence for
         # ANY location — no confident narrow, keep the whole node.
         return (node.line_start, node.line_end)
-
-    target_line = node.line_start + best_offset + best_first_match
 
     # Step 2: cut at the enclosing block's AST node edges (B27). Without
     # something parsed there is no node edge to cut on — a raw-line window
@@ -664,19 +673,44 @@ def _narrow_large_node(
     if not (original_code and language):
         return (node.line_start, node.line_end)
 
-    block = _find_enclosing_block(
-        original_code, language, target_line,
-        node.line_start, node.line_end,
-    )
-    if not block:
-        # The matched window sits outside any for/if/while/try block; no
-        # AST edge bounds a smaller cut, so keep the whole node.
+    # Collect the matched lines IN the best-aligned window, first onward:
+    # (original line number, stripped content). The first is the C3 anchor;
+    # the rest are the walk's candidates.
+    window_region = [
+        line.rstrip() for line in node_lines[best_offset:best_offset + window]
+    ]
+    matched_positions = [
+        (node.line_start + best_offset + i, s.strip())
+        for i, (s, r) in enumerate(zip(snippet_lines[:window], window_region, strict=False))
+        if s.strip() == r.strip()
+    ]
+    if not matched_positions:
         return (node.line_start, node.line_end)
 
-    return (
-        max(node.line_start, block[0]),
-        min(node.line_end, block[1]),
-    )
+    block = None
+    for candidate_line, _content in matched_positions:
+        block = _find_enclosing_block(
+            original_code, language, candidate_line,
+            node.line_start, node.line_end,
+        )
+        if block:
+            break
+    if not block:
+        # No matched line sits inside any block; no AST edge bounds a
+        # smaller cut, so keep the whole node (the B27 contract).
+        return (node.line_start, node.line_end)
+
+    # Issue #12 follow-up, span extension: the cut must cover EVERY
+    # matched context line of the best window, not just the block edges —
+    # a context line above the block (the statement before the edited
+    # try, say) is a declared snippet anchor; leaving it outside the
+    # chunk makes the battery read it as a declared-new line missing from
+    # the merge and rejects every attempt. Extending to the matched span
+    # keeps the cut anchored on snippet-declared lines (never raw
+    # ±padding), so the B27 mid-block-cut hazard does not return.
+    start = max(node.line_start, min(matched_positions[0][0], block[0]))
+    end = min(node.line_end, max(matched_positions[-1][0], block[1]))
+    return (start, end)
 
 
 def _find_enclosing_parent(

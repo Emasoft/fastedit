@@ -8,15 +8,20 @@ format symbols only COUNTED declared-vs-deleted content lines — the
 truncated line counted as a new line covering the deletion, so the tail
 (``... config is valid.``) was dropped with exit 0.
 
-Part (b): ``fastedit diff`` diffed the current file against the NEWEST
+Part (b): ``fastedit diff`` used to diff the current file against the NEWEST
 backup (``BackupStore.peek``), i.e. against the LAST edit's pre-state. A
 loss from an EARLIER edit vanished from the diff as soon as any later edit
-landed — the diff showed only the newest intended hunk. The diff base is
-now the OLDEST surviving backup, so the rendered diff covers every change
-still in the undo history (context n stays the standard 3: adjacent hunks
-merge automatically, distant hunks each print in full — every changed line
+landed — the diff showed only the newest intended hunk. Issue #8 fixed that
+by diffing against the OLDEST surviving backup so the rendered diff covers
+every change still in the undo history.
+
+Issue #15 made that loss-detection view OPT-IN: the default base is now the
+NEWEST backup (`--base last`, exactly the last edit's change — what an
+agent verifying an edit expects), while `--base all` keeps the issue-#8
+whole-history view. Context n stays the standard 3: adjacent hunks merge
+automatically, distant hunks each print in full — every changed line
 appears as a removal or addition either way; the base, not the context,
-was the gap).
+was the gap.
 """
 
 from __future__ import annotations
@@ -182,7 +187,7 @@ class TestDiffCoverage:
         content = target.read_text()
         assert "a = 2" in content and "b = 2" not in content
 
-        diff = run_cli("diff", str(target))
+        diff = run_cli("diff", str(target), "--base", "all")
         assert diff.returncode == 0, diff.stderr
         # The removal from the EARLIER edit appears even though the newest
         # edit's pre-state still contained it.

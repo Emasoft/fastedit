@@ -113,8 +113,8 @@ fastedit edit src/app.py --replace handle_request --snippet '
 |---|---|
 | `read <file>` | Structure: full content (small files) or symbol map with line ranges |
 | `search <query> [path]` | Symbols, references, regex or hybrid matches (`--mode`, `--top-k`) |
-| `diff <file>` | Unified diff between the newest backup and the file (read-only) |
-| `edit <file>` | One edit: `--after` / `--replace SYMBOL` + `--snippet` |
+| `diff <file>` | Unified diff vs a pre-edit backup (read-only). `--base last` (default) = the NEWEST backup, i.e. the last edit's change; `--base all` = every change still in the undo history — loss detection across edits |
+| `edit <file>` | One edit: `--after` / `--replace SYMBOL` + `--snippet`; hermetic literal primitives `--insert-after`/`--insert-before LITERAL` and `--lines FROM:TO --delete` are 0 tokens |
 | `batch-edit <file>` | Ordered edits to ONE file: `--edits` JSON list (`-` for stdin) |
 | `multi-edit` | Edits across files, all-or-nothing: `--file-edits` JSON list |
 | `delete <file> <sym>` | Remove a symbol by AST; refuses while cross-file callers exist (`--force` skips the check) |
@@ -132,7 +132,7 @@ fastedit edit src/app.py --replace handle_request --snippet '
 | `mcp-install` | Write the MCP entry for Claude Code (`--scope user` or `project`) |
 | `init` | One-shot setup: install the fastedit agent skill for your coding agent |
 
-Workflow: `fastedit read` before writing, `--dry-run` where offered, then `fastedit diff` / `fastedit undo` to verify or step back.
+Workflow: `fastedit read` before writing, `--dry-run` where offered, then `fastedit diff` / `fastedit undo` to verify or step back. After SEVERAL edits on one file run `fastedit diff --base all` — the default diff base is the NEWEST backup (the last edit's change), so loss detection across the whole undo history needs `--base all` (base: the OLDEST backup).
 
 ## Validation & retries
 
@@ -180,6 +180,8 @@ writers.
 | `parse errors; refusing to write` | The edit introduced new syntax errors; fix the snippet; the file is unchanged |
 | `Symbol 'x' not found` | Check the name — the error lists available symbols; `fastedit read` shows the map |
 | `contains a keep-marker but the edit cannot be placed deterministically` / `has no definition` | The refusal names the fix (more surrounding unique lines, or the full replacement); or use `--after` to insert |
+| `literal not found: <lit>` | The `--insert-after`/`--insert-before` anchor must equal one line's FULL STRIPPED content; check `fastedit read` for the exact line |
+| `literal matches N lines` | The anchor is ambiguous — include more context in the literal, or target the spot with `--lines FROM:TO --delete` |
 | `Model not found locally` | `fastedit pull --model mlx-8bit` (Apple Silicon) or `--model bf16` (Linux/GPU) |
 | anything else | `fastedit doctor` |
 
