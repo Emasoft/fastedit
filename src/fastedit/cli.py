@@ -1313,6 +1313,18 @@ def _cmd_edit_locked(args):
             _print_edit_refusal(str(e))
             sys.exit(1)
         if result is not None:
+            # Issue #16 (defect 1): a deterministic result byte-identical to
+            # what was read is a NO-OP — the snippet restated the target's
+            # content unchanged. Report it truthfully (exit 0, no write) and
+            # never print the "Applied edit" success line for work that did
+            # not happen: the reported defect was exactly that success line
+            # followed by `fastedit diff` saying "No changes detected".
+            if result.merged_code == original_code:
+                print(
+                    "No change resulted from this edit (the snippet matches "
+                    "the current content). File untouched."
+                )
+                return
             try:
                 _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
             except ValueError as e:
@@ -1413,6 +1425,17 @@ def _cmd_edit_locked(args):
     # when none were consumed — shape stays stable). The retry budget itself
     # is resolved inside chunked_merge (FASTEDIT_MAX_RETRIES env or default).
     metrics += _validation_retries_metric(getattr(result, "retries", 0))
+    if result.merged_code == original_code and not getattr(result, "chunks_rejected", 0):
+        # Issue #16 (defect 1): the merge validated clean but produced
+        # byte-identical output — a true no-op, not an error. Report it
+        # truthfully (exit 0, nothing written) instead of the "Applied
+        # edit" success line the issue flagged as the worst failure class
+        # for a write tool.
+        print(
+            "No change resulted from this edit (the snippet matches the "
+            "current content). File untouched."
+        )
+        return
     if getattr(result, "chunks_rejected", 0):
         print(
             f"Warning: {result.chunks_rejected}/{result.chunks_used} chunk(s) rejected. "

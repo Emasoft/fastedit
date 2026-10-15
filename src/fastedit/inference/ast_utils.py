@@ -774,6 +774,99 @@ def _json_pair_name(node, language: str, source_bytes: bytes) -> str:
     return _strip_quote_pair(_node_text(key, source_bytes))
 
 
+def _snippet_head_is_same_kind_definition(
+    snippet: str,
+    anchor: ASTNode,
+    language: str,
+    anchor_line: str | None = None,
+) -> bool:
+    """True when the snippet's first line is a definition line of the SAME
+    kind as ``anchor`` (issue #16, defect 3).
+
+    Decided declaratively from the format spec table — never per-format
+    branches (repo no-hardcoding rule). ``definition_line_required`` marks
+    exactly the formats whose symbol's FIRST line is its naming line (a
+    markdown heading, a TOML ``[table]`` header, a JSON/YAML key line, an
+    SQL ``CREATE TABLE``, an HTML open tag). For those formats the
+    question "is the snippet's head a definition line of the same kind?"
+    is answered by re-parsing the snippet's first non-blank line with the
+    format's own extractor:
+
+      * it must yield a NON-EMPTY name from the anchor's format extractor
+        (same-kind definition head, any name — a new heading added after
+        an existing one is the reported shape)
+      * generic formats whose extractor reads the naming construct (the
+        ``[table]`` header, the ``"key":`` line) satisfy the same
+        property through the same parse: they must yield a NON-EMPTY
+        name from the anchor's format extractor.
+
+    Used by the ``after=`` fast path to distinguish the reported
+    duplication shape — inserting a ``#### S001`` heading after the
+    ``## Scenario`` symbol must land after the heading LINE, not after
+    the section's 60-line span — from an ordinary non-definition insert,
+    which keeps the span-end semantics.
+    """
+    spec = _FORMAT_SYMBOL_SPECS.get(language)
+    if (
+        spec is None
+        or not spec.definition_line_required
+        or not spec.after_insert_at_definition_line
+    ):
+        # Every format whose "after the symbol" reads as "after the SPAN
+        # end" returns False BEFORE any parse — span-end semantics hold
+        # regardless of snippet head shape (the declarative discriminator
+        # is the spec row's ``after_insert_at_definition_line`` flag).
+        return False
+    head = next(
+        (ln for ln in snippet.splitlines() if ln.strip()), ""
+    )
+    if not head.strip():
+        return False
+    try:
+        from ..data_gen.ast_analyzer import parse_code
+
+        source_bytes = head.encode("utf-8")
+        tree = parse_code(head, language)
+    except Exception:  # noqa: BLE001 -- a fragment parse is best-effort evidence: on any resolver/grammar failure the conservative span-end semantics apply
+        return False
+
+    def _walk(node):
+        if node.start_point[0] == 0:
+            name = spec.extract(node, language, source_bytes)
+            # ANY non-empty name qualifies for the flagged format: the
+            # reported shape is a NEW heading (#### S001) inserted after an
+            # existing one (## Scenario) — the names differ, only the KIND
+            # must match. This canonical check runs ONLY for the spec row
+            # that declares ``after_insert_at_definition_line`` — every
+            # other format returned False before reaching this parse.
+            if name:
+                return node
+        for child in node.children:
+            found = _walk(child)
+            if found is not None:
+                return found
+        return None
+
+    matched = _walk(tree.root_node)
+    if matched is None:
+        return False
+    if spec.snippet_head_nests is not None:
+        if anchor_line is None:
+            return False
+        # The head must NEST inside the anchor (markdown: a deeper heading
+        # is a subsection landing right after the naming line). A
+        # same-depth sibling head — the golden-pinned shape — keeps the
+        # span-end semantics.
+        return spec.snippet_head_nests(head, anchor_line)
+    return True
+
+
+def _json_pair_name(node, language: str, source_bytes: bytes) -> str:
+    """Name of a JSON pair: its key, unquoted."""
+    key = node.child_by_field_name("key")
+    return _strip_quote_pair(_node_text(key, source_bytes))
+
+
 def _yaml_key_name(node, language: str, source_bytes: bytes) -> str:
     """Name of a YAML block-mapping pair: its key, unquoted."""
     key = node.child_by_field_name("key")
@@ -910,6 +1003,28 @@ class _FormatSymbolSpec:
     kind_by_node: dict[str, str] = field(default_factory=dict)
     trim_trailing_blank_lines: bool = False
     definition_line_required: bool = False
+    # True only where "after the symbol" reads as "after the naming line" —
+    # markdown headings — instead of the span end. Declarative; no
+    # per-format branches.
+    after_insert_at_definition_line: bool = False
+    # Registered pure predicate ``(head_line, anchor_line) -> bool`` deciding
+    # whether the snippet head's definition NESTS inside the anchor (a
+    # deeper heading is a subsection that belongs right after the anchor's
+    # naming line). ``None`` lets any same-kind head qualify.
+    snippet_head_nests: Callable[[str, str], bool] | None = None
+
+
+def _markdown_head_nests_in_anchor(head_line: str, anchor_line: str) -> bool:
+    """Markdown nesting: the head heading is DEEPER than the anchor's.
+
+    ``#### S001`` inserted after ``## Scenario`` is a subsection of the
+    Scenario section — it belongs immediately after the naming line; a
+    same-level ``## Troubleshooting`` is a sibling section that belongs
+    after the whole span (the pinned golden semantics).
+    """
+    head_depth = len(head_line.strip()) - len(head_line.strip().lstrip("#"))
+    anchor_depth = len(anchor_line.strip()) - len(anchor_line.strip().lstrip("#"))
+    return head_depth > anchor_depth
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1103,8 @@ _FORMAT_SYMBOL_SPECS: dict[str, _FormatSymbolSpec] = {
         recurse=True,
         trim_trailing_blank_lines=True,
         definition_line_required=True,
+        after_insert_at_definition_line=True,
+        snippet_head_nests=_markdown_head_nests_in_anchor,
     ),
     "json": _FormatSymbolSpec(
         node_types=("pair",),

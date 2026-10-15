@@ -10,7 +10,9 @@ Works across all 16 languages supported by tldr.
 
 from __future__ import annotations
 
+import difflib
 import itertools
+import math
 import os
 import re
 from collections import Counter
@@ -42,6 +44,7 @@ from .ast_utils import (  # noqa: F401
     _call_symbol_snippet_top_level_names,
     _qualified_symbol_names,
     _resolve_symbol,
+    _snippet_head_is_same_kind_definition,
     get_ast_map,
     get_ast_map_from_source,
 )
@@ -370,6 +373,78 @@ def _complete_restatement_removals(
     return uncovered
 
 
+def _leading_restatement_gap_unjustified(
+    original_func: str,
+    tokens: list[tuple[str, int | None, str | None]],
+) -> str | None:
+    """Decline a WHOLESALE-FRAGMENT restatement rewrite (issue #16, defect 4).
+
+    The defect-4 shape: a ``replace=`` snippet that restates the target
+    span's LEADING content (its anchors form a consecutive run starting at
+    the span's first content line) and, within that restated run, declares
+    a NEW line between two anchors — while the original line(s) between
+    those anchors are left UNMENTIONED. The editor implements such a
+    snippet as a conservative insertion (the unmentioned original survives
+    beside the declared new line), silently turning a replacement intent
+    into a duplication — and the deterministic path ratifies a wholesale
+    rewrite with 0 model tokens while the same shape through the model
+    path (a merge that drops the line) is rejected. Same input, different
+    verdict: the exact nondeterminism the issue pins.
+
+    The fix reads as one declarative rule over the editor's own token
+    binding: with a leading restated run of >= 2 anchors and an embedded
+    declared NEW line, the gap's dropped originals must be justified by
+    the battery's own rules — a unique keyed identity or a high-similarity
+    rename pairing (:func:`_find_rename_pairs`), computed with the SAME
+    call the battery uses, so both gates can never disagree. A wholly
+    different replacement line has neither → the deterministic path
+    declines and the model path's merge is judged by the battery.
+
+    Partial snippets anchored around an insertion point (no leading
+    restatement), trailing-appends (no embedded new line between anchors),
+    complete symbol re-definitions (direct-swap's structural proof) and
+    anything marker-bearing keep their existing semantics.
+    """
+    orig, _orig_raw = _raw_content_lines(original_func)
+    # Leading consecutive context-anchored run: snippet content anchored
+    # to orig[0..idx-1] in order.
+    idx = 0
+    i = 0
+    while i < len(tokens) and tokens[i][0] == "context" and tokens[i][1] == idx:
+        idx += 1
+        i += 1
+    if idx < 2 or i >= len(tokens) or tokens[i][0] != "new":
+        return None  # no leading restated run, or the next token is not new
+    seg_tokens: list[tuple[str, int | None, str | None]] = []
+    while i < len(tokens) and tokens[i][0] != "context":
+        seg_tokens.append(tokens[i])
+        i += 1
+    seg_new = [t[2] for t in seg_tokens if t[0] == "new" and t[2]]
+    if not seg_new:
+        return None
+    # The embedded new line must be BRACKETED on both sides by declared
+    # anchors within the restated run — an unbracketed (trailing or
+    # marker-terminated) declaration is an ordinary insertion, whose
+    # preserve-the-remainder semantics are the editor's contract, never a
+    # restatement gap.
+    if i >= len(tokens) or tokens[i][0] != "context":
+        return None
+    next_anchor = tokens[i][1]
+    if not isinstance(next_anchor, int) or next_anchor <= idx:
+        return None  # nothing dropped inside the embedded gap
+    if any(t[0] == "marker" for t in seg_tokens):
+        return None  # a marker gap declares keep-the-rest, not a rewrite
+    dropped_local = list(range(next_anchor - idx))
+    return _unjustified_deletion_reason(
+        orig[idx:next_anchor],
+        dropped_local,
+        seg_new,
+        [], [],
+        allow_positional=False,
+        allow_complete_replacement=False,
+    )
+
+
 def _deterministic_result_is_faithful(
     original_func: str,
     edited: str,
@@ -479,6 +554,44 @@ def _deterministic_result_unfaithful_reason(
         else:
             tokens.append(("new", None, line.strip()))
 
+    # Issue #16 (defect 4), marker-free snippets only — a marker-bearing
+    # snippet declares keep-the-rest semantics where completeness arithmetic
+    # does not apply. A snippet that restates the WHOLE target span (every
+    # content line except exactly one is a declared context anchor) and
+    # declares exactly one new line has only ONE consistent reading — that
+    # line was REPLACED. The editor implements it as a conservative
+    # insertion (the unmentioned original survives beside the new line),
+    # silently turning a replacement intent into a duplication — ratifying
+    # a wholesale rewrite with 0 model tokens. The replacement is justified
+    # ONLY by the battery's own declarative rules — a unique keyed identity
+    # or a high-similarity rename pairing (:func:`_find_rename_pairs`) — so
+    # anything else (the "Complete the onboarding survey..." shape) fails
+    # closed and falls to the model, whose merge the battery then judges.
+    if not any(t[0] == "marker" for t in tokens):
+        orig, _orig_raw = _raw_content_lines(original_func)
+        removals = _complete_restatement_removals(orig, tokens)
+        if removals:
+            new_lines = [t[2] for t in tokens if t[0] == "new" and t[2]]
+            justification = _unjustified_deletion_reason(
+                orig, removals, new_lines, [], [],
+                allow_positional=False,
+                allow_complete_replacement=False,
+            )
+            if justification is not None:
+                return (
+                    "whole-span restatement: the snippet restates the "
+                    "entire target span except one line, so that line can "
+                    f"only have been replaced — and {justification}. A "
+                    "replacement is justified only by a uniquely keyed "
+                    "identity with the declared new line or by a "
+                    "high-similarity rename pairing"
+                )
+        fragment_reason = _leading_restatement_gap_unjustified(
+            original_func, tokens,
+        )
+        if fragment_reason is not None:
+            return fragment_reason
+
     return _hallucination_reason(
         original_func, edited, snippet, tokens=tokens,
     )
@@ -541,7 +654,6 @@ def _snippet_splice_covers_deleted_lines(
         c[2] for c in classified
         if c[0] == "context" and c[2] in content_idx
     }
-    deleted = [ci for ri, ci in content_idx.items() if ri not in bound]
     new_lines = [c for c in classified if c[0] == "new"]
 
     # Issue #8: a snippet ending MID-SENTENCE — its final content line a
@@ -569,7 +681,22 @@ def _snippet_splice_covers_deleted_lines(
                 if orig_line.startswith(last_new) and len(last_new) < len(orig_line):
                     return False
 
-    return len(deleted) <= len(new_lines)
+    # Issue #16 (defect 2): a deleted original the snippet restates with a
+    # token RENAMED is covered by a declared new line through the SAME
+    # declarative rename pairing the content validator consumes
+    # (:func:`_find_rename_pairs`) — one-to-one, similarity-thresholded,
+    # capped. This is the direct-swap analogue of the battery gate: the
+    # swap deletes one original and adds one renamed replacement, so the
+    # count arithmetic must credit the pair.
+    seg_orig = [raw_lines[ri].strip() for ri in content_idx]
+    deleted_idx = [ci for ri, ci in content_idx.items() if ri not in bound]
+    seg_new = [
+        c[3].strip() for c in classified
+        if c[0] == "new" and (c[3] or "").strip()
+    ]
+    rename_pairs = _find_rename_pairs(seg_orig, deleted_idx, seg_new)
+    covered = len(deleted_idx) - len(rename_pairs)
+    return covered <= len(new_lines)
 
 
 def _strip_leading_doc_duplicate(
@@ -1435,6 +1562,142 @@ def _deletions_justified(
     ) is None
 
 
+_RENAME_MIN_LINE_CHARS = 12
+"""Minimum stripped-line length for a rename pairing (issue #16, defect 2).
+
+Similarity on very short lines is unstable noise: ``return x`` vs
+``return x + 1`` scores 0.80 and ``validate(x)`` vs ``audit(x)`` scores
+0.79 — both below this line's 12-character floor together with the ratio
+thresholds (which exist for the same reason). A line short enough to be
+ambiguously similar is content the battery must not re-classify as a
+rename; such edits keep their pre-#16 refusal semantics (a full
+replacement body or a marker is the sanctioned way to express them).
+"""
+
+_RENAME_MAX_SEGMENT_FRACTION = 0.25
+"""Cap on renamed lines per segment, as a fraction of its content lines
+(issue #16, defect 2 constraint iii). Without the cap a snippet that
+"renames" most of a segment is a rewrite wearing a rename's clothes — the
+pairing must never become a fuzz pass that accepts rewrites. 25% keeps
+the canonical rename shapes (one token in a prose section, a heading
+token, a couple of URLs) far under the ceiling while a wholesale
+restatement exceeds it and fails closed."""
+
+_RENAME_QUICK_RATIO_MIN = 0.80
+"""The quick-similarity pre-filter threshold (issue #16, defect 2). A
+candidate new line whose ``quick_ratio`` against the dropped original is
+below this can never reach the full-ratio threshold and is discarded
+without the full match computation."""
+
+_RENAME_RATIO_MIN = 0.92
+"""The full-similarity threshold for a justified rename (issue #16,
+defect 2): the snippet's new line must be a NEAR restatement of the
+dropped original — the same line with a token renamed — not merely
+similar. Calibrated against the pinned refusals AND acceptances
+(monitor both sides): ``return x`` vs ``return x + 1`` scores 0.80 and
+``validate(x)`` vs ``audit(x)`` 0.79 — far below, keep failing closed;
+``step-1500`` vs ``step-1500-rewritten`` scores 0.8913 and the pinned
+``midnight``/``dawn`` prose 0.9130 — below, so an undeclared mutation and
+a prose-value swap keep failing closed (issue #12); while the issue's own
+``appUrl`` → ``dashboardUrl`` shape scores 0.9242 — just above, so the
+canonical rename lands."""
+
+
+def _rename_similarity(original_line: str, new_line: str) -> float:
+    """Character similarity of two stripped lines via difflib (issue #16).
+
+    :class:`difflib.SequenceMatcher` is the stdlib's own restatement
+    measure — no second similarity model, matching the repo doctrine that
+    the validator maintains no language model. ``autojunk=False`` keeps
+    the popular-element heuristic off: snippet lines are short enough that
+    autojunk's frequency table can distort the ratio on prose.
+    """
+    return difflib.SequenceMatcher(
+        None, original_line.strip(), new_line.strip(), autojunk=False,
+    ).ratio()
+
+
+def _rename_quick_similarity(original_line: str, new_line: str) -> float:
+    """The cheap upper-bound similarity pre-filter (issue #16).
+
+    ``SequenceMatcher.quick_ratio()`` is an upper bound on ``ratio()``; the
+    pairing pass runs it FIRST so a candidate that cannot possibly reach
+    the ratio threshold never pays the full match computation.
+    """
+    return difflib.SequenceMatcher(
+        None, original_line.strip(), new_line.strip(), autojunk=False,
+    ).quick_ratio()
+
+
+def _find_rename_pairs(
+    orig_seg: list[str],
+    deleted: list[int],
+    new_all: list[str],
+) -> dict[int, int]:
+    """The RENAME-AWARE pairing pass for one protected segment (issue #16).
+
+    For each deleted identity-free original the exact-line battery treats
+    as "unmentioned", look for a declared new line that is a near
+    restatement of it — the snippet restate the line WITH a token renamed
+    (the issue's ``${appUrl}/contact`` → ``${dashboardUrl}/contact``
+    shape). A deleted original O and a declared new line N form a
+    JUSTIFIED RENAME pair iff all of:
+
+      * ``len(O.strip()) >= _RENAME_MIN_LINE_CHARS`` — short lines have
+        unstable similarity (see the constant's rationale);
+      * O has no exact survivor in the segment (the caller only routes
+        identity-free drops here — an exact restatement is in-place
+        replacement, never a rename);
+      * ``quick_ratio(O, N) >= 0.80`` AND ``ratio(O, N) >= 0.85`` on the
+        stripped lines (issue #16 thresholds; ``quick_ratio`` runs first
+        as the cheap pre-filter);
+      * the pairing is ONE-TO-ONE and UNAMBIGUOUS — each original pairs at
+        most one new line and each new line at most one original; when two
+        or more qualifying new lines compete for the same original the
+        pairing fails closed instead of guessing which one replaced it;
+      * the segment-wide rename cap holds: at most
+        ``ceil(_RENAME_MAX_SEGMENT_FRACTION * len(orig_seg))`` pairs.
+
+    Returns ``{deleted_original_index: new_line_index}`` for the accepted
+    pairs only; candidates that fail any condition are simply not paired,
+    and their deletions keep failing closed exactly as before. The pairing
+    replaces the per-line justification ONLY — every other battery gate
+    (relative parse, survivor order, indent deltas, marker side-order,
+    declared-new equality) applies unchanged, and the merged output must
+    still satisfy the relative parse gate + trait battery.
+    """
+    if not deleted or not new_all:
+        return {}
+    cap = max(1, math.ceil(_RENAME_MAX_SEGMENT_FRACTION * len(orig_seg)))
+    pairs: dict[int, int] = {}
+    used_new: set[int] = set()
+    for i in deleted:  # in segment order — the pairing is deterministic
+        original_line = orig_seg[i].strip()
+        if len(original_line) < _RENAME_MIN_LINE_CHARS:
+            continue
+        candidates: list[int] = []
+        for j, new_line in enumerate(new_all):
+            if j in used_new or not new_line:
+                continue
+            if _rename_quick_similarity(original_line, new_line) < _RENAME_QUICK_RATIO_MIN:
+                continue
+            if _rename_similarity(original_line, new_line) < _RENAME_RATIO_MIN:
+                continue
+            candidates.append(j)
+        # Ambiguity fails closed (issue #16 constraint i): two or more
+        # near-restatements competing for one original cannot be told
+        # apart — pairing either would be a guess about which one replaced
+        # the line. Likewise a new line already claimed by an earlier
+        # original is out of the pool, so many-to-one is impossible.
+        if len(candidates) != 1:
+            continue
+        pairs[i] = candidates[0]
+        used_new.add(candidates[0])
+        if len(pairs) >= cap:
+            break
+    return pairs
+
+
 def _unjustified_deletion_reason(
     orig_seg: list[str],
     deleted: list[int],
@@ -1511,6 +1774,18 @@ def _unjustified_deletion_reason(
         positional.append(i)
 
     if not positional:
+        return None
+
+    # Issue #16 (defect 2): a dropped identity-free original whose snippet
+    # declares a NEAR-RESTATEMENT of it is a justified RENAME — the issue's
+    # '${appUrl}/contact' → '${dashboardUrl}/contact' prose shape, which the
+    # exact-line battery read as an unmentioned drop on every retry. The
+    # pairing is declarative and bounded (see _find_rename_pairs): one-to-one
+    # only, minimum line length, similarity thresholds, and a per-segment cap
+    # so it can never become a rewrite-accepting fuzz pass. Unpaired drops
+    # keep failing closed below, and every other gate still applies.
+    rename_pairs = _find_rename_pairs(orig_seg, positional, new_all)
+    if rename_pairs and len(rename_pairs) == len(positional):
         return None
 
     if not allow_positional:
@@ -2027,6 +2302,12 @@ def _snippet_justifiable_removals(
         whose own shape declares an insertion-only wrap
         (:func:`_tokens_declare_insertion_only`) — the same switch the
         content validator uses.
+      * **rename capacity** (issue #16, defect 2) — identity-free
+        originals paired with a near-restatement declared new line by
+        :func:`_find_rename_pairs`, the SAME declarative pairing the
+        content validator consumes (one-to-one, similarity thresholds,
+        per-segment cap), so the trait gate and the content gate can
+        never disagree about which removal a rename justifies.
 
     Segments are sliced exactly like :func:`_build_segments` (leading,
     between consecutive anchors, trailing), so per-segment caps match the
@@ -2126,6 +2407,26 @@ def _snippet_justifiable_removals(
     # declares. Crediting it here makes the trait arithmetic the exact
     # replace-one-line-with-one-line arithmetic on structureless files.
     removable.update(_complete_restatement_removals(orig, raw_tokens))
+
+    # Rename capacity (issue #16, defect 2): the SAME declarative pairing
+    # the content validator's deletion gate consumes
+    # (:func:`_find_rename_pairs`), applied per segment so the caps and the
+    # one-to-one constraint match exactly. Without this the D1 trait gate
+    # would count the dropped original's traits as unexplained while the
+    # content gate had (correctly) accepted the rename — two gates
+    # disagreeing about the same snippet.
+    for seg_rank, lo, hi in segments:
+        if lo >= hi:
+            continue
+        seg_tokens = groups.get(seg_rank, [])
+        seg_new = [
+            t[2] for t in seg_tokens if t[0] == "new" and t[2] is not None
+        ]
+        seg_orig = orig[lo:hi]
+        deleted = list(range(hi - lo))
+        pairs = _find_rename_pairs(seg_orig, deleted, seg_new)
+        for i in pairs:
+            removable.add(lo + i)
     return [orig_raw[i] for i in sorted(removable)]
 
 
@@ -3024,10 +3325,35 @@ def chunked_merge(
                 f"Available: {available}"
             )
 
-        # Insert after the anchor's last line
-        anchor_end = anchor_node.line_end  # 1-indexed
-        before = original_lines[:anchor_end]
-        after_lines = original_lines[anchor_end:]
+        # Insert after the anchor's last line — UNLESS the anchor is a
+        # format symbol whose FIRST line is its naming line
+        # (``definition_line_required``) and the snippet's first line is
+        # itself a definition line of the same kind naming the same
+        # symbol (issue #16, defect 3): the reported duplication shape,
+        # ``--snippet '#### S001: ...' --after 'Scenario: ...'`` landed
+        # the new heading at the END of the section span (60 lines away),
+        # duplicating the S001 heading. "After the symbol" for such
+        # snippets reads as "after the symbol's DEFINITION LINE". The
+        # decision is declarative (the format spec table + the same
+        # extractor that names the symbol), never per-format branches.
+        insert_after_line = anchor_node.line_end
+        head_at_definition_line = _snippet_head_is_same_kind_definition(
+            snippet_text, anchor_node, language or "",
+            anchor_line=(
+                original_lines[anchor_node.line_start - 1]
+                if anchor_node.line_start - 1 < len(original_lines) else ""
+            ),
+        )
+        if head_at_definition_line:
+            insert_after_line = anchor_node.line_start
+            _log.info(
+                "Fast-path insert after '%s': snippet head restates the "
+                "symbol's definition line — inserting after L%d (the "
+                "definition line) instead of the span end L%d",
+                after, insert_after_line, anchor_node.line_end,
+            )
+        before = original_lines[:insert_after_line]
+        after_lines = original_lines[insert_after_line:]
 
         # Align snippet indent to match the anchor's indent level.
         anchor_start_idx = anchor_node.line_start - 1
@@ -3045,7 +3371,36 @@ def chunked_merge(
 
         # Ensure blank line separator before and after the new code —
         # spelled with the file's own ending, never a hardcoded "\n".
-        separator = [line_ending] if before and before[-1].strip() != "" else []
+        # Definition-line landing (issue #16 defect 3): the new content
+        # belongs DIRECTLY after the anchor's naming line (a subsection
+        # heading sits with its parent heading, no blank between), so the
+        # leading separator is suppressed there.
+        at_definition_line = head_at_definition_line
+        if at_definition_line:
+            # No-duplicate invariant (issue #16 defect 3): when the snippet's
+            # head definition line ALREADY exists inside the anchor span
+            # (the reported shape — the '#### S001' heading re-inserted after
+            # its own parent section), the splice must not create a SECOND
+            # copy. The pre-existing identical line is dropped so the head
+            # lands exactly once, at the definition line. Only the head line
+            # participates — the snippet's remaining lines are new content.
+            snippet_head_line = next(
+                (ln.rstrip("\r\n") for ln in snippet_parts if ln.strip()), None,
+            )
+            if snippet_head_line is not None:
+                # The pre-existing copy lies INSIDE the anchor span; given
+                # the definition-line insertion point it is AFTER the splice
+                # slot — drop it from `after_lines` (never from `before`,
+                # which ends at the naming line by construction).
+                for i, ln in enumerate(after_lines):
+                    if ln.strip() == snippet_head_line.strip():
+                        after_lines = [
+                            l2 for j, l2 in enumerate(after_lines) if j != i
+                        ]
+                        break
+        separator = [] if at_definition_line else (
+            [line_ending] if before and before[-1].strip() != "" else []
+        )
         trailing = [line_ending] if after_lines and after_lines[0].strip() != "" else []
 
         result_lines = before + separator + snippet_parts + trailing + after_lines
@@ -3076,7 +3431,7 @@ def chunked_merge(
 
         _log.info(
             "Fast-path insert after '%s' (L%d): %d snippet lines, 0 model tokens",
-            after, anchor_end, len(snippet_parts),
+            after, insert_after_line, len(snippet_parts),
         )
         return ChunkedMergeResult(
             merged_code=merged,
