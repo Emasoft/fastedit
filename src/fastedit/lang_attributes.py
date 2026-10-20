@@ -277,6 +277,7 @@ def _md_structure_traits(
     text: str,
     *,
     fragment: bool = False,
+    target_starts_with_frontmatter: bool | None = None,
 ) -> list[AttributeTrait]:
     """The markdown structure traits: frontmatter + fenced code blocks.
 
@@ -330,9 +331,18 @@ def _md_structure_traits(
                 add("md_frontmatter_key", records[i][0], records[i])
             add("md_frontmatter_delim", records[close_idx][0], records[close_idx])
     elif fragment:
-        for record in records:
-            if _FRONTMATTER_KEY_RE.match(record[0]):
-                add("md_frontmatter_key", record[0], record)
+        # Issue #19 (defect 1): a fragment that does NOT start with ``---``
+        # may be honest prose — "questions:" / "Why:" are key:-shaped splits
+        # of a wrapped paragraph. A key-shaped line declares a frontmatter-
+        # key trait only when the caller vouches that the TARGET DOCUMENT
+        # starts with a frontmatter block (``target_starts_with_frontmatter``
+        # — declared_changes_from_text derives it from the original bytes).
+        # ``None`` (no vouch — back-compatibility default for standalone
+        # extract_attributes callers) keeps the legacy declare behavior.
+        if target_starts_with_frontmatter is not False:
+            for record in records:
+                if _FRONTMATTER_KEY_RE.match(record[0]):
+                    add("md_frontmatter_key", record[0], record)
 
     # --- fenced code blocks ---
     in_fence = False
@@ -692,6 +702,7 @@ def _regex_traits(
     spec: _FormatSpec,
     *,
     fragment: bool = False,
+    target_starts_with_frontmatter: bool | None = None,
 ) -> list[AttributeTrait]:
     traits: list[AttributeTrait] = []
     for pattern in spec.patterns:
@@ -706,7 +717,13 @@ def _regex_traits(
                 pattern.kind, _pattern_value(pattern, match), start, end, raw,
             ))
     if spec.structure is not None:
-        traits.extend(spec.structure(text, fragment=fragment))
+        traits.extend(
+            spec.structure(
+                text,
+                fragment=fragment,
+                target_starts_with_frontmatter=target_starts_with_frontmatter,
+            )
+        )
     traits.sort(key=lambda t: (t.start, t.end))
     return traits
 
@@ -716,6 +733,7 @@ def extract_attributes(
     format: str,
     *,
     fragment: bool = False,
+    target_starts_with_frontmatter: bool | None = None,
 ) -> list[AttributeTrait]:
     """Extract the language-attribute/structure traits of ``text``.
 
@@ -741,7 +759,10 @@ def extract_attributes(
         ast_traits = _ast_traits(text, spec)
         if ast_traits is not None:
             return ast_traits
-    return _regex_traits(text, spec, fragment=fragment)
+    return _regex_traits(
+        text, spec, fragment=fragment,
+        target_starts_with_frontmatter=target_starts_with_frontmatter,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +799,7 @@ def declared_changes_from_text(
     declared_text: str,
     removable_text: str,
     format: str,
+    target_starts_with_frontmatter: bool | None = None,
 ) -> DeclaredChanges:
     """Build :class:`DeclaredChanges` from the op's raw text (Step D3).
 
@@ -790,11 +812,17 @@ def declared_changes_from_text(
     if fmt not in _FORMAT_SPECS:
         return DeclaredChanges()
     declared = tuple(
-        extract_attributes(declared_text, fmt, fragment=True)
+        extract_attributes(
+            declared_text, fmt, fragment=True,
+            target_starts_with_frontmatter=target_starts_with_frontmatter,
+        )
         if declared_text else ()
     )
     removable = tuple(
-        extract_attributes(removable_text, fmt, fragment=True)
+        extract_attributes(
+            removable_text, fmt, fragment=True,
+            target_starts_with_frontmatter=target_starts_with_frontmatter,
+        )
         if removable_text else ()
     )
     families: frozenset[str] = frozenset()

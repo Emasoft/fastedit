@@ -2494,6 +2494,12 @@ def _derived_attribute_changes(original_code: str, snippet: str, fmt: str | None
     The snippet classification is the SAME one the content validator uses
     (:func:`_classify_snippet_raw`), so the two gates can never disagree
     about which lines the op declares.
+
+    Issue #19 (defect 1): the ORIGINAL bytes are visible here, so the
+    markdown frontmatter-key declaration of a fragment is vouched — a
+    ``key:``-shaped prose line (a wrapped paragraph's second line) in a
+    document WITHOUT frontmatter is not a frontmatter key, and declaring
+    it as one refused every otherwise-correct merge.
     """
     from ..lang_attributes import declared_changes_from_text
 
@@ -2504,6 +2510,9 @@ def _derived_attribute_changes(original_code: str, snippet: str, fmt: str | None
         snippet,
         "".join(line + "\n" for line in removable_lines),
         fmt,
+        target_starts_with_frontmatter=original_code.lstrip("\ufeff").startswith(
+            "---",
+        ),
     )
 
 
@@ -3941,6 +3950,7 @@ def chunked_merge(
         attempts = 0
         whole_tokens = 0
         whole_latency = 0.0
+        prev_reason: str | None = None
         for attempt in range(max_retries + 1):
             result = merge_fn(safe_code, attempt_snippet, language)
             attempts += 1
@@ -3967,6 +3977,25 @@ def chunked_merge(
                 "Whole-file merge attempt %d/%d rejected: %s",
                 attempt + 1, max_retries + 1, reason,
             )
+            # Issue #19 (defect 2): when the battery rejects the SAME way
+            # on consecutive attempts (observed hopeless shape: an M-lines
+            # -> N-line markdown rewording whose declared new line cannot
+            # be honored without dropping the reworded originals — every
+            # attempt burned minutes of model work and the report measured
+            # 11 to 20 minutes per refusal), the retry budget cannot
+            # change the verdict. Stop EARLY (2 consecutive identical
+            # rejections) — the loop's exhaustion path below still refuses
+            # with the same bookkeeping and the same named reason. A
+            # converging merge never hits this: its rejection reason
+            # changes between attempts or disappears.
+            if reason == prev_reason:
+                _log.warning(
+                    "Whole-file merge rejected the same way %d attempt(s) "
+                    "in a row (%s) — stopping retries early",
+                    2, reason,
+                )
+                break
+            prev_reason = reason
             attempt_snippet = _append_corrective_note(safe_snippet, reason)
 
         if reason is not None:
@@ -4123,6 +4152,7 @@ def chunked_merge(
         chunk_tokens = 0
         chunk_latency = 0.0
         reason: str | None = None
+        prev_reason: str | None = None
         for attempt in range(max_retries + 1):
             result = merge_fn(escaped_chunk, prompt_snippet, language)
             attempts += 1
@@ -4158,6 +4188,18 @@ def chunked_merge(
                 chunk.start_line, chunk.end_line,
                 attempt + 1, max_retries + 1, reason,
             )
+            # Issue #19 (defect 2): same reason twice in a row = a hopeless
+            # shape (see the whole-file twin above for the rationale) —
+            # stop burning the retry budget's remaining model calls and
+            # go straight to the exhaustion bookkeeping below.
+            if reason == prev_reason:
+                _log.warning(
+                    "Chunk %d-%d rejected the same way %d attempt(s) in a "
+                    "row (%s) — stopping retries early",
+                    chunk.start_line, chunk.end_line, 2, reason,
+                )
+                break
+            prev_reason = reason
             prompt_snippet = _append_corrective_note(safe_chunk_snippet, reason)
 
         total_tokens += chunk_tokens

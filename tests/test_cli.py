@@ -2671,7 +2671,10 @@ class TestCLIEditInsertAfterBefore:
         )
         assert result.returncode == 1
         assert "literal matches 2 lines" in result.stderr
-        assert "include more context" in result.stderr
+        # Issue #18: the refusal now spells BOTH remedies — the '#N'
+        # ordinal suffix on the literal, or --lines FROM:TO.
+        assert "#1" in result.stderr and "#2" in result.stderr
+        assert "--lines" in result.stderr
         assert "--lines" in result.stderr
         assert target.read_text(encoding="utf-8") == code
 

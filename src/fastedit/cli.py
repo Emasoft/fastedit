@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.resources
+import re
 import sys
 from pathlib import Path
 
@@ -641,6 +642,22 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
             f"Available: {available}",
             file=sys.stderr,
         )
+        # Issue #18: nested definitions (functions/methods declared INSIDE
+        # a function body) are not top-level addressable symbols, so a name
+        # that exists only nested is reported missing by design. Say so and
+        # hand over the working recipe instead of a bare not-found that
+        # agents retry for hours.
+        print(
+            "Note: definitions nested INSIDE another function's body are "
+            "not independently addressable symbols. To edit one, target "
+            "the ENCLOSING symbol (--replace <enclosing>) and restate it, "
+            "or use the hermetic literal primitives: "
+            "`fastedit edit <file> --replace-literal '<line>' "
+            "--snippet '<new line>'` (add '#N' to the literal for the "
+            "Nth occurrence of a repeated line), or "
+            "`--lines FROM:TO --snippet/--delete`.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     func_start = target_node.line_start - 1  # 0-indexed
@@ -920,6 +937,11 @@ _EDIT_REFUSAL_DIFF_NOTE = (
     "show no changes."
 )
 
+_DELETION_REFUSAL_RE = re.compile(
+    r"unmentioned original line dropped|dropped without a unique |"
+    r"can only have been replaced",
+)
+
 
 def _print_edit_refusal(message: str) -> None:
     """Print a refusal line plus the unchanged-file/diff guidance (issue #12).
@@ -951,6 +973,70 @@ def _refuse_if_edit_broke_parse(path, original_code, merged_code, language):
     raise ValueError(
         f"merged output for {path} has parse errors; refusing to write. "
         f"The file is unchanged."
+    )
+
+
+def _blank_only_noop_note(
+    original_code: str,
+    original_lines: list[str],
+    snippet: str,
+    replace_sym: str | None,
+    language: str | None,
+    path,
+) -> str | None:
+    """Issue #21: the honest message when a no-op differs only in blanks.
+
+    A ``--replace`` edit whose snippet differs from the target's text ONLY
+    in blank line counts is reported as a no-op — the leading blank lines
+    before a symbol sit OUTSIDE the symbol's span (the span starts at the
+    definition line), so no symbol-targeted edit can change them. Return
+    that explanation plus the working recipe (--lines FROM:TO --delete)
+    when BOTH hold: the content-normalized snippet equals the
+    content-normalized span (or whole file, when the model path reported
+    the no-op), and the blank-line counts differ. ``None`` otherwise — the
+    caller prints its own truthful generic no-op line.
+    """
+    if not replace_sym or not language:
+        return None
+    try:
+        from .inference.ast_utils import _resolve_symbol
+        from .inference.chunked_merge import get_ast_map_from_source
+
+        ast_nodes = get_ast_map_from_source(
+            original_code, str(path), language,
+        )
+        target = _resolve_symbol(replace_sym, ast_nodes or [])
+        if target is None:
+            return None
+        span_text = "".join(
+            original_lines[target.line_start - 1:target.line_end],
+        )
+    except Exception:  # noqa: BLE001 -- the honest fallback is the generic no-op line; never crash for a note
+        return None
+
+    def _content(s: str) -> list[str]:
+        return [
+            ln.strip() for ln in s.splitlines()
+            if ln.strip() and not ln.strip().startswith(("...", "…"))
+        ]
+
+    if _content(span_text) != _content(snippet):
+        return None
+    span_blanks = sum(1 for ln in span_text.splitlines() if not ln.strip())
+    snippet_blanks = sum(1 for ln in snippet.splitlines() if not ln.strip())
+    if span_blanks == snippet_blanks:
+        return None
+    return (
+        f"No change resulted from this edit: the snippet matches symbol "
+        f"'{replace_sym}' content for content, but differs in blank "
+        f"line(s) ({snippet_blanks} in the snippet vs {span_blanks} in the "
+        f"symbol's span). Blank lines BEFORE a symbol's definition line "
+        f"(e.g. the PEP 8 spacing between definitions) are OUTSIDE the "
+        f"symbol's span, so --replace cannot change them — use the "
+        f"hermetic line primitives instead, e.g. "
+        f"`fastedit edit {path} --lines <from>:<to> --delete` (see "
+        f"`--lines`, which also has a --snippet replace mode). File "
+        f"untouched."
     )
 
 
@@ -986,6 +1072,50 @@ def _check_line_mode_conflicts(args, has_snippet: bool) -> None:
     wants_delete = bool(getattr(args, "delete", False))
     after_sym = args.after or getattr(args, "after_imports", False) or None
     replace_sym = args.replace or None
+    replace_literal = getattr(args, "replace_literal", None)
+    if (
+        getattr(args, "occurrence", None) is not None
+        and not (insert_after or insert_before or replace_literal)
+    ):
+        _print_edit_refusal(
+            "--occurrence applies to --insert-after/--insert-before/"
+            "--replace-literal, which were not passed; address a repeated "
+            "line with the literal flag's '#N' ordinal suffix instead "
+            "(e.g. --snippet '...' --replace-literal 'line;#2')."
+        )
+        sys.exit(1)
+    if replace_literal:
+        conflict_labels = {
+            "insert_after": "--insert-after",
+            "insert_before": "--insert-before",
+            "lines": "--lines",
+            "delete": "--delete",
+            "after": "--after/--after-imports",
+            "replace": "--replace",
+        }
+        if insert_after:
+            conflict = "insert_after"
+        elif insert_before:
+            conflict = "insert_before"
+        elif lines_spec is not None:
+            conflict = "lines"
+        elif wants_delete:
+            conflict = "delete"
+        elif after_sym:
+            conflict = "after"
+        elif replace_sym:
+            conflict = "replace"
+        else:
+            conflict = None
+        if conflict is not None:
+            _print_edit_refusal(
+                f"--replace-literal cannot be combined with "
+                f"{conflict_labels[conflict]}: it is its own mode — the "
+                "line whose full stripped content matches the literal is "
+                "replaced wholesale by the snippet. Drop the other mode "
+                "and retry."
+            )
+            sys.exit(1)
 
     if insert_after and insert_before:
         _print_edit_refusal(
@@ -1000,19 +1130,34 @@ def _check_line_mode_conflicts(args, has_snippet: bool) -> None:
             "fixes the insertion point. Drop the symbol flag and retry."
         )
         sys.exit(1)
+    if (insert_after or insert_before or replace_literal) and lines_spec is not None:
+        _print_edit_refusal(
+            "the literal modes cannot be combined with --lines; use one "
+            "mode per call."
+        )
+        sys.exit(1)
     if lines_spec is not None:
-        if not wants_delete:
-            _print_edit_refusal(
-                f"--lines {lines_spec} without --delete would do nothing "
-                "here. Pass --delete to remove that line range, or drop "
-                "--lines and edit with --snippet."
-            )
-            sys.exit(1)
-        if has_snippet:
+        if wants_delete and has_snippet:
             _print_edit_refusal(
                 "--lines with --delete is a pure deletion and takes no "
                 "--snippet. Drop --snippet, or use --snippet with the "
-                "insert/replace modes instead."
+                "line REPLACE mode (--lines FROM:TO --snippet '...', no "
+                "--delete) instead."
+            )
+            sys.exit(1)
+        if not wants_delete and not has_snippet:
+            _print_edit_refusal(
+                f"--lines {lines_spec} without --delete or --snippet would "
+                "do nothing here. Pass --delete to remove that line range, "
+                "--snippet to replace it with new content, or drop --lines "
+                "and edit with --snippet."
+            )
+            sys.exit(1)
+        if after_sym or replace_sym:
+            _print_edit_refusal(
+                "--lines replaces/deletes one exact line range and cannot "
+                "be combined with --after/--after-imports/--replace. Use "
+                "one mode per call."
             )
             sys.exit(1)
     if wants_delete and lines_spec is None:
@@ -1057,6 +1202,7 @@ def _parse_lines_range(lines_spec: str, total_lines: int) -> tuple[int, int]:
 
 def _resolve_line_literal(
     original_lines: list[str], literal: str, flag_label: str,
+    occurrence: int | None = None,
 ) -> int:
     """Index of the UNIQUE line whose stripped content equals *literal*.
 
@@ -1064,7 +1210,19 @@ def _resolve_line_literal(
     file's indentation) with an enforced unique match — 0 matches and >1
     matches both refuse with the remedy spelled out. Returns the 0-indexed
     line position for the splice.
-    """
+
+    Issue #17/#18: *literal* may carry a ``#N`` ordinal suffix
+    (``1``-based, e.g. ``'summary.push("A");#2'``) to address one
+    occurrence of a REPEATED line; plain literals keep the unique-match
+    contract (an unaddressed repeat refuses with the count and the
+    ordinal remedy spelled out). An explicit *occurrence* argument (from
+    ``--occurrence N``) wins over the suffix and needs none."""
+    head_spec = literal.rsplit("#", 1)
+    if occurrence is None:
+        occurrence = None
+        if len(head_spec) == 2 and head_spec[1].isdigit() and head_spec[0].strip():
+            occurrence = int(head_spec[1])
+            literal = head_spec[0]
     matches = [
         i for i, line in enumerate(original_lines)
         if line.strip() == literal.strip()
@@ -1076,14 +1234,58 @@ def _resolve_line_literal(
             "read` for the exact line."
         )
         sys.exit(1)
-    if len(matches) > 1:
+    if occurrence is None:
+        if len(matches) > 1:
+            ordinals = ", ".join(f"#{n}" for n in range(1, len(matches) + 1))
+            _print_edit_refusal(
+                f"literal matches {len(matches)} lines: {literal.strip()} -- "
+                f"address one occurrence with the {'#1'}/{'#N'} ordinal "
+                f"suffix on the literal (occurrences: {ordinals}, in file "
+                "order), or use --lines FROM:TO to target the range "
+                "precisely."
+            )
+            sys.exit(1)
+        return matches[0]
+    if occurrence < 1 or occurrence > len(matches):
+        ordinals = ", ".join(f"#{n}" for n in range(1, len(matches) + 1))
         _print_edit_refusal(
-            f"literal matches {len(matches)} lines: {literal.strip()} -- "
-            "include more context or use --lines FROM:TO --delete to target "
-            "the occurrence precisely."
+            f"literal has {len(matches)} occurrence(s); occurrence #{occurrence} "
+            f"does not exist (occurrences: {ordinals}, in file order)."
         )
         sys.exit(1)
-    return matches[0]
+    return matches[occurrence - 1]
+
+
+def _inherit_literal_indent(
+    snippet_lines: list[str],
+    anchor_line: str,
+    line_ending: str,
+) -> tuple[list[str], bool]:
+    """Issue #22: indent-inherit a column-0 snippet from an anchor line.
+
+    Returns ``(lines, reindented)``. When EVERY non-blank snippet line
+    starts at column 0 (the caller did not choose an indentation) and the
+    anchor line is itself indented, the anchor's leading whitespace is
+    inherited uniformly; a snippet that specifies its own indentation
+    stays verbatim, and a column-0 anchor inherits nothing. Inherited
+    blank lines stay blank.
+    """
+    anchor_indent = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
+    nonblank = [ln for ln in snippet_lines if ln.strip()]
+    if (
+        nonblank
+        and all(not ln.startswith((" ", "\t")) for ln in nonblank)
+        and anchor_indent
+    ):
+        return (
+            [
+                ("" if not ln.strip() else anchor_indent + ln.rstrip("\r\n"))
+                + line_ending
+                for ln in snippet_lines
+            ],
+            True,
+        )
+    return snippet_lines, False
 
 
 def _apply_insert_after_before(
@@ -1093,6 +1295,7 @@ def _apply_insert_after_before(
     snippet: str,
     literal: str,
     *,
+    occurrence: int | None = None,
     before: bool,
     backups,
     encoding: str,
@@ -1112,7 +1315,9 @@ def _apply_insert_after_before(
     from .mcp.backup import _atomic_write
     from .split_join import detect_line_ending, normalize_line_endings
 
-    anchor_idx = _resolve_line_literal(original_lines, literal, "--insert")
+    anchor_idx = _resolve_line_literal(
+        original_lines, literal, "--insert", occurrence=occurrence,
+    )
     line_ending = detect_line_ending(original_code)
     snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n")
     if not snippet_text:
@@ -1124,6 +1329,9 @@ def _apply_insert_after_before(
     snippet_lines = [
         ln + line_ending for ln in snippet_text.split("\n")
     ]
+    snippet_lines, reindented = _inherit_literal_indent(
+        snippet_lines, original_lines[anchor_idx], line_ending,
+    )
     insert_at = anchor_idx if before else anchor_idx + 1
     result_lines = (
         original_lines[:insert_at] + snippet_lines + original_lines[insert_at:]
@@ -1136,8 +1344,9 @@ def _apply_insert_after_before(
     print(
         f"Inserted {len(snippet_lines)} line(s) "
         f"{'before' if before else 'after'} {anchor_display} "
-        f"({literal.strip()}) in {path}. "
-        f"latency: 0ms, 0 tok/s, 0 tokens"
+        f"({literal.strip()}) in {path}"
+        + (" (indentation inherited from the anchor line)" if reindented else "")
+        + ". latency: 0ms, 0 tok/s, 0 tokens"
     )
 
 
@@ -1179,6 +1388,172 @@ def _apply_lines_delete(
     print(
         f"Deleted lines {start}-{end} ({end - start + 1} line(s)) from "
         f"{path}. latency: 0ms, 0 tok/s, 0 tokens"
+    )
+
+
+def _hermetic_write_gate(
+    path: Path,
+    original_code: str,
+    merged: str,
+    language: str | None,
+) -> str | None:
+    """The write-side gate shared by the hermetic line primitives.
+
+    Returns a refusal reason, or ``None`` when the merged bytes may be
+    written. Two guards in battery order:
+
+      * the NO-OP guard (issue #16, defect 1): merged bytes identical to
+        what was read are refused as a no-op — the refusal names the
+        remedy, never a success line for work that did not happen;
+      * the RELATIVE parse gate (req. 9): a parse-clean ORIGINAL that the
+        THIS edit broke is refused (a pre-existing defect is inherited
+        untouched — the primitives never come near it).
+    """
+    from .data_gen.ast_analyzer import validate_parse
+
+    if merged == original_code:
+        return (
+            "No change resulted from this edit (the replacement matches "
+            "the current content). File untouched."
+        )
+    if language:
+        if validate_parse(merged, language):
+            return None
+        if validate_parse(original_code, language):
+            return (
+                "merged output for this edit has parse errors; refusing "
+                "to write. The file is unchanged."
+            )
+    return None
+
+
+def _apply_replace_literal(
+    path: Path,
+    original_code: str,
+    original_lines: list[str],
+    snippet: str,
+    literal: str,
+    occurrence: int | None,
+    language: str | None,
+    backups,
+    encoding: str,
+    read_stat,
+) -> None:
+    """Issues #17/#18: guarded literal LINE REPLACEMENT. Hermetic, no model.
+
+    The line whose full stripped content matches *literal* (``#N`` /
+    ``--occurrence`` disambiguates a repeat) is replaced WHOLESALE by the
+    snippet's lines — multi-line snippets allowed, blank lines carried
+    verbatim. Guards: bounds/unique-match via _resolve_line_literal, EOL +
+    trailing state via _normalize_merged_eol, indented-inheritance for a
+    column-0 snippet (issue #22 semantics), the shared write gate above,
+    and the usual backup/codec/BOM/stat/lock machinery of _atomic_write.
+    """
+    from .inference.chunked_merge import _normalize_merged_eol
+    from .mcp.backup import _atomic_write
+    from .split_join import detect_line_ending, normalize_line_endings
+
+    anchor_idx = _resolve_line_literal(
+        original_lines, literal, "--replace-literal", occurrence=occurrence,
+    )
+    line_ending = detect_line_ending(original_code)
+    snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n")
+    if not snippet_text:
+        _print_edit_refusal(
+            "the snippet is empty; there is nothing to replace the line "
+            "with. Pass the new content via --snippet, @path, or piped "
+            "stdin — to remove the line entirely use --lines FROM:TO "
+            "--delete."
+        )
+        sys.exit(1)
+    snippet_lines, reindented = _inherit_literal_indent(
+        [ln + line_ending for ln in snippet_text.split("\n")],
+        original_lines[anchor_idx],
+        line_ending,
+    )
+    result_lines = (
+        original_lines[:anchor_idx] + snippet_lines + original_lines[anchor_idx + 1:]
+    )
+    merged = _normalize_merged_eol("".join(result_lines), original_code)
+    refusal = _hermetic_write_gate(path, original_code, merged, language)
+    if refusal is not None:
+        _print_edit_refusal(refusal)
+        sys.exit(1)
+    _atomic_write(
+        path, merged, backups=backups, encoding=encoding, expected_stat=read_stat,
+    )
+    print(
+        f"Replaced line {anchor_idx + 1} ({literal.strip()}"
+        + (f"#{occurrence}" if occurrence else "") + ") with "
+        f"{len(snippet_lines)} line(s) in {path}"
+        + (" (indentation inherited from the replaced line)" if reindented else "")
+        + ". latency: 0ms, 0 tok/s, 0 tokens"
+    )
+
+
+def _apply_lines_replace(
+    path: Path,
+    original_code: str,
+    original_lines: list[str],
+    lines_spec: str,
+    snippet: str,
+    language: str | None,
+    backups,
+    encoding: str,
+    read_stat,
+) -> None:
+    """Issue #18: guarded --lines FROM:TO --snippet LINE-RANGE REPLACEMENT.
+
+    The 1-indexed inclusive range is replaced wholesale by the snippet's
+    lines (the symmetric partner of --lines FROM:TO --delete, which stays
+    the deletion form). Bounds, EOL/trailing state, the relative parse
+    gate, a no-op refusal, and the usual atomic-write guards apply.
+    """
+    from .inference.chunked_merge import _normalize_merged_eol
+    from .mcp.backup import _atomic_write
+    from .split_join import detect_line_ending, normalize_line_endings
+
+    try:
+        start, end = _parse_lines_range(lines_spec, len(original_lines))
+    except ValueError as e:
+        _print_edit_refusal(str(e))
+        sys.exit(1)
+    line_ending = detect_line_ending(original_code)
+    snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n")
+    if not snippet_text:
+        _print_edit_refusal(
+            f"the snippet is empty; --lines {start}:{end} with --snippet "
+            "must carry the replacement content. To DELETE the range "
+            "instead, drop --snippet and pass --delete."
+        )
+        sys.exit(1)
+    snippet_lines, reindented = _inherit_literal_indent(
+        [ln + line_ending for ln in snippet_text.split("\n")],
+        original_lines[start - 1],
+        line_ending,
+    )
+    result_lines = (
+        original_lines[: start - 1] + snippet_lines + original_lines[end:]
+    )
+    if not any(ln.strip() for ln in result_lines):
+        _print_edit_refusal(
+            f"replacing lines {start}-{end} with an empty result would "
+            "leave the file empty; refusing."
+        )
+        sys.exit(1)
+    merged = _normalize_merged_eol("".join(result_lines), original_code)
+    refusal = _hermetic_write_gate(path, original_code, merged, language)
+    if refusal is not None:
+        _print_edit_refusal(refusal)
+        sys.exit(1)
+    _atomic_write(
+        path, merged, backups=backups, encoding=encoding, expected_stat=read_stat,
+    )
+    print(
+        f"Replaced lines {start}-{end} ({end - start + 1} line(s)) with "
+        f"{len(snippet_lines)} line(s) in {path}"
+        + (" (indentation inherited from the range's first line)" if reindented else "")
+        + ". latency: 0ms, 0 tok/s, 0 tokens"
     )
 
 
@@ -1280,11 +1655,28 @@ def _cmd_edit_locked(args):
     _check_line_mode_conflicts(args, has_snippet=bool(snippet))
     insert_after_lit = getattr(args, "insert_after", None)
     insert_before_lit = getattr(args, "insert_before", None)
+    replace_literal_lit = getattr(args, "replace_literal", None)
+    occurrence = getattr(args, "occurrence", None)
     if insert_after_lit or insert_before_lit:
         _apply_insert_after_before(
             path, original_code, original_lines, snippet,
             insert_after_lit or insert_before_lit,
             before=insert_before_lit is not None,
+            occurrence=occurrence,
+            backups=backups, encoding=encoding, read_stat=read_stat,
+        )
+        return
+    if replace_literal_lit:
+        _apply_replace_literal(
+            path, original_code, original_lines, snippet,
+            replace_literal_lit, occurrence, language,
+            backups=backups, encoding=encoding, read_stat=read_stat,
+        )
+        return
+    if lines_spec is not None and not wants_delete:
+        _apply_lines_replace(
+            path, original_code, original_lines, lines_spec, snippet,
+            language,
             backups=backups, encoding=encoding, read_stat=read_stat,
         )
         return
@@ -1342,10 +1734,20 @@ def _cmd_edit_locked(args):
             # not happen: the reported defect was exactly that success line
             # followed by `fastedit diff` saying "No changes detected".
             if result.merged_code == original_code:
-                print(
+                # Issue #21: "the snippet matches the current content" is a
+                # LIE when the snippet differs from the symbol's text only
+                # in the blank lines that sit BEFORE the symbol (or between
+                # its lines) — those blanks are outside the span and the
+                # text-match legitimately ignores them. Say plainly where
+                # the difference lives and hand over the working recipe.
+                noop_note = _blank_only_noop_note(
+                    original_code, original_lines, snippet,
+                    replace_sym, language, path,
+                )
+                print(noop_note or (
                     "No change resulted from this edit (the snippet matches "
                     "the current content). File untouched."
-                )
+                ))
                 return
             try:
                 _refuse_if_edit_broke_parse(path, original_code, result.merged_code, language)
@@ -1452,11 +1854,16 @@ def _cmd_edit_locked(args):
         # byte-identical output — a true no-op, not an error. Report it
         # truthfully (exit 0, nothing written) instead of the "Applied
         # edit" success line the issue flagged as the worst failure class
-        # for a write tool.
-        print(
+        # for a write tool. Issue #21: name a blank-line-only difference
+        # honestly and hand over the recipe.
+        noop_note = _blank_only_noop_note(
+            original_code, original_lines, snippet,
+            replace_sym, language, path,
+        )
+        print(noop_note or (
             "No change resulted from this edit (the snippet matches the "
             "current content). File untouched."
-        )
+        ))
         return
     if getattr(result, "chunks_rejected", 0):
         print(
@@ -3065,9 +3472,30 @@ def main():
              "enforced). Hermetic: 0 tokens, no model.",
     )
     edit_p.add_argument(
+        "--replace-literal", default=None, dest="replace_literal",
+        help="Replace WHOLESALE (delete + rewrite) the line whose full "
+             "stripped content equals this literal, with the lines from "
+             "--snippet. Repeated lines: address one occurrence with the "
+             "'#N' ordinal suffix on the literal or with --occurrence N "
+             "(1-based, file order). Hermetic: 0 tokens, no model. Example "
+             "(#17): fastedit edit sample.sh --replace-literal 'PID=...' "
+             "--snippet 'PID=\"$(cat /run/pid)'",
+    )
+    edit_p.add_argument(
+        "--occurrence", type=int, default=None, dest="occurrence",
+        help="With --insert-after/--insert-before/--replace-literal: "
+             "1-based occurrence of the anchor literal in file order "
+             "(alternative to the literal's '#N' suffix, useful when the "
+             "literal's own text ends in '#N').",
+    )
+    edit_p.add_argument(
         "--lines", default=None, dest="lines",
-        help="With --delete: remove lines FROM:TO (1-indexed, inclusive), "
-             "e.g. --lines 12:14 --delete. Pure deletion, no model.",
+        help="Two modes, one flag. With --delete: remove lines FROM:TO "
+             "(1-indexed, inclusive), e.g. --lines 12:14 --delete. With "
+             "--snippet: REPLACE lines FROM:TO wholesale with the snippet's "
+             "lines (issue #18: change one occurrence of a repeated line by "
+             "its line number), e.g. --lines 15:16 --snippet '...'. Pure "
+             "line splicing, no model.",
     )
     edit_p.add_argument(
         "--delete", action="store_true", dest="delete",
