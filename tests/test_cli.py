@@ -1779,9 +1779,99 @@ class TestCLIBatchEdit:
         assert result.returncode == 1
         assert "Traceback" not in result.stderr
 
+    # -- batch/multi stdin bug: the eager backend build (measured ~17-28s of
+    # MLX import + engine load BEFORE the merge) must be LAZY, like cmd_edit's
+    # _model_merge_window -- a deterministic batch (--after inserts, 0 model
+    # tokens) never loads an engine, never blocks past the pipe. ----
 
-# ===================================================================
-# 13. Multi-edit tests
+    def test_batch_edit_deterministic_never_loads_backend(
+        self, tmp_path: Path, backup_dir, monkeypatch, capsys,
+    ):
+        import json as json_mod
+        from types import SimpleNamespace
+
+        from fastedit import cli as cli_module
+
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        def _no_backend(args):  # pragma: no cover - must never run
+            raise AssertionError("deterministic batch-edit must not build a backend")
+
+        monkeypatch.setattr(cli_module, "_make_backend_with_overrides", _no_backend)
+        edits = json_mod.dumps([
+            {"snippet": "def hello_world() -> str:\n    return 'Hi'", "after": "greet"},
+        ])
+        args = SimpleNamespace(
+            file=str(target), edits=edits, backend=None, model_path=None,
+            api_base=None, api_model=None,
+        )
+        cli_module._cmd_batch_edit_locked(args)  # no assertion raised
+        assert "def hello_world" in target.read_text(encoding="utf-8")
+
+    def test_multi_edit_deterministic_never_loads_backend(
+        self, tmp_path: Path, backup_dir, monkeypatch, capsys,
+    ):
+        """Same lazy-backend contract for multi-edit: a batch of --after
+        inserts across files never constructs the engine."""
+        import json as json_mod
+
+        from fastedit import cli as cli_module
+
+        target = tmp_path / "mod.py"
+        target.write_text(SMALL_PYTHON_FILE, encoding="utf-8")
+
+        def _no_backend(args):  # pragma: no cover - must never run
+            raise AssertionError("deterministic multi-edit must not build a backend")
+
+        monkeypatch.setattr(cli_module, "_make_backend_with_overrides", _no_backend)
+        monkeypatch.setenv("FASTEDIT_NO_UPDATE_CHECK", "1")
+        file_edits = json_mod.dumps([
+            {"file_path": str(target), "edits": [
+                {"snippet": "def hello_world() -> str:\n    return 'Hi'", "after": "greet"},
+            ]},
+        ])
+        argv_backup = sys.argv
+        sys.argv = ["fastedit", "multi-edit", "--file-edits", file_edits]
+        try:
+            cli_module.main()  # no assertion raised, no SystemExit: success
+        finally:
+            sys.argv = argv_backup
+        assert "def hello_world" in target.read_text(encoding="utf-8")
+
+
+class TestDashStdinSecondPayload:
+    """Issue: at most ONE stdin payload per command invocation. A second
+    '-' flag on the same invocation cannot re-read the consumed pipe -- it
+    must fail LOUDLY with exit 1 naming the flag that consumed it, never
+    silently read empty EOF JSON ('invalid JSON') nor hang."""
+
+    def test_second_read_refused_cleanly(self, monkeypatch, capsys):
+        import io as io_mod
+
+        from fastedit import cli as cli_module
+
+        monkeypatch.setattr(cli_module, "_DASH_STDIN_CONSUMED_BY", [])
+        monkeypatch.setattr(sys, "stdin", io_mod.StringIO('[{"snippet": "x"}]'))
+        assert cli_module._read_dash_stdin("--edits") == '[{"snippet": "x"}]'
+        with pytest.raises(SystemExit) as exc_info:
+            cli_module._read_dash_stdin("--file-edits")
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "stdin already consumed by --edits" in err
+        assert "Traceback" not in err
+
+    def test_second_read_message_names_the_remedy(self, monkeypatch, capsys):
+        import io as io_mod
+
+        from fastedit import cli as cli_module
+
+        monkeypatch.setattr(cli_module, "_DASH_STDIN_CONSUMED_BY", [])
+        monkeypatch.setattr(sys, "stdin", io_mod.StringIO("[1]"))
+        cli_module._read_dash_stdin("--file-edits")
+        with pytest.raises(SystemExit):
+            cli_module._read_dash_stdin("--edits")
+        assert "pass --edits as a file" in capsys.readouterr().err
 # ===================================================================
 
 class TestCLIMultiEdit:

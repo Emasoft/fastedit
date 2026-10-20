@@ -176,6 +176,15 @@ _DASH_STDIN_TIMEOUT_ENV = "FASTEDIT_STDIN_TIMEOUT_S"
 _DASH_STDIN_DEFAULT_TIMEOUT_S = 60.0
 _ATFILE_AUTODETECT_MAX_CHARS = 1024
 
+# At most ONE stdin payload per command invocation. A piped stdin payload is
+# consumed (and sys.stdin retired) by the FIRST '-' flag that reads it; the
+# pipe cannot be re-read, so a SECOND '-' on the same invocation must fail
+# loudly instead of silently reading an empty EOF payload (like the retired
+# StringIO would give) -- the empty payload used to surface as a baffling
+# "invalid JSON" instead of the true cause. Module-global per-process latch,
+# reset only by the process exit.
+_DASH_STDIN_CONSUMED_BY: list[str] = []
+
 
 def _read_dash_stdin(
     flag_label: str, *, binary: bool = False, usage_hint: str | None = None,
@@ -222,7 +231,16 @@ def _read_dash_stdin(
     if usage_hint is None:
         usage_hint = f"e.g. `cat snippet.py | fastedit edit <file> {flag_label} -`"
 
-    if stdin is None or is_tty:
+    if stdin is None or is_tty or _DASH_STDIN_CONSUMED_BY:
+        if _DASH_STDIN_CONSUMED_BY:
+            first_flag = _DASH_STDIN_CONSUMED_BY[0]
+            print(
+                f"Error: stdin already consumed by {first_flag}; stdin payload "
+                f"can be read only ONCE per command. Pass {flag_label} as a "
+                f"file path or inline text instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(
             f"Error: {flag_label} - requires piped stdin ({usage_hint})",
             file=sys.stderr,
@@ -275,8 +293,10 @@ def _read_dash_stdin(
 
     data = chunks[0] if chunks else (b"" if binary else "")
 
-    # The single read is done -- retire stdin so nothing downstream (a merge
-    # helper, a prompt, a retry loop) can ever block on it again (issue #9).
+    # The single read is done -- latch the consuming flag and retire stdin so
+    # nothing downstream (a merge helper, a prompt, a retry loop, or a SECOND
+    # '-' flag) can ever block on or re-read stdin again (issue #9).
+    _DASH_STDIN_CONSUMED_BY.append(flag_label)
     sys.stdin = io.BytesIO(b"") if binary else io.StringIO("")
 
     return data
@@ -1955,21 +1975,23 @@ def _cmd_batch_edit_locked(args):
         sys.exit(1)
     language = detect_language(path)
 
-    # Backend construction + the whole batch merge run under ONE global
-    # model slot (engine load + every chunk's merge attempts), so a batch
-    # never exceeds the machine-wide model-instance ceiling. The heavy
-    # window for a big target is already held (cmd_batch_edit).
-    from .resource_hub import SlotWaitTimeout, acquire_slot
+    # The whole batch merge runs under ONE global model slot when the merge
+    # actually invokes the model. The backend is built LAZILY (the same
+    # _model_merge_window contract cmd_edit uses): a deterministic batch
+    # (--after/--replace text-match inserts, 0 model tokens) never imports the
+    # MLX stack nor loads an engine — the eager build here used to cost
+    # ~17-28s of machine time on every batch-edit call and pushed invocations
+    # near the 30s timeout even when NOTHING model-shaped was requested.
+    from .resource_hub import SlotWaitTimeout
 
     try:
-        with acquire_slot("model"):
-            _backend_kind, backend = _make_backend_with_overrides(args)
+        with _model_merge_window(args) as merge_fn:
             try:
                 result = batch_chunked_merge(
                     original_code=original_code,
                     edits=batch,
                     file_path=args.file,
-                    merge_fn=backend.merge_auto,
+                    merge_fn=merge_fn,
                     language=language,
                 )
             except ValueError as e:
@@ -2104,7 +2126,19 @@ def _cmd_multi_edit_model_window(args, file_edits_list):
     )
     from .write_gates import _all_chunks_rejected, _rejection_refusal
 
-    _backend_kind, backend = _make_backend_with_overrides(args)
+    # LAZY backend (the same contract cmd_edit's _model_merge_window gives
+    # batch-edit): the engine is built on the FIRST merge_fn call only. A
+    # fully deterministic multi-file batch (--after inserts, 0 model tokens)
+    # used to pay the eager MLX import + engine load (~17-28s) before any
+    # merge ran. The slot above is the whole-run lease, so a lazily-built
+    # engine still runs inside it.
+    _backend_state: dict = {}
+
+    def backend_merge_fn(*a, **kw):
+        if "engine" not in _backend_state:
+            _backend_state["engine"] = _make_backend_with_overrides(args)[1]
+        return _backend_state["engine"].merge_auto(*a, **kw)
+
     backups = BackupStore()
 
     # PHASE 1 -- reject EVERY knowable-beforehand error before touching anything.
@@ -2173,7 +2207,7 @@ def _cmd_multi_edit_model_window(args, file_edits_list):
                 original_code=original_code,
                 edits=batch,
                 file_path=str(path),
-                merge_fn=backend.merge_auto,
+                merge_fn=backend_merge_fn,
                 language=detect_language(path),
             )
             _refuse_if_edit_broke_parse(path, original_code, result.merged_code, detect_language(path))
