@@ -219,13 +219,23 @@ class TestSnippetHasKeepMarker:
         """The canonical long-form slash marker is a keep-marker."""
         assert snippet_has_keep_marker("// ... existing code ...") is True
 
-    def test_bare_short_ellipsis_phrase_is_not_a_marker(self):
-        """A bare `# ...` (no trailing `existing code`) is real code, not a marker."""
-        assert snippet_has_keep_marker("# ...") is False
+    def test_bare_short_ellipsis_phrase_is_a_keep_marker_now(self):
+        """Issue #20: a WHOLE-LINE `# ...` is a keep-marker.
 
-    def test_bare_short_slash_ellipsis_phrase_is_not_a_marker(self):
-        """A bare `// ...` (no trailing `existing code`) is real code, not a marker."""
-        assert snippet_has_keep_marker("// ...") is False
+        `is_marker_line` (the shared line-anchored predicate) accepts the
+        spaced short forms on purpose; a `--replace` snippet that carries
+        such a line reached the direct-replacement splice and silently
+        deleted the lines the marker stood for (exit 0). The whole-line
+        case now decides with the shared predicate, erring toward
+        refusing. (The historical O-line mid-line claim below the old
+        verdict -- "real code" -- was the silent direction the issue
+        measured.)
+        """
+        assert snippet_has_keep_marker("# ...") is True
+
+    def test_bare_short_slash_ellipsis_phrase_is_a_keep_marker_now(self):
+        """Issue #20: a WHOLE-LINE `// ...` is a keep-marker (see above)."""
+        assert snippet_has_keep_marker("// ...") is True
 
     def test_real_trailing_comment_is_not_a_marker(self):
         """A real code line whose comment happens to contain `# ...` is not a marker."""

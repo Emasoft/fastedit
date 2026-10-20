@@ -739,7 +739,7 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
     # named replace_sym"; that is filed separately. Refuse loudly meanwhile --
     # returning None would route to a merge backend that may not be installed and
     # surface as a bare ModuleNotFoundError, which tells the user nothing.
-    if snippet_has_keep_marker(snippet):
+    if snippet_has_keep_marker(snippet, original_func):
         # Issue #12: the old message claimed "no anchor line matched the
         # original body" even when the anchor EXISTS but is repeated across
         # the symbol (ambiguous). Diagnose the actual decline and spell out
@@ -845,6 +845,28 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
 
     # Direct replacement: snippet IS the new symbol. Swap line ranges.
     snippet_text = normalize_line_endings(snippet, line_ending).rstrip("\r\n") + line_ending
+    # Issue #20 defense-in-depth: a whole-line keep-marker the bound-side
+    # gates let a directive through must never be WRITTEN as a
+    # literal directive line. A whole-line `// ...` is legitimate content,
+    # so the guard counts: the spliced span may not carry MORE marker-shaped
+    # lines than the original span had — a snippet whose markers were
+    # supposed to be expanded writes them literally when any upstream
+    # predicate gap lets a marker-bearing snippet through, and this catch
+    # turns that silent data loss back into a refusal.
+    from .inference.markers import is_marker_line as _is_marker_line_cli
+    orig_marker_lines = sum(
+        1 for ln in original_func.splitlines() if _is_marker_line_cli(ln)
+    )
+    new_marker_lines = sum(
+        1 for ln in snippet_text.splitlines() if _is_marker_line_cli(ln)
+    )
+    if new_marker_lines > orig_marker_lines:
+        raise ValueError(
+            f"snippet for '{replace_sym}' contains {new_marker_lines} "
+            f"keep-marker line(s) but its replacement shape deletes content "
+            f"instead of expanding them; the markers would be written into "
+            f"the file literally. Pass the full replacement body."
+        )
     snippet_lines = snippet_text.splitlines(keepends=True)
     result_lines = list(original_lines)
     result_lines[func_start:func_end] = snippet_lines

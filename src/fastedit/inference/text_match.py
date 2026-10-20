@@ -156,8 +156,28 @@ def _marker_snippet_placement_refusal(original_func: str, snippet: str) -> str:
     )
 
 
-def snippet_has_keep_marker(snippet: str) -> bool:
+def snippet_has_keep_marker(
+    snippet: str,
+    original_func: str | None = None,
+) -> bool:
     """True when a snippet contains a line that IS a keep-marker.
+
+    Issue #20: the whole-line marker spellings ``is_marker_line`` accepts
+    (``// ...``, ``# ...``, unicode ellipsis, long forms under any
+    indentation) are ALL keep-markers here — a marker the predicate misses
+    reaches the direct-replacement splice and silently deletes every line
+    it stands for (exit 0, code lost). Deciding the whole-line case with
+    the shared predicate (:meth:`markers.is_marker_line` — the codebase's
+    single source of truth) instead of substring scanning closes that gap.
+    The per-line comment scan below stays for the mid-line shapes.
+
+    *original_func* supplies the loud-direction escape (issue #20, the
+    negative case): a snippet marker line that the ORIGINAL symbol body
+    already carries identically is RESTATED CONTENT, not a directive — the
+    author is rewriting the symbol while keeping its own marker-comment
+    line, so redeclaring it must not refuse. Matched on stripped content
+    (the same tolerance the tail gates apply). ``None`` (the historical
+    call shape) refuses, erring toward the loud direction.
 
     This predicate REFUSES to write a file, so its two failure directions are
     NOT symmetric and the design follows that asymmetry:
@@ -245,7 +265,17 @@ def snippet_has_keep_marker(snippet: str) -> bool:
             i += 1
         return -1
 
+    original_marker_lines: set[str] = set()
+    if original_func is not None:
+        original_marker_lines = {
+            line.strip() for line in original_func.splitlines()
+            if is_marker_line(line)
+        }
     for line in snippet.splitlines():
+        if is_marker_line(line):
+            if line.strip() in original_marker_lines:
+                continue  # restated content of the symbol body, not a directive
+            return True
         if line.strip() in _EXACT_SHORT_MARKERS:
             return True
         start = comment_start(line)
