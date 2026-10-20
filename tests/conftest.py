@@ -108,3 +108,24 @@ def _isolated_lock_dir(tmp_path_factory):
         del os.environ["FASTEDIT_LOCK_DIR"]
     else:
         os.environ["FASTEDIT_LOCK_DIR"] = previous
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_hub_dir(tmp_path_factory):
+    """Point the resource-governor hub at a session-scoped tmp dir.
+
+    The suite sets FASTEDIT_HUB_DIR (the BackupStore-style override consumed
+    by fastedit.resource_hub) so the model/heavy slot semaphores live in a
+    sandbox instead of the real per-user hub at ~/.fastedit — tests never
+    contend with a concurrent fastedit process's slots.
+    Tests that need their own hub (tests/test_resource_hub.py) override the
+    env per test; the later assignment wins.
+    """
+    hub_root = tmp_path_factory.mktemp("fastedit-hub")
+    previous = os.environ.get("FASTEDIT_HUB_DIR")
+    os.environ["FASTEDIT_HUB_DIR"] = str(hub_root)
+    yield hub_root
+    if previous is None:
+        del os.environ["FASTEDIT_HUB_DIR"]
+    else:
+        os.environ["FASTEDIT_HUB_DIR"] = previous
