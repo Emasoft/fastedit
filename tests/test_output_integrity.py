@@ -1085,3 +1085,157 @@ class TestFastEditEngineNullContent:
         )
         assert result.merged_code == ""
         assert result.truncated is False
+
+
+# ---------------------------------------------------------------------------
+# MLX-stub regression — spec-less fakes must not break transformers' probe
+# ---------------------------------------------------------------------------
+
+# The bug: ``MLXEngine.__init__`` imports transformers (for load-time
+# logging suppression). transformers' import-time ``is_mlx_available``
+# probe calls ``importlib.util.find_spec("mlx")``, which RAISES
+# ``ValueError: mlx.__spec__ is None`` when a spec-less module named mlx
+# sits in sys.modules (the fake-mlx test ecosystem) — crashing engine
+# construction on any environment holding such a stub, and also crashing
+# when transformers itself is half-broken (ImportError). The production
+# fix lives in ``fastedit.inference.mlx_compat.import_transformers_quietly``.
+
+
+class TestFindSpecRobustness:
+    """The production transformers probe must be tolerant of a spec-less
+    mlx stub and of a broken transformers install."""
+
+    def test_specless_mlx_stub_yields_not_available(self):
+        """A spec-less 'mlx' module in sys.modules must not make the
+        production probe raise: it reports 'not available' instead
+        (transformers' own find_spec('mlx') raises ValueError for exactly
+        this module shape, and a missing/broken transformers raises
+        ImportError — both collapse to None)."""
+        import importlib
+
+        from fastedit.inference.mlx_compat import import_transformers_quietly
+
+        saved = {name: sys.modules.get(name) for name in ("mlx", "transformers")}
+        try:
+            for name in saved:
+                sys.modules.pop(name, None)
+            # Spec-less stub: exactly the shape the fake-mlx ecosystem
+            # used to install (bare ModuleType, no __spec__).
+            sys.modules["mlx"] = type(sys)("mlx")
+
+            # The fix contract: the probe must NOT raise — regardless of
+            # whether this environment's transformers import still
+            # succeeds (its is_mlx_available probe hit may be served from
+            # an already-warm module cache) or, as in the regression, its
+            # find_spec("mlx") call raises ValueError. Both outcomes are
+            # legal; a raise is not.
+            result = import_transformers_quietly()  # must not raise
+        finally:
+            for name, orig in saved.items():
+                if orig is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = orig
+
+    def test_probe_returns_module_when_transformers_importable(self, monkeypatch):
+        """Success path: a usable transformers module is returned as-is,
+        so load-time verbosity suppression keeps working."""
+        from fastedit.inference.mlx_compat import import_transformers_quietly
+
+        fake = type(sys)("transformers")
+        fake.logging = SimpleNamespace(
+            get_verbosity=lambda: 30,
+            set_verbosity=lambda level: None,
+            set_verbosity_error=lambda: None,
+        )
+        monkeypatch.setitem(sys.modules, "transformers", fake)
+        assert import_transformers_quietly() is fake
+
+    def test_broken_transformers_import_yields_not_available(self, monkeypatch):
+        """A half-broken transformers install (import raises) is also
+        'not available', never engine-fatal."""
+        from fastedit.inference import mlx_compat
+
+        def _boom(name):
+            raise ValueError("mlx.__spec__ is None")
+
+        monkeypatch.setattr(mlx_compat.importlib, "import_module", _boom)
+        assert mlx_compat.import_transformers_quietly() is None
+
+    def test_find_spec_valueerror_is_not_available(self, monkeypatch):
+        """The exact regression: find_spec's ValueError for a spec-less
+        mlx module is treated as 'not available', not engine-fatal. Pinned
+        deterministically by making the import surface the ValueError."""
+        from fastedit.inference import mlx_compat
+
+        def _boom(name):
+            raise ValueError("mlx.__spec__ is None")
+
+        monkeypatch.setattr(mlx_compat.importlib, "import_module", _boom)
+        assert mlx_compat.import_transformers_quietly() is None
+
+    def test_specless_stub_with_usable_transformers_still_imports_engine(
+        self, monkeypatch,
+    ):
+        """Propagation safety on the mocked engine path: install the
+        shared fake mlx ecosystem (now spec-bearing via _build_mlx_mocks)
+        and a fake transformers WITHOUT mlx awareness, then construct
+        MLXEngine and run merge() — the stubbed path used by
+        TestMLXTokenCapTruncation — proving the engine propagates its
+        truncation contract with or without transformers."""
+        from test_mlx_engine import _build_mlx_mocks
+
+        modules, mocks = _build_mlx_mocks()
+        # transformers is importable in most dev venvs and its import-time
+        # probe used to crash against the stubs; bound our own specless-
+        # probe-safe stand-in so this test is deterministic either way.
+        fake_transformers = type(sys)("transformers")
+        fake_transformers.logging = SimpleNamespace(
+            get_verbosity=lambda: 30,
+            set_verbosity=lambda level: None,
+            set_verbosity_error=lambda: None,
+        )
+        saved = dict(sys.modules)
+        saved_names = list(modules) + ["transformers"]
+        try:
+            for name, mod in modules.items():
+                sys.modules[name] = mod
+            sys.modules["transformers"] = fake_transformers
+            # Only the test at hand imports fresh engine modules.
+            for name in [
+                "fastedit.inference.mlx_engine",
+                "fastedit.inference.cache_utils",
+                "fastedit.inference.prefix_cache",
+                "fastedit.inference.mlx_compat",
+            ]:
+                sys.modules.pop(name, None)
+
+            FakeArray = mocks["FakeArray"]
+            eos_id = mocks["tokenizer"].eos_token_id
+            mocks["model"].side_effect = (
+                lambda tokens, cache=None: FakeArray([[eos_id]])
+            )
+            tok = mocks["tokenizer"]
+            tok.decode.return_value = "<updated-code>def hello(): pass</updated-code>"
+
+            def _apply_chat_template(messages, tokenize=False,
+                                     add_generation_prompt=True, **kwargs):
+                return "".join(
+                    m.get("content", "") if isinstance(m, dict) else str(m)
+                    for m in messages
+                ) + (" suffix" if add_generation_prompt else "")
+
+            tok.apply_chat_template.side_effect = _apply_chat_template
+            from fastedit.inference.mlx_engine import MLXEngine
+
+            engine = MLXEngine(max_tokens=6)
+            result = engine.merge("def foo(): pass", "def foo(): return 1")
+            assert result.truncated is False
+            assert result.parse_valid is True
+        finally:
+            for name in saved_names:
+                if name in sys.modules:
+                    if name in saved:
+                        sys.modules[name] = saved[name]
+                    else:
+                        sys.modules.pop(name, None)

@@ -375,15 +375,19 @@ class MLXEngine:
         # for the process lifetime. (transformers.logging is an attribute
         # alias of transformers.utils.logging, so it is imported as an
         # attribute, not a submodule.)
-        import transformers
+        from .mlx_compat import import_transformers_quietly
 
-        _hf_logging = transformers.logging
-        _prev_verbosity = _hf_logging.get_verbosity()
-        _hf_logging.set_verbosity_error()
-        try:
+        transformers = import_transformers_quietly()
+        if transformers is not None and hasattr(transformers, "logging"):
+            _hf_logging = transformers.logging
+            _prev_verbosity = _hf_logging.get_verbosity()
+            _hf_logging.set_verbosity_error()
+            try:
+                self.model, self.tokenizer = load(model_path)
+            finally:
+                _hf_logging.set_verbosity(_prev_verbosity)
+        else:
             self.model, self.tokenizer = load(model_path)
-        finally:
-            _hf_logging.set_verbosity(_prev_verbosity)
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
         self.max_tokens = max_tokens

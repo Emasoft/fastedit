@@ -145,7 +145,21 @@ def _build_mlx_mocks():
         def state(self, v):
             self.cache = v
 
-    # Build module hierarchy
+    # Spec-bearing fakes (MLX-stub regression): availability probes such as
+    # transformers' is_mlx_available call importlib.util.find_spec on these
+    # names; find_spec RAISES ValueError ("X.__spec__ is None") for a module
+    # without a spec instead of returning None, which used to crash any
+    # probe running while these fakes sit in sys.modules. ModuleSpec(name,
+    # None) marks them explicitly as module objects (not packages), which
+    # find_spec accepts.
+    import importlib.machinery
+
+    def _spec_bearing(name, module):
+        module.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=True)
+        module.__package__ = name
+        module.__path__ = []  # mark as an importable parent of mlX child stubs
+        return module
+
     mlx_mod = ModuleType("mlx")
     mlx_core_mod = ModuleType("mlx.core")
     mlx_mod.core = mlx_core_mod
@@ -202,6 +216,9 @@ def _build_mlx_mocks():
         "mlx_lm.generate": mlx_lm_generate_mod,
         "mlx_lm.models": mlx_lm_models_mod,
         "mlx_lm.models.cache": mlx_lm_models_cache_mod,
+    }
+    modules = {
+        name: _spec_bearing(name, mod) for name, mod in modules.items()
     }
 
     return modules, {
