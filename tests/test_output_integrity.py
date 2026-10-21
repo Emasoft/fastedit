@@ -1111,8 +1111,6 @@ class TestFindSpecRobustness:
         (transformers' own find_spec('mlx') raises ValueError for exactly
         this module shape, and a missing/broken transformers raises
         ImportError — both collapse to None)."""
-        import importlib
-
         from fastedit.inference.mlx_compat import import_transformers_quietly
 
         saved = {name: sys.modules.get(name) for name in ("mlx", "transformers")}
@@ -1129,7 +1127,7 @@ class TestFindSpecRobustness:
             # an already-warm module cache) or, as in the regression, its
             # find_spec("mlx") call raises ValueError. Both outcomes are
             # legal; a raise is not.
-            result = import_transformers_quietly()  # must not raise
+            import_transformers_quietly()  # must not raise
         finally:
             for name, orig in saved.items():
                 if orig is None:

@@ -114,7 +114,7 @@ fastedit edit src/app.py --replace handle_request --snippet '
 | `read <file>` | Structure: full content (small files) or symbol map with line ranges |
 | `search <query> [path]` | Symbols, references, regex or hybrid matches (`--mode`, `--top-k`) |
 | `diff <file>` | Unified diff vs a pre-edit backup (read-only). `--base last` (default) = the NEWEST backup, i.e. the last edit's change; `--base all` = every change still in the undo history — loss detection across edits |
-| `edit <file>` | One edit: `--after` / `--replace SYMBOL` + `--snippet`; hermetic literal primitives `--insert-after`/`--insert-before LITERAL` and `--lines FROM:TO --delete` are 0 tokens |
+| `edit <file>` | One edit: `--after` / `--replace SYMBOL` (auto-reindented to the target's level; `--indent N` overrides) + `--snippet`; hermetic 0-token primitives: `--insert-after`/`--insert-before LITERAL`, `--replace-literal LITERAL` (repeated lines: `#N` suffix or `--occurrence N`), `--lines FROM:TO --delete` (pure deletion) and `--lines FROM:TO --snippet '...'` (line-range replace) |
 | `batch-edit <file>` | Ordered edits to ONE file: `--edits` JSON list (`-` for stdin) |
 | `multi-edit` | Edits across files, all-or-nothing: `--file-edits` JSON list |
 | `delete <file> <sym>` | Remove a symbol by AST; refuses while cross-file callers exist (`--force` skips the check) |
@@ -156,8 +156,11 @@ FastEdit holds a per-file cross-process lock (kernel `flock` under
 exits 1 before anything is read or written:
 `another fastedit instance (pid N, running Xs) is editing <path>; wait for it to finish — file unchanged`
 The lock self-releases if the holder crashes; `--force` never bypasses it.
-The stat guard (`file changed on disk since it was read`) covers non-fastedit
-writers.
+The stat guard (`file changed on disk since it was read`) covers non-fastedit writers.
+A global governor (slots under `~/.fastedit/limits/`) caps machine-wide the loaded
+merge engines (`max_model_instances`) and concurrent big-file edits (`max_heavy_jobs`)
+across ALL fastedit processes: busy slots queue with a one-line stderr status; past
+`slot_wait_timeout_s` (600s default) it exits 1 — raise limits in `~/.fastedit/limits/limits.json`.
 
 ## Limits & constraints
 
@@ -177,6 +180,7 @@ writers.
 |---|---|
 | `another fastedit instance (pid N, running Xs) is editing <path>` | Wait for the holder; the lock self-releases if it dies, then re-run |
 | `file changed on disk since it was read` | A non-fastedit writer changed the file; nothing was written; re-run against current content |
+| `queued too long for a model/heavy slot` | Another fastedit process is holding all slots; wait, or raise `max_model_instances`/`max_heavy_jobs`/`slot_wait_timeout_s` in `~/.fastedit/limits/limits.json` |
 | `parse errors; refusing to write` | The edit introduced new syntax errors; fix the snippet; the file is unchanged |
 | `Symbol 'x' not found` | Check the name — the error lists available symbols; `fastedit read` shows the map |
 | `contains a keep-marker but the edit cannot be placed deterministically` / `has no definition` | The refusal names the fix (more surrounding unique lines, or the full replacement); or use `--after` to insert |
@@ -187,13 +191,10 @@ writers.
 
 ## Install & update
 
-Fork: `scripts/install-dev.sh` (`--dev` editable, `--revert` back to upstream
-PyPI). Upstream PyPI: `uv tool install 'fastedits[mlx,mcp]'`. Upgrade: `uv
-tool upgrade fastedits` or re-run the installer.
-Agent skill: `fastedit init` (preferred — ships with the installed CLI;
-installs global+yes, no branch ambiguity). From a clone:
+Fork: `scripts/install-dev.sh` (`--revert` back to upstream PyPI).
+Upstream PyPI: `uv tool install 'fastedits[mlx,mcp]'`. Upgrade: `uv tool upgrade fastedits` or re-run the installer.
+Agent skill: `fastedit init` (ships with the installed CLI; global+yes). From a clone:
 `npx --yes skills add "<repo>/skills/fastedit" -g -a claude-code -y`.
 
-MCP: a server also exists — `fastedit mcp-install` writes the entry for Claude
-Code (12 `fast_*` tools). This skill's flow is intentional CLI use; the CLI
-stays the primary surface.
+MCP: a server also exists — `fastedit mcp-install` writes the entry for Claude Code (12 `fast_*` tools).
+The CLI is the primary surface; this skill's flow is intentional CLI use.
