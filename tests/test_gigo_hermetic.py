@@ -69,22 +69,34 @@ def _scripted(outputs: list[str]):
 # declared replacement) — i.e. the command did not land.
 _MD_STILL_MALFORMED = MD_ORIGINAL
 
+# A second non-converging shape with a DIFFERENT rejection reason: the
+# frontmatter WAS fixed well-formed, but the declared ``## Appendix``
+# heading never landed. Consecutive attempts therefore fail with distinct
+# reasons (missing declared 'title: Release Notes' vs missing declared
+# '## Appendix'), so the issue-#19 two-identical-rejections early stop
+# cannot fire and a scripted [bad, bad, good] retry sequence is reachable.
+_MD_FIXED_FRONT_MISSING_APPENDIX = MD_WELLFORMED_BLOCK + (
+    "# Field notes\n"
+    "Body paragraph one opens the sensor log.\n"
+    "Body paragraph two records the drift.\n"
+)
+
 
 def test_commanded_frontmatter_fix_is_retried_until_correct(tmp_path):
     """req. 9, case (c) direction 1: refuse → corrective note → correct.
 
-    The first two attempts keep the malformed frontmatter; the battery
-    rejects each (the snippet's DECLARED new lines are missing from the
-    merge — the content gate, whose line-exact view sees the missing
-    declared block before the D3 semantic layer names it), retries with
-    the corrective note, and accepts only the well-formed merge. The final
+    The first attempt keeps the malformed frontmatter and the second fixes
+    the frontmatter but drops the declared ``## Appendix`` heading — the
+    battery rejects each (distinct reasons, so the issue-#19
+    two-identical-rejections early stop cannot fire), retries with the
+    corrective note, and accepts only the well-formed merge. The final
     state is the committed golden: frontmatter well-formed, rest of the
     file byte-exact, ``retries > 0``.
     """
     well_formed = _golden("md_frontmatter/expected_frontmatter_fix.md")
     merge_fn, calls = _scripted([
         _MD_STILL_MALFORMED,
-        _MD_STILL_MALFORMED,
+        _MD_FIXED_FRONT_MISSING_APPENDIX,
         well_formed,
     ])
     result = chunked_merge(
@@ -145,12 +157,20 @@ def test_helpful_typo_fix_in_untouched_region_is_rejected_in_pipeline(tmp_path):
     ``test_relative_validation.py::test_helpful_fix_of_untouched_defect_is_retried_then_rejected``.
     """
     helpful = _py_wrap_oracle(PY_DEFECTS).replace("def alpha()\n", "def alpha():\n")
+    # A second non-converging shape whose untouched-region mutation DIFFERS
+    # (a stray parameter instead of the missing colon): the rejection
+    # reasons of consecutive attempts therefore differ, so the issue-#19
+    # two-identical-rejections early stop cannot fire and the pinned
+    # retry+exhaustion sequence stays reachable.
+    helpful_other_mutation = _py_wrap_oracle(PY_DEFECTS).replace(
+        "def alpha()\n", "def alpha(config):\n",
+    )
     # Sanity: the scripted output DOES perform the commanded wrap — the only
     # unfaithful thing about it is the untouched typo it also "fixed".
     assert "    with audit_lock():\n" in helpful
     assert "def alpha():\n" in helpful and "def alpha()\n" not in helpful
 
-    merge_fn, calls = _scripted([helpful])
+    merge_fn, calls = _scripted([helpful, helpful_other_mutation, helpful])
     result = chunked_merge(
         PY_DEFECTS, PY_WRAP_SNIPPET, str(tmp_path / "report.py"), merge_fn,
         language="python", replace="beta", max_validation_retries=2,

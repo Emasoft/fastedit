@@ -60,6 +60,7 @@ from .chunk_locator import (  # noqa: F401
 )
 from .indent import (
     _align_snippet_indent,
+    _align_snippet_to_symbol_indent,
     _escape_tags,
     _new_tag_nonce,
     _realign_output,
@@ -3745,11 +3746,18 @@ def chunked_merge(
                     # decided by _normalize_merged_eol below, from the
                     # original — never by this constant.
                     snippet_text = snippet.rstrip("\r\n") + line_ending
-                    snippet_text = _align_snippet_indent(
-                        snippet_text, anchor_first_line,
+                    # Issue #23: same alignment as the CLI direct-swap
+                    # splice — the snippet is re-indented to the TARGET
+                    # symbol's own level (anchor_first_line IS the target's
+                    # head line here; the replaced span rides along as the
+                    # indent-char vote context), never spliced at its
+                    # caller-chosen indent.
+                    snippet_text = _align_snippet_to_symbol_indent(
+                        snippet_text,
+                        anchor_first_line,
+                        "".join(original_lines[func_start:func_end]),
                     )
                     snippet_lines = snippet_text.splitlines(keepends=True)
-
                     result_lines = list(original_lines)
                     result_lines[func_start:func_end] = snippet_lines
                     merged = "".join(result_lines)

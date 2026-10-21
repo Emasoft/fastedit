@@ -98,6 +98,62 @@ def _apply_indent_delta(line: str, delta: int, indent_char: str) -> str:
     return line
 
 
+def _align_snippet_to_symbol_indent(
+    snippet_text: str,
+    target_head_line: str,
+    context_text: str = "",
+    explicit_columns: int | None = None,
+) -> str:
+    """Issue #23: re-indent a wholesale-symbol swap snippet to the REPLACED
+    SYMBOL's own indentation level, preserving its relative structure.
+
+    Both direct-swap splice sites (the CLI ``--replace`` deterministic path
+    in :mod:`fastedit.cli` and the brace-balanced direct-swap branch of
+    :func:`fastedit.inference.chunked_merge`) now run every wholesale
+    splice through here, so a column-0 snippet can never land its symbol
+    (and body) outside the container it replaces — the exit-0 silent
+    structural corruption #23 reported.
+
+    Semantics:
+
+      * the desired head indent is the TARGET symbol's own leading
+        whitespace, taken from ``target_head_line`` (the AST anchor's
+        definition line — the tool already knows it from the
+        tree-sitter parse);
+      * ``explicit_columns`` (the ``--indent N`` escape hatch) overrides
+        that level with N leading spaces in the file's dominant indent
+        character;
+      * the shift is column-based (``expandtabs(4)``) and applied in the
+        FILE's dominant indent character (``_indent_char_of`` votes over
+        ``context_text`` — the replaced span/surroundings — with the
+        target head as tie-breaker), so a tab-indented file shifts with
+        tabs (B7), and lines that begin inside a multi-line string are
+        USER DATA and pass through byte-identical (B30);
+      * a snippet already at the desired level is a byte-for-byte NO-OP
+        (a same-indent call produces no change), so the existing goldens
+        and correctly indented snippets keep their exact bytes.
+
+    Delegate: :func:`_align_snippet_indent` does all shifting; this
+    wrapper only computes the desired level — no duplicated mechanics.
+    """
+    def _head_indent(line: str) -> str:
+        stripped = line.lstrip()
+        return line[: len(line) - len(stripped)] if stripped else ""
+
+    desired = _head_indent(target_head_line)
+    if explicit_columns is not None and explicit_columns > 0:
+        desired = _indent_prefix(
+            explicit_columns,
+            _indent_char_of(context_text or target_head_line),
+        )
+    # _align_snippet_indent takes the chunk's FIRST non-blank line as its
+    # base indent, so a probe head carrying the desired level is the
+    # delta; ``context_text`` rides along only to make the indent-char
+    # vote (and any tab/space tie-break) file-convention aware.
+    probe = desired + "__fastedit_symbol_head__\n"
+    return _align_snippet_indent(snippet_text, probe + context_text)
+
+
 def _string_interior_flags(text: str) -> list[bool]:
     """Per-line flags: True when the line BEGINS inside a string literal.
 

@@ -70,6 +70,28 @@ def _scripted(results):
     return merge_fn, calls
 
 
+def _alternating(first, second):
+    """A HOPELESS merge_fn cycling two differently-rejected merges.
+
+    The retry-budget pins need a merge that never converges AND still burns
+    every attempt. chunked_merge's issue-#19 early stop breaks the loop
+    after TWO consecutive IDENTICAL rejections, so a stub replaying one
+    hopeless merge would stop at 2 attempts and the budget would never be
+    exhausted. This stub alternates a parse-invalid merge (caught by the
+    RELATIVE parse rule) with a faithfulness-violating merge (caught by the
+    CONTENT guard); both are rejected forever, but consecutive rejection
+    reasons differ, so no early stop fires and the full budget is
+    genuinely consumed.
+    """
+    calls: list[tuple[str, str, str | None]] = []
+
+    def merge_fn(code, snippet, language):
+        calls.append((code, snippet, language))
+        return _StubMergeResult(first if len(calls) % 2 else second)
+
+    return merge_fn, calls
+
+
 # 30 filler lines above and below the target function, so the beta chunk
 # never spans the whole file and the PER-CHUNK loop runs.
 FILLER_TOP = "\n".join(f"x{i} = {i}" for i in range(30))
@@ -103,6 +125,14 @@ BROKEN_TARGET_SNIPPET = (
 FAITHFUL_BROKEN_CHUNK = "def beta():\n    retrun 1\n    return 99\n"
 HELPFUL_FIX_CHUNK = "def beta():\n    return 1\n    return 99\n"
 BROKEN_MERGE_CHUNK = "def beta():\n    retrun 1\n    return 99\n    )\n"
+# A second hopelessly-broken shape with a DIFFERENT relative-parse error
+# signature (a missing paren after the def head instead of the retrun-typo
+# + stray-paren pair). The retry-budget pins cycle it with
+# BROKEN_MERGE_CHUNK: both are rejected forever, but the rejection reason —
+# the full diagnostic string — never repeats on consecutive attempts, so
+# chunked_merge's issue-#19 two-identical-rejections early stop cannot
+# fire and the pinned budget is genuinely exhausted.
+BROKEN_MERGE_CHUNK_ALT = "def beta(:\n    return 1\n    return 99\n"
 
 CLEAN_BODY = "    return 1\n    return 0\n"
 CLEAN_TARGET_FILE = _target_file(CLEAN_BODY)
@@ -527,7 +557,7 @@ class TestChunkRetryLoop:
 
     def test_default_budget_is_eight_retries(self, tmp_path, monkeypatch):
         monkeypatch.delenv("FASTEDIT_MAX_RETRIES", raising=False)
-        merge_fn, calls = _scripted([_StubMergeResult(BROKEN_MERGE_CHUNK)])
+        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
         result = _write_and_merge(
             tmp_path, CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, merge_fn,
         )
@@ -537,7 +567,7 @@ class TestChunkRetryLoop:
         assert result.merged_code == CLEAN_TARGET_FILE
 
     def test_max_validation_retries_kwarg_pins_the_budget(self, tmp_path):
-        merge_fn, calls = _scripted([_StubMergeResult(BROKEN_MERGE_CHUNK)])
+        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
         result = _write_and_merge(
             tmp_path, CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, merge_fn,
             max_validation_retries=3,
@@ -564,7 +594,7 @@ class TestChunkRetryLoop:
 
         # …an explicit kwarg beats the env…
         monkeypatch.setenv("FASTEDIT_MAX_RETRIES", "0")
-        merge_fn, calls = _scripted([_StubMergeResult(BROKEN_MERGE_CHUNK)])
+        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
         chunked_merge(
             CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, str(target), merge_fn,
             language="python", max_validation_retries=2,
@@ -622,7 +652,17 @@ class TestWholeFileRetryLoop:
 
     def test_helpful_fix_is_retried_until_budget_exhaustion(self, tmp_path, monkeypatch):
         monkeypatch.delenv("FASTEDIT_MAX_RETRIES", raising=False)
-        result, calls = self._merge(tmp_path, [_StubMergeResult(WHOLE_HELPFUL_FIX)])
+        # A parse-invalid variant of the same hopeless merge: the model
+        # "helpfully fixes" the untouched defect AND introduces a new
+        # paren. Cycling it with the plain helpful fix alternates the
+        # rejection reason (relative-parse vs content-faithfulness), so the
+        # issue-#19 two-identical-rejections early stop cannot fire and the
+        # whole retry budget is genuinely exhausted.
+        helpful_and_broken = "def foo():\n    return 1\n)\n"
+        merge_fn, calls = _alternating(WHOLE_HELPFUL_FIX, helpful_and_broken)
+        result = _write_and_merge(
+            tmp_path, WHOLE_BROKEN_FILE, WHOLE_BROKEN_SNIPPET, merge_fn,
+        )
         assert len(calls) == 9
         assert result.retries == 8
         assert result.chunks_rejected == 1

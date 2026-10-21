@@ -756,9 +756,19 @@ class TestBatteryTextTraitBranch:
             ).splitlines(keepends=True)
             if line.strip()
         )
+        # A second hopeless shape with a DIFFERENT rejection signature: the
+        # blank destruction PLUS one original line dropped — the CONTENT
+        # faithfulness gate rejects it instead of the text-trait gate. The
+        # rejection reason therefore alternates between attempts, so the
+        # issue-#19 two-identical-rejections early stop cannot fire and the
+        # pinned retry budget is genuinely exhausted.
+        blank_stripped_drop_a_line = blank_stripped.replace(
+            "It skips items marked discontinued.\n", "",
+        )
         result, calls = _run_whole_file_merge(
             tmp_path, NOTES_ORIGINAL, NOTES_APPEND_SNIPPET,
-            [_StubMergeResult(blank_stripped)],
+            [_StubMergeResult(blank_stripped), _StubMergeResult(blank_stripped_drop_a_line),
+             _StubMergeResult(blank_stripped)],
             max_validation_retries=2,
         )
         assert len(calls) == 3  # initial + 2 retries

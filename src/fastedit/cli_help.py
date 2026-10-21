@@ -109,6 +109,9 @@ COMMANDS: tuple[Command, ...] = (
                     "auto-preserved. Multi-line snippets with '# ... existing code ...' keep",
                     "the rest of the body; '--snippet @f.py' reads it from a file, '-' from",
                     "piped stdin; '--snippet-is-literal' disables that resolution.",
+                    "The replacement is auto-re-indented to the symbol's own level",
+                    "(issue #23) — a column-0 snippet still lands inside its container;",
+                    "--indent N overrides that level.",
                 ),
             ),
             Example(

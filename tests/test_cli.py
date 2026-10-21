@@ -63,6 +63,25 @@ LARGE_PYTHON_FILE = textwrap.dedent("""\
 )  # ~180 lines — exceeds the 100-line threshold for full content
 
 
+@pytest.fixture(autouse=True)
+def _fresh_dash_stdin_latch():
+    """Every test starts with a CLEARED stdin-payload latch.
+
+    The module-global latch (_DASH_STDIN_CONSUMED_BY) is per-process by
+    design and the handlers reset it at each top-level command entry; these
+    unit tests call _read_dash_stdin DIRECTLY (no handler in between), so
+    without a per-test reset a test that consumed stdin would poison every
+    later test in the file — the order-dependence class. Clearing it before
+    AND after each test keeps the assertion-bearing refusal tests inside a
+    single invocation untouched.
+    """
+    from fastedit import cli as _cli
+
+    _cli._DASH_STDIN_CONSUMED_BY.clear()
+    yield
+    _cli._DASH_STDIN_CONSUMED_BY.clear()
+
+
 @pytest.fixture
 def small_py(tmp_path: Path) -> Path:
     """Write a small Python file (<100 lines) and return its path."""
@@ -1871,7 +1890,7 @@ class TestDashStdinSecondPayload:
         cli_module._read_dash_stdin("--file-edits")
         with pytest.raises(SystemExit):
             cli_module._read_dash_stdin("--edits")
-        assert "pass --edits as a file" in capsys.readouterr().err
+        assert "Pass --edits as a file" in capsys.readouterr().err
 # ===================================================================
 
 class TestCLIMultiEdit:

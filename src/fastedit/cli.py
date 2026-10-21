@@ -182,8 +182,24 @@ _ATFILE_AUTODETECT_MAX_CHARS = 1024
 # loudly instead of silently reading an empty EOF payload (like the retired
 # StringIO would give) -- the empty payload used to surface as a baffling
 # "invalid JSON" instead of the true cause. Module-global per-process latch,
-# reset only by the process exit.
+# reset only by the process exit. `_reset_dash_stdin_latch` clears it at
+# every top-level command entry (the argparse-dispatch boundary) so
+# in-process sequential handler calls (tests, scripts driving cli.main()
+# repeatedly) start clean; WITHIN one invocation a second '-' still
+# refuses cleanly.
 _DASH_STDIN_CONSUMED_BY: list[str] = []
+
+
+def _reset_dash_stdin_latch() -> None:
+    """Clear the one-payload-per-invocation stdin latch (see above).
+
+    Called at the TOP entry of every command handler that can consume
+    stdin (cmd_edit / cmd_batch_edit / cmd_multi_edit / cmd_create), i.e.
+    once per CLI invocation. Without it, one in-process invocation of
+    `-` consumed the latch FOREVER, poisoning every later in-process
+    call in the same interpreter (the test suite's order dependence).
+    """
+    _DASH_STDIN_CONSUMED_BY.clear()
 
 
 def _read_dash_stdin(
@@ -601,7 +617,7 @@ def _snippet_is_single_matching_definition(snippet, target_node):
     return node.type == kind_to_node_type.get(target_node.kind)
 
 
-def _try_deterministic_replace(path, original_code, original_lines, snippet, replace_sym, language, backups):
+def _try_deterministic_replace(path, original_code, original_lines, snippet, replace_sym, language, backups, indent_override=None):
     from .data_gen.ast_analyzer import validate_parse
     from .inference.chunked_merge import (
         _MAX_SNIPPET_CHARS,
@@ -904,9 +920,38 @@ def _try_deterministic_replace(path, original_code, original_lines, snippet, rep
             f"instead of expanding them; the markers would be written into "
             f"the file literally. Pass the full replacement body."
         )
-    snippet_lines = snippet_text.splitlines(keepends=True)
+    # Issue #23: the direct swap used to splice the snippet VERBATIM, so a
+    # column-0 snippet put the replacement symbol and its body at column 0
+    # — outside the class/container the symbol belongs to — and still
+    # parsed (brace languages), reported as success with exit 0. The splice
+    # now auto-re-indents the snippet to the TARGET symbol's own level
+    # (relative structure preserved; a snippet already at that level is a
+    # byte-for-byte no-op). --indent N is the explicit escape hatch when
+    # the target's level is not what the caller wants.
+    from .inference.indent import _align_snippet_to_symbol_indent
+    from .inference.text_match import _indent_width
+    snippet_text = _align_snippet_to_symbol_indent(
+        snippet_text, original_lines[func_start], original_func,
+        explicit_columns=indent_override,
+    )
+    # Belt (issue #23): after the reindent the splice lands at the
+    # target's level; this note is redundant with a correct --indent
+    # call (the caller explicitly chose the level), so it is skipped
+    # there.
+    if indent_override is None:
+        emitted_head = next(
+            (ln for ln in snippet_text.splitlines() if ln.strip()), "",
+        )
+        if _indent_width(emitted_head) != _indent_width(original_lines[func_start]):
+            print(
+                f"note: '{replace_sym}' replacement was spliced at indent "
+                f"width {_indent_width(emitted_head)} while the replaced "
+                f"symbol's own level is {_indent_width(original_lines[func_start])} "
+                f"— verify the file after this edit.",
+                file=sys.stderr,
+            )
     result_lines = list(original_lines)
-    result_lines[func_start:func_end] = snippet_lines
+    result_lines[func_start:func_end] = snippet_text.splitlines(keepends=True)
     merged = "".join(result_lines)
     # Step 14 (B31): same funnel as the text-match branch above — whether
     # the edited file ends with a terminator is decided by the ORIGINAL's
@@ -1579,6 +1624,7 @@ def _apply_lines_replace(
 
 def cmd_edit(args):
     """Apply an edit snippet to a file using the FastEdit model."""
+    _reset_dash_stdin_latch()
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
@@ -1738,6 +1784,7 @@ def _cmd_edit_locked(args):
         try:
             result = _try_deterministic_replace(
                 path, original_code, original_lines, snippet, replace_sym, language, backups,
+                indent_override=getattr(args, "indent", None),
             )
         except ValueError as e:
             # TRDD-CMRMA2YG: the keep-marker guard in _try_deterministic_replace
@@ -1898,6 +1945,7 @@ def _cmd_edit_locked(args):
 
 def cmd_batch_edit(args):
     """Apply multiple sequential edits to one file."""
+    _reset_dash_stdin_latch()
     path = Path(args.file)
     if not path.exists():
         print(f"Error: file not found: {args.file}", file=sys.stderr)
@@ -2050,6 +2098,7 @@ def cmd_multi_edit(args):
     """Apply edits across multiple files, writing nothing unless every file succeeds."""
     import json as json_mod
 
+    _reset_dash_stdin_latch()
     # Issue #9: bounded single read via the shared '-' helper.
     file_edits_json = (
         _read_dash_stdin("--file-edits") if args.file_edits == "-" else args.file_edits
@@ -2753,6 +2802,7 @@ def cmd_create(args):
     from .filetype import is_text_file
     from .mcp.backup import BackupStore, _atomic_write
 
+    _reset_dash_stdin_latch()
     # Flag-conflict first: it is knowable from argv alone and must not be
     # masked by a state error (an existing file or missing parent) that the
     # user might fix while the real problem -- two content sources -- stays.
@@ -3548,6 +3598,15 @@ def main():
              "(equivalent to --after imports)",
     )
     edit_p.add_argument("--replace", default="", help="Replace this symbol with the snippet")
+    edit_p.add_argument(
+        "--indent", type=int, default=None, dest="indent",
+        help="Issue #23: explicit replacement indentation in spaces for "
+             "--replace splices. By default the direct-swap replacement is "
+             "auto-re-indented to the REPLACED SYMBOL's own level (relative "
+             "body structure preserved, blank/string-interior lines "
+             "untouched); --indent N overrides that level with N leading "
+             "spaces on the symbol's head line.",
+    )
     edit_p.add_argument("--backend", choices=["mlx", "vllm"], default=None)
     edit_p.add_argument("--model-path", default=None, help="MLX model path (overrides FASTEDIT_MODEL_PATH)")
     edit_p.add_argument("--api-base", default=None, help="vLLM API base URL")
