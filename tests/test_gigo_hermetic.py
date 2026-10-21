@@ -53,13 +53,20 @@ def _StubMergeResult(merged_code: str, truncated: bool = False):
     )
 
 
-def _scripted(outputs: list[str]):
-    """A scripted merge_fn: yields ``outputs`` in order, then holds the last."""
+def _scripted(outputs: list):
+    """A scripted merge_fn: yields ``outputs`` in order, then holds the last.
+
+    Items may be plain strings (the merge payload) or pre-built stub
+    objects (for pinned truncation flags — used to cycle rejection
+    CATEGORIES past the issue-#24 early stop)."""
     calls: list[tuple[str, str, str | None]] = []
 
     def merge_fn(code: str, snippet: str, lang: str | None):
         calls.append((code, snippet, lang))
-        return _StubMergeResult(outputs[min(len(calls) - 1, len(outputs) - 1)])
+        item = outputs[min(len(calls) - 1, len(outputs) - 1)]
+        if isinstance(item, SimpleNamespace):
+            return item
+        return _StubMergeResult(item)
 
     return merge_fn, calls
 
@@ -96,7 +103,12 @@ def test_commanded_frontmatter_fix_is_retried_until_correct(tmp_path):
     well_formed = _golden("md_frontmatter/expected_frontmatter_fix.md")
     merge_fn, calls = _scripted([
         _MD_STILL_MALFORMED,
-        _MD_FIXED_FRONT_MISSING_APPENDIX,
+        # Issue #24 defect B: the early stop compares REJECTION CATEGORIES
+        # (attempt 1 here is a faithfulness rejection — "declared new line
+        # 'title: Release Notes' missing"), so attempt 2 cycles a
+        # DIFFERENT category (truncation flag) to keep the pinned
+        # [bad, bad, good] retry sequence reachable.
+        _StubMergeResult(_MD_FIXED_FRONT_MISSING_APPENDIX, truncated=True),
         well_formed,
     ])
     result = chunked_merge(
@@ -157,20 +169,21 @@ def test_helpful_typo_fix_in_untouched_region_is_rejected_in_pipeline(tmp_path):
     ``test_relative_validation.py::test_helpful_fix_of_untouched_defect_is_retried_then_rejected``.
     """
     helpful = _py_wrap_oracle(PY_DEFECTS).replace("def alpha()\n", "def alpha():\n")
-    # A second non-converging shape whose untouched-region mutation DIFFERS
-    # (a stray parameter instead of the missing colon): the rejection
-    # reasons of consecutive attempts therefore differ, so the issue-#19
-    # two-identical-rejections early stop cannot fire and the pinned
-    # retry+exhaustion sequence stays reachable.
-    helpful_other_mutation = _py_wrap_oracle(PY_DEFECTS).replace(
-        "def alpha()\n", "def alpha(config):\n",
-    )
-    # Sanity: the scripted output DOES perform the commanded wrap — the only
-    # unfaithful thing about it is the untouched typo it also "fixed".
+    # Issue #24 defect B: the early stop compares REJECTION CATEGORIES —
+    # attempt 1 here is a faithfulness rejection (the "fixed" untouched
+    # line is not a declared snippet line), so attempt 2 cycles a
+    # DIFFERENT category (the truncation flag) to keep the pinned
+    # retry+exhaustion sequence reachable. Shape notes: the scripted
+    # output performs the commanded wrap; the only unfaithful thing about
+    # it is the untouched typo it also "fixed".
     assert "    with audit_lock():\n" in helpful
     assert "def alpha():\n" in helpful and "def alpha()\n" not in helpful
 
-    merge_fn, calls = _scripted([helpful, helpful_other_mutation, helpful])
+    merge_fn, calls = _scripted([
+        helpful,
+        _StubMergeResult(helpful, truncated=True),
+        helpful,
+    ])
     result = chunked_merge(
         PY_DEFECTS, PY_WRAP_SNIPPET, str(tmp_path / "report.py"), merge_fn,
         language="python", replace="beta", max_validation_retries=2,

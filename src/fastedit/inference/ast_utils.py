@@ -47,6 +47,12 @@ class ChunkedMergeResult:
     # site — whole-file counts as one site, each chunk as one). 0 for
     # deterministic paths and first-attempt successes.
     retries: int = 0
+    # Issue #24 (defect C): the rejection CATEGORIES the exhausted merge
+    # saw ("parse" / "faithfulness" / "truncation" / "trait" / "attribute"),
+    # so the shared write-gate refusal can branch its advice: an all-
+    # faithfulness exhaustion is a content-fidelity refusal (the caller
+    # should use the deterministic primitives), not a size problem.
+    rejection_categories: tuple[str, ...] = ()
 
 
 @dataclass

@@ -643,6 +643,36 @@ def _snippet_splice_covers_deleted_lines(
         # The gate fails closed for the same inputs the editor declines.
         return False
 
+    # Issue #24 (defect A): FULL-SECTION SWAP, TWICE-BRACKETED. A
+    # format-symbol snippet (--replace over a definition_line_required
+    # span) whose head restates the span's FIRST content line (the
+    # definition line) AND whose last content line restates the span's
+    # LAST content line is a deliberately bracketed whole-section
+    # restatement: everything the snippet omits in between is an
+    # INTENTIONAL deletion (the issue's section rewrite — one paragraph
+    # deleted, two bullets reworded). The contract: a --replace snippet
+    # restating the whole section IS the complete new text — deletions
+    # included. Checked BEFORE the #8 truncated-tail refusal below: the
+    # two shapes are disjoint (a REWORDED INTERIOR line of a full swap
+    # can be a strict prefix of its original — the #24 rule requires the
+    # tail restated EXACTLY, while #8 fires when the TAIL ITSELF is cut
+    # mid-sentence), so ordering keeps #8 intact wherever the tail is
+    # not restated.
+    snippet_briquetted = [
+        ln.strip() for ln in snippet_text.splitlines()
+        if ln.strip() and not is_marker_line(ln)
+    ]
+    span_content = [
+        ln.strip() for ln in raw_lines
+        if ln.strip() and not is_marker_line(ln)
+    ]
+    if (
+        snippet_briquetted
+        and snippet_briquetted[0] == span_content[0]
+        and snippet_briquetted[-1] == span_content[-1]
+    ):
+        return True
+
     content_idx: dict[int, int] = {}
     ci = 0
     for ri, ln in enumerate(raw_lines):
@@ -2676,6 +2706,43 @@ def _merge_rejection_reason(
 # only (Step 11). The per-chunk loop now runs the same battery.
 _whole_file_rejection_reason = _merge_rejection_reason
 
+
+def _rejection_category(reason: str) -> str:
+    """Coarsen a battery rejection reason into its category (issue #24, B).
+
+    The reason strings insist on the specific violation, but the retry
+    loop's hopeless-shape check only needs to know the category the
+    validator lives at — a hopeless merge can still OSCILLATE between two
+    strings of one category ("declared new line '…' is missing from the
+    merge" ↔ "unmentioned original line dropped: '…'"), which defeated the
+    issue-#19 exact-string early stop and burned the whole 9-attempt
+    budget (54 s on the issue's 10-line section) for zero chance of
+    convergence. Categories:
+
+      * ``truncation`` — the engine hit its token cap (B12);
+      * ``parse`` — the relative parse rule (req. 9);
+      * ``faithfulness`` — the content validator (dropped / invented /
+        reindented / reordered lines, marker leaks);
+      * ``trait`` — the D1 text-trait gate (structureless files);
+      * ``attribute`` — the D3 language-attribute/structure gate;
+      * ``other`` — anything unclassified (conservative: behaves like the
+        old exact-string rule, since categories only ever coarsen).
+
+    Consumers: both retry loops' early stop (two consecutive = stop) and
+    the rejection bookkeeping threaded to the write-gate refusal (#24 C).
+    """
+    if reason.startswith("truncated"):
+        return "truncation"
+    if "does not parse" in reason or "parse error" in reason:
+        return "parse"
+    if "content-faithfulness" in reason:
+        return "faithfulness"
+    if "text-trait" in reason:
+        return "trait"
+    if "language-attribute" in reason:
+        return "attribute"
+    return "other"
+
 _DEFAULT_MAX_VALIDATION_RETRIES = 8
 """Retry-until-valid budget (req. 5): bounded, loud failure on exhaustion."""
 
@@ -3959,6 +4026,7 @@ def chunked_merge(
         whole_tokens = 0
         whole_latency = 0.0
         prev_reason: str | None = None
+        rejection_categories: set[str] = set()
         for attempt in range(max_retries + 1):
             result = merge_fn(safe_code, attempt_snippet, language)
             attempts += 1
@@ -3985,25 +4053,28 @@ def chunked_merge(
                 "Whole-file merge attempt %d/%d rejected: %s",
                 attempt + 1, max_retries + 1, reason,
             )
-            # Issue #19 (defect 2): when the battery rejects the SAME way
-            # on consecutive attempts (observed hopeless shape: an M-lines
-            # -> N-line markdown rewording whose declared new line cannot
-            # be honored without dropping the reworded originals — every
-            # attempt burned minutes of model work and the report measured
-            # 11 to 20 minutes per refusal), the retry budget cannot
-            # change the verdict. Stop EARLY (2 consecutive identical
-            # rejections) — the loop's exhaustion path below still refuses
-            # with the same bookkeeping and the same named reason. A
-            # converging merge never hits this: its rejection reason
-            # changes between attempts or disappears.
-            if reason == prev_reason:
+            # Issue #19 (defect 2), issue #24 (defect B): when the battery
+            # rejects with the same REJECTION CATEGORY on consecutive
+            # attempts (parse / faithfulness / truncation / ...), the retry
+            # budget cannot change the verdict. This OBSERVED hopeless
+            # shape oscillates two faithfulness strings
+            # ("declared new line missing" ↔ "unmentioned original line
+            # dropped") — comparing EXACT strings (the #19 rule) was
+            # defeated by the oscillation, 9 attempts on a 10-line file;
+            # the category rule stops it after 2. A converging merge never
+            # hits this: its rejection category changes between attempts
+            # (cycling categories still exhaust the budget) or the
+            # rejection disappears.
+            final_category = _rejection_category(reason)
+            rejection_categories.add(final_category)
+            if final_category == prev_reason:
                 _log.warning(
-                    "Whole-file merge rejected the same way %d attempt(s) "
-                    "in a row (%s) — stopping retries early",
-                    2, reason,
+                    "Whole-file merge rejected with the same category %d "
+                    "attempt(s) in a row (%s: %s) — stopping retries early",
+                    2, final_category, reason,
                 )
                 break
-            prev_reason = reason
+            prev_reason = final_category
             attempt_snippet = _append_corrective_note(safe_snippet, reason)
 
         if reason is not None:
@@ -4027,6 +4098,7 @@ def chunked_merge(
                 latency_ms=whole_latency,
                 chunks_rejected=1,
                 retries=attempts - 1,
+                rejection_categories=tuple(sorted(rejection_categories)),
             )
 
         # parse_valid is the pipeline's RELATIVE verdict (Step A2): the
@@ -4066,6 +4138,7 @@ def chunked_merge(
     total_retries = 0
     rejected_chunks = 0
     chunk_regions = []
+    all_rejection_categories: set[str] = set()
 
     for rev_pos, chunk in enumerate(reversed(chunks)):
         chunk_pos = len(chunks) - 1 - rev_pos  # index into `chunks` order
@@ -4161,6 +4234,7 @@ def chunked_merge(
         chunk_latency = 0.0
         reason: str | None = None
         prev_reason: str | None = None
+        chunk_rejection_categories: set[str] = set()
         for attempt in range(max_retries + 1):
             result = merge_fn(escaped_chunk, prompt_snippet, language)
             attempts += 1
@@ -4196,23 +4270,29 @@ def chunked_merge(
                 chunk.start_line, chunk.end_line,
                 attempt + 1, max_retries + 1, reason,
             )
-            # Issue #19 (defect 2): same reason twice in a row = a hopeless
-            # shape (see the whole-file twin above for the rationale) —
-            # stop burning the retry budget's remaining model calls and
-            # go straight to the exhaustion bookkeeping below.
-            if reason == prev_reason:
+            # Issue #19 (defect 2) + issue #24 (defect B): same CATEGORY
+            # twice in a row = a hopeless shape — the issue's oscillation
+            # alternates the faithfulness STRING but stays one category, so
+            # the string rule was defeated by the oscillation (the
+            # whole-file twin above carries the rationale). Cycling
+            # categories (parse ↔ faithfulness) still exhaust the budget.
+            chunk_category = _rejection_category(reason)
+            chunk_rejection_categories.add(chunk_category)
+            if chunk_category == prev_reason:
                 _log.warning(
-                    "Chunk %d-%d rejected the same way %d attempt(s) in a "
-                    "row (%s) — stopping retries early",
-                    chunk.start_line, chunk.end_line, 2, reason,
+                    "Chunk %d-%d rejected with the same category %d "
+                    "attempt(s) in a row (%s: %s) — stopping retries early",
+                    chunk.start_line, chunk.end_line, 2,
+                    chunk_category, reason,
                 )
                 break
-            prev_reason = reason
+            prev_reason = chunk_category
             prompt_snippet = _append_corrective_note(safe_chunk_snippet, reason)
 
         total_tokens += chunk_tokens
         total_latency += chunk_latency
         total_retries += attempts - 1
+        all_rejection_categories.update(chunk_rejection_categories)
 
         if merged_chunk_code is None:
             # Budget exhausted: keep the original chunk unchanged rather
@@ -4301,6 +4381,7 @@ def chunked_merge(
                 latency_ms=total_latency,
                 chunks_rejected=len(chunks),
                 retries=total_retries,
+                rejection_categories=tuple(sorted(all_rejection_categories)),
             )
         op, layout_slack, removable = _derived_text_op(original_code, snippet)
         ok, trait_reason = validate_text_output(
@@ -4323,6 +4404,9 @@ def chunked_merge(
                 latency_ms=total_latency,
                 chunks_rejected=len(chunks),
                 retries=total_retries,
+                rejection_categories=tuple(sorted(
+                    all_rejection_categories | {"trait"},
+                )),
             )
 
     # Step D3: final-assembly ATTRIBUTE/STRUCTURE gate (req. 7 + 9) — the
@@ -4352,6 +4436,9 @@ def chunked_merge(
                 latency_ms=total_latency,
                 chunks_rejected=len(chunks),
                 retries=total_retries,
+                rejection_categories=tuple(sorted(
+                    all_rejection_categories | {"attribute"},
+                )),
             )
 
     return ChunkedMergeResult(
@@ -4363,4 +4450,11 @@ def chunked_merge(
         latency_ms=total_latency,
         chunks_rejected=rejected_chunks,
         retries=total_retries,
+        # Issue #24 (defect C): when the run fully lands, rejected_pieces
+        # carry their own categories; an all-rejected run surfaces them so
+        # the refusal can branch its advice. A clean run stays empty.
+        rejection_categories=(
+            tuple(sorted(all_rejection_categories))
+            if rejected_chunks else ()
+        ),
     )

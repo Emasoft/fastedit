@@ -71,17 +71,20 @@ def _scripted(results):
 
 
 def _alternating(first, second):
-    """A HOPELESS merge_fn cycling two differently-rejected merges.
+    """A HOPELESS merge_fn cycling two differently-CATEGORIZED rejections.
 
     The retry-budget pins need a merge that never converges AND still burns
-    every attempt. chunked_merge's issue-#19 early stop breaks the loop
-    after TWO consecutive IDENTICAL rejections, so a stub replaying one
-    hopeless merge would stop at 2 attempts and the budget would never be
-    exhausted. This stub alternates a parse-invalid merge (caught by the
-    RELATIVE parse rule) with a faithfulness-violating merge (caught by the
-    CONTENT guard); both are rejected forever, but consecutive rejection
-    reasons differ, so no early stop fires and the full budget is
-    genuinely consumed.
+    every attempt. chunked_merge's early stop (issue #19, sharpened by
+    issue #24 defect B) breaks the loop after TWO consecutive
+    same-CATEGORY rejections, so a stub replaying one hopeless merge — and
+    a stub alternating two rejections of ONE category — would stop at 2
+    attempts and the budget would never be exhausted. This stub alternates
+    a parse-category merge (relative parse rule) with a faithfulness-
+    category merge (content guard); both are rejected forever, but the
+    categories CYCLE between consecutive attempts, so no early stop fires
+    and the full budget is genuinely consumed. (The issue-#24-era
+    distinction: cycling categories exhaust, same-category stops — two
+    parse-signature variants are one category now.)
     """
     calls: list[tuple[str, str, str | None]] = []
 
@@ -125,6 +128,12 @@ BROKEN_TARGET_SNIPPET = (
 FAITHFUL_BROKEN_CHUNK = "def beta():\n    retrun 1\n    return 99\n"
 HELPFUL_FIX_CHUNK = "def beta():\n    return 1\n    return 99\n"
 BROKEN_MERGE_CHUNK = "def beta():\n    retrun 1\n    return 99\n    )\n"
+# Issue #24 defect B: a parse-VALID but faithfulness-rejected shape, for
+# cycling reject CATEGORIES past the category early stop (the budget pins
+# pair it with the parse-rejected shapes above). A reordered body — the
+# declared new lines never land in order — fails the content gate to
+# exhaustion with its own (distinct) reason string.
+FAITHFULNESS_REJECT_CHUNK = "def beta():\n    return 99\n    return 1\n"
 # A second hopelessly-broken shape with a DIFFERENT relative-parse error
 # signature (a missing paren after the def head instead of the retrun-typo
 # + stray-paren pair). The retry-budget pins cycle it with
@@ -557,7 +566,15 @@ class TestChunkRetryLoop:
 
     def test_default_budget_is_eight_retries(self, tmp_path, monkeypatch):
         monkeypatch.delenv("FASTEDIT_MAX_RETRIES", raising=False)
-        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
+        # Issue #24 defect B: the early stop compares CATEGORIES. The two
+        # parse-signature variants of the hopeless merge were the #19-era
+        # way to dodge the exact-string rule; now they are ONE category, so
+        # the budget exhausts with cycling categories instead (parse ↔
+        # faithfulness — attempt 2 replays a reordered chunk, a parse-valid
+        # but faithfulness-rejected shape) — exactly the sanctioned shape.
+        merge_fn, calls = _alternating(
+            BROKEN_MERGE_CHUNK, FAITHFULNESS_REJECT_CHUNK,
+        )
         result = _write_and_merge(
             tmp_path, CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, merge_fn,
         )
@@ -567,7 +584,10 @@ class TestChunkRetryLoop:
         assert result.merged_code == CLEAN_TARGET_FILE
 
     def test_max_validation_retries_kwarg_pins_the_budget(self, tmp_path):
-        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
+        # Cycling categories (issue #24 defect B): parse <-> faithfulness.
+        merge_fn, calls = _alternating(
+            BROKEN_MERGE_CHUNK, FAITHFULNESS_REJECT_CHUNK,
+        )
         result = _write_and_merge(
             tmp_path, CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, merge_fn,
             max_validation_retries=3,
@@ -592,9 +612,12 @@ class TestChunkRetryLoop:
         assert len(calls) == 1  # budget 0 → single attempt, then reject
         assert calls[0][2] == "python"
 
-        # …an explicit kwarg beats the env…
+        # …an explicit kwarg beats the env… (cycling categories, issue #24
+        # defect B: parse ↔ faithfulness).
         monkeypatch.setenv("FASTEDIT_MAX_RETRIES", "0")
-        merge_fn, calls = _alternating(BROKEN_MERGE_CHUNK, BROKEN_MERGE_CHUNK_ALT)
+        merge_fn, calls = _alternating(
+            BROKEN_MERGE_CHUNK, FAITHFULNESS_REJECT_CHUNK,
+        )
         chunked_merge(
             CLEAN_TARGET_FILE, CLEAN_TARGET_SNIPPET, str(target), merge_fn,
             language="python", max_validation_retries=2,

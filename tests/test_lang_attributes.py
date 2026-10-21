@@ -1159,19 +1159,17 @@ class TestBatteryAttributeGate:
             '  <p lang="en">First paragraph.</p>',
             '  <p lang="de">First paragraph.</p>',
         )
-        # A second hopeless shape with a DIFFERENT rejection signature: the
-        # declared ``lang="fr"`` IS applied (content-faithful) but the
-        # closing ``</html>`` is dropped, so the RELATIVE parse gate
-        # rejects. The rejection reason alternates between attempts
-        # (unfaithful lang swap vs parse error), so the issue-#19
-        # two-identical-rejections early stop cannot fire and the pinned
-        # retry budget is genuinely exhausted.
-        merged_drop_closer = HTML_ORIGINAL.replace("</html>\n", "")
+        # Issue #24 defect B: the early stop compares CATEGORIES —
+        # attempt 1 is a faithfulness rejection regardless of which
+        # sub-gate names it (even the dropped ``</html>`` is caught by
+        # the content gate before the parse rule), so attempt 2 cycles a
+        # DIFFERENT category (the truncation flag) to keep the pinned
+        # retry budget genuinely exhausted.
         result, calls = _run_merge(
             tmp_path, "page.html", HTML_ORIGINAL, snippet,
             [
                 _StubMergeResult(merged),
-                _StubMergeResult(merged_drop_closer),
+                _StubMergeResult(merged, truncated=True),
                 _StubMergeResult(merged),
             ],
             language="html",
